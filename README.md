@@ -114,7 +114,7 @@ This Neovim configuration works on macOS, Ubuntu (PC/WSL), and Raspberry Pi. Fol
 
 ```sh
     cd ~/dev
-    git clone https://github.com/k0d3x8its/nvim-config.git
+    git clone git@github.com:k0d3x8its/kodex-ide.git
 ```
 
 ## 2. Backup any existing config
@@ -126,7 +126,7 @@ This Neovim configuration works on macOS, Ubuntu (PC/WSL), and Raspberry Pi. Fol
 ## 3. Symlink your config
 
 ```sh
-    ln -s ~/dev/nvim-config ~/.config/nvim
+    ln -s ~/dev/kodex-ide ~/.config/nvim
 ```
 
 ## 4. Open Neovim

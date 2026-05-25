@@ -14,7 +14,10 @@ end
 vim.opt.rtp:prepend(lazypath)
 
 -- 2️⃣ Python provider
-vim.g.python3_host_prog = "/home/broke/.config/nvim/venv/bin/python"
+local python3_host_prog = vim.fn.stdpath("config") .. "/venv/bin/python"
+if vim.fn.executable(python3_host_prog) == 1 then
+	vim.g.python3_host_prog = python3_host_prog
+end
 
 -- disabled Perl and Ruby
 vim.g.loaded_perl_provider = 0

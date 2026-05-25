@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.0b (2025-10-30)
+## v1.0.0b (2025-10-30)
 
 - **➕:** PlatformIO
 - **➕:** PlatformIO support to keymaps

@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.1b (2026-05-24)
+
+- **♻️:** update install instructions for the `kodex-ide` repo
+- **🛠️:** use a config-local Python host path instead of a hard-coded user path
+- **➕:** expose the Alpha dashboard command for lazy loading
+- **🛠️:** pin `nvim-treesitter` to the compatible `master` branch
+- **⬆️:** refresh the plugin lockfile for the latest dependency pins
+
 ## v1.0.0b (2025-10-30)
 
 - **➕:** PlatformIO

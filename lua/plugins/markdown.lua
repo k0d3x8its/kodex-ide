@@ -31,7 +31,7 @@ return {
 
 				vim.bo[args.buf].fixeol = true
 
-				vim.fn.winsaveview(view)
+				vim.fn.winrestview(view)
 			end,
 			desc = "markdownlint quick fixes",
 		})

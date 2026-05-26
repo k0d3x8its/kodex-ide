@@ -29,7 +29,7 @@ return {
 					vim.cmd([[%s/^\s\+$//e]])
 				end)
 
-				vim.bo[args.buf].fixol = true
+				vim.bo[args.buf].fixeol = true
 
 				vim.fn.winsaveview(view)
 			end,

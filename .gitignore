@@ -2,3 +2,4 @@ venv/
 .cache/
 **/.DS_Store
 **/__pycache__/
+session-log.md

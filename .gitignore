@@ -2,5 +2,6 @@ venv/
 .cache/
 **/.DS_Store
 **/__pycache__/
-# Release artifacts
+# Claude artifacts
 RELEASE-NOTES.md
+session-log.md

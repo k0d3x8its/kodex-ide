@@ -1,5 +1,7 @@
 # Changelog
 
+## [Unreleased]
+
 ## v1.0.1b (2026-05-24)
 
 - **♻️:** update install instructions for the `kodex-ide` repo

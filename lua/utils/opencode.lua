@@ -56,9 +56,16 @@ local function create_term(root)
     close_on_exit   = false,
     hidden          = true,
     -- flag flips via callbacks, not in toggle(): catches every close path
-    -- (keymap, :q on the window, etc.)
-    on_open  = function() state.opencode_active = true end,
-    on_close = function() state.opencode_active = false end,
+    -- (keymap, :q on the window, etc.). Diff hooks manage 'autoread' +
+    -- interceptor autocmds (findings Q6 prototype correction #1).
+    on_open = function()
+      state.opencode_active = true
+      require("utils.opencode_diff").on_panel_open()
+    end,
+    on_close = function()
+      state.opencode_active = false
+      require("utils.opencode_diff").on_panel_close()
+    end,
   }
 end
 
@@ -102,6 +109,8 @@ function mod.reset()
   state.stored_root = nil
   state.diff_queue = {}
   state.opencode_active = false
+  -- shutdown() may not fire on_close; restore autoread explicitly
+  require("utils.opencode_diff").on_panel_close()
   mod.toggle()
 end
 

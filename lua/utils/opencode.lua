@@ -106,8 +106,10 @@ function mod.toggle()
 end
 
 --- Return text from last visual selection.
--- Vim sets the '< and '> marks the moment you leave visual mode, so by the
--- time the keymap callback fires (normal mode) the marks are already stable.
+-- Reads the '< and '> marks, which Vim only flushes when visual mode is LEFT.
+-- A mode="v" Lua keymap fires while STILL in visual mode, so the caller must
+-- exit visual mode first (see ask_selection) or these marks hold the PREVIOUS
+-- selection (empty on first use → false "no text selected").
 -- getpos returns {bufnr, line, col, off} — col is 1-based byte offset.
 local function get_visual_selection()
   local s = vim.fn.getpos("'<")
@@ -135,6 +137,14 @@ function mod.ask_selection()
       vim.log.levels.ERROR
     )
     return
+  end
+
+  -- This is a mode="v" keymap, so it fires while STILL in visual mode — at
+  -- which point '< and '> hold the PREVIOUS selection (empty on first use).
+  -- Leave visual mode to flush the marks to the CURRENT selection before
+  -- reading it. \27 == <Esc>; the \22 branch covers blockwise (<C-v>).
+  if vim.fn.mode():match("[vV\22]") then
+    vim.cmd("normal! \27")
   end
 
   local selection = get_visual_selection()

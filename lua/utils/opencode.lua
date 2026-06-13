@@ -64,6 +64,16 @@ local function create_term(root)
       -- Pass <Esc> through to the TUI (e.g. dismiss ctrl+p palette).
       -- Use <C-\><C-n> to exit terminal mode instead.
       vim.keymap.set("t", "<Esc>", "<Esc>", { buffer = term.bufnr, noremap = true })
+      -- Rename the buffer so bufferline (tab) and lualine (statusline) show
+      -- "opencode" instead of toggleterm's raw "term://…;#toggleterm#1" URI.
+      -- toggleterm tracks this terminal via its Terminal object, not the buffer
+      -- name, so the rename is safe. Guard against re-running on every toggle:
+      -- after the rename the name resolves to "<cwd>/opencode", so skip if it
+      -- already ends in /opencode. pcall guards the rare E95 name-collision.
+      local bufname = vim.api.nvim_buf_get_name(term.bufnr)
+      if not bufname:match("/opencode$") then
+        pcall(vim.api.nvim_buf_set_name, term.bufnr, "opencode")
+      end
     end,
     on_close        = function()
       state.opencode_active = false

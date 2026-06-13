@@ -6,9 +6,9 @@ return {
     {
       "<C-s>",
       function()
-        require("utils.tree_toggle").toggle_at_dev()
+        require("utils.tree_toggle").toggle_at_cwd()
       end,
-      desc = "Toggle File Tree at ~/dev",
+      desc = "Toggle File Tree at project cwd",
     },
   },
   config = function()
@@ -16,7 +16,11 @@ return {
 
     nvim_tree.setup {
       view = { side = "left", width = 35 },
-      update_focused_file = { enable = true },
+      -- Keep the tree root following :cd so it shows the project the dock picker
+      -- opened (e.g. ~/dev/kos), not Neovim's startup cwd (~/dev).
+      sync_root_with_cwd = true,
+      respect_buf_cwd = true,
+      update_focused_file = { enable = true, update_root = true },
       renderer = {
         indent_markers = {
           enable = true,

@@ -6,7 +6,12 @@ return {
     "rcarriga/nvim-notify",
   },
   config = function()
-    require("notify").setup()
+    -- background_colour is required when the colorscheme has a transparent or
+    -- unset Normal background; nvim-notify uses it as the 100%-transparency
+    -- fallback colour when building notification highlight groups
+    require("notify").setup({
+      background_colour = "#000000",
+    })
     vim.notify = require("notify")
     local noice = require("noice")
 

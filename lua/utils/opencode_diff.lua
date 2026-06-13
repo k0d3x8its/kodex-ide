@@ -126,7 +126,7 @@ local function open_diff(path)
 
   vim.notify(
     "OpenCode proposed changes — `do` accept hunk (from original window; :w after)"
-      .. " | <leader>oa accept all | <leader>ox reject all",
+    .. " | <leader>oa accept all | <leader>ox reject all",
     vim.log.levels.INFO
   )
   log("diff-open:" .. path)
@@ -182,7 +182,7 @@ local function ensure_autocmds()
         vim.schedule(function()
           vim.notify(
             "OpenCode changed " .. vim.fn.fnamemodify(ev.file, ":t")
-              .. " but the buffer has unsaved local edits — accept-all will overwrite them",
+            .. " but the buffer has unsaved local edits — accept-all will overwrite them",
             vim.log.levels.WARN
           )
         end)

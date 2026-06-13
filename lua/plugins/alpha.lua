@@ -62,7 +62,8 @@ return {
     end
 
     -- ────────────────────────────────────────────────────────────────────────────
-    -- 3) RECENT FILES SECTION     FIX: file path will extend into its option if path is long enough
+    -- 3) RECENT FILES SECTION — buttons auto-width to the longest path so the
+    --    "SPC N" shortcut extends past the path instead of overlapping it
     -- ────────────────────────────────────────────────────────────────────────────
     local recent = { type = "group", val = {}, opts = { spacing = 1 } }
 
@@ -83,6 +84,19 @@ return {
       end
     end
 
+    -- Size the buttons to the longest path so the right-aligned "SPC N"
+    -- shortcut extends past the path instead of overlapping it. alpha's default
+    -- width=50 is too narrow for long entries like ~/dev/.../local/bin/batctrl.
+    -- Width counts display cells (strdisplaywidth), not bytes.
+    local max_w = 0
+    for _, file in ipairs(files) do
+      local display = vim.fn.fnamemodify(file, ":~")
+      max_w = math.max(max_w, vim.fn.strdisplaywidth(display))
+    end
+    -- +3 for the devicon (1 cell) and its 2 trailing spaces; +8 for the
+    -- right-aligned "SPC N" shortcut (5 cells) plus a gap
+    local btn_width = max_w + 3 + 8
+
     for i, file in ipairs(files) do
       local display = vim.fn.fnamemodify(file, ":~")
       local ext = vim.fn.fnamemodify(file, ":e")
@@ -94,6 +108,7 @@ return {
 
       local btn = dashboard.button("SPC " .. i, label, cmd)
       btn.opts.position = "center"
+      btn.opts.width = btn_width
       table.insert(recent.val, btn)
     end
 

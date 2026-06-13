@@ -58,11 +58,14 @@ local function create_term(root)
     -- flag flips via callbacks, not in toggle(): catches every close path
     -- (keymap, :q on the window, etc.). Diff hooks manage 'autoread' +
     -- interceptor autocmds (findings Q6 prototype correction #1).
-    on_open = function()
+    on_open         = function(term)
       state.opencode_active = true
       require("utils.opencode_diff").on_panel_open()
+      -- Pass <Esc> through to the TUI (e.g. dismiss ctrl+p palette).
+      -- Use <C-\><C-n> to exit terminal mode instead.
+      vim.keymap.set("t", "<Esc>", "<Esc>", { buffer = term.bufnr, noremap = true })
     end,
-    on_close = function()
+    on_close        = function()
       state.opencode_active = false
       require("utils.opencode_diff").on_panel_close()
     end,

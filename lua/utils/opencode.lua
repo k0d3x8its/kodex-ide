@@ -95,6 +95,67 @@ function mod.toggle()
   state.term:toggle(panel_width())
 end
 
+--- Return text from last visual selection.
+-- Vim sets the '< and '> marks the moment you leave visual mode, so by the
+-- time the keymap callback fires (normal mode) the marks are already stable.
+-- getpos returns {bufnr, line, col, off} — col is 1-based byte offset.
+local function get_visual_selection()
+  local s = vim.fn.getpos("'<")
+  local e = vim.fn.getpos("'>")
+  -- nvim_buf_get_lines is 0-indexed, end-exclusive
+  local lines = vim.api.nvim_buf_get_lines(0, s[2] - 1, e[2], false)
+  if #lines == 0 then return "" end
+  -- trim the last line to the end-column first (before trimming the first
+  -- line shifts index [1] when the selection is a single line)
+  lines[#lines] = lines[#lines]:sub(1, e[3])
+  -- trim the first line to start at the selection's start-column
+  lines[1] = lines[1]:sub(s[3])
+  return table.concat(lines, "\n")
+end
+
+--- Ask OpenCode about visually selected text (<leader>oq).
+-- Flow: yank visual selection → floating prompt → open panel if needed →
+-- send "<question>\n\n```\n<selection>\n```" to the running TUI.
+-- vim.ui.input is used so dressing.nvim / noice.nvim can style the float
+-- (matches the "Ask opencode  @selection:" UI shown in the design reference).
+function mod.ask_selection()
+  if not mod.is_available() then
+    vim.notify(
+      "opencode not found at ~/.opencode/bin/opencode — install from opencode.ai",
+      vim.log.levels.ERROR
+    )
+    return
+  end
+
+  local selection = get_visual_selection()
+  if selection == "" then
+    vim.notify("OpenCode: no text selected", vim.log.levels.WARN)
+    return
+  end
+
+  -- prompt string intentionally mirrors the "Ask opencode  @selection:" label
+  -- from the design reference so the UX is recognisable without extra UI work
+  vim.ui.input({ prompt = "Ask opencode  @selection: " }, function(question)
+    if not question or question == "" then return end
+
+    -- snapshot open state BEFORE mod.open() so we know whether the TUI was
+    -- already running or is booting cold right now
+    local already_open = state.term and state.term:is_open()
+    mod.open()
+
+    -- cold-boot needs ~500 ms for opencode's TUI to reach its input loop;
+    -- an already-open panel just needs a tick for focus to settle
+    local delay = already_open and 50 or 500
+    vim.defer_fn(function()
+      -- fenced code block so opencode renders the selection as code, not prose
+      local msg = question .. "\n\n```\n" .. selection .. "\n```"
+      -- term:send(text, true) writes to the terminal channel then appends \n,
+      -- which submits the message exactly as if the user pressed <CR>
+      state.term:send(msg, true)
+    end, delay)
+  end)
+end
+
 --- Open without toggling — dock-launch flow calls this (findings Q14)
 function mod.open()
   if state.term and state.term:is_open() then

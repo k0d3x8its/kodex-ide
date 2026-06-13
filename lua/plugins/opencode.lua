@@ -38,5 +38,16 @@ return {
       end,
       desc = "OpenCode: reset session",
     },
+    {
+      -- visual-mode only: yank selection, prompt for a question, send both to
+      -- the OpenCode panel. Bound to <leader>oq (o=opencode, q=question) —
+      -- free in the <leader>o* namespace and mnemonic for "ask".
+      "<leader>oq",
+      function()
+        require("utils.opencode").ask_selection()
+      end,
+      mode = "v",
+      desc = "OpenCode: ask about selection",
+    },
   },
 }

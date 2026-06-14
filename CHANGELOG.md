@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### 2026-06-13
+#### Added
+- ➕ Dock-launch project pick now prompts "Restore session" vs "New session" when the chosen project already has a saved session, instead of silently auto-restoring [\[00b8c25\]](https://github.com/k0d3x8its/kodex-ide/commit/00b8c25f28b78d9e83903803509c66be447e4be5)
+- ➕ Headless test harness — `make test` runs each `tests/*_spec.lua` in its own `nvim --headless -u NONE`, covering the diff-queue mechanism (9 hard cases) plus regressions for every v1.1.0 review fix [\[c334e18\]](https://github.com/k0d3x8its/kodex-ide/commit/c334e18d7e15ee311a881b0231f86e49f62362a2) [\[ce2fff9\]](https://github.com/k0d3x8its/kodex-ide/commit/ce2fff9ed9ada98f1004913a06830604fe530bda) [\[abfcfbf\]](https://github.com/k0d3x8its/kodex-ide/commit/abfcfbf048616578090ce6f7d22c1424616839d6) [\[a9c6dab\]](https://github.com/k0d3x8its/kodex-ide/commit/a9c6dabcefb9267d9f06fe7c9dfaea705e251029) [\[4df5d31\]](https://github.com/k0d3x8its/kodex-ide/commit/4df5d31f5b83227d3d0331df96b5f384f9ed985a)
+
+#### Fixed
+- 🛠️ Hardened the OpenCode diff workflow — drains the queue when a queued file has no open buffer, survives an opencode-deleted file, guards an invalidated original buffer, and on a failed accept/reject write now notifies and keeps the diff open rather than silently advancing as if the revert succeeded (prevented a data-loss case where changes stayed on disk) [\[49e5f7e\]](https://github.com/k0d3x8its/kodex-ide/commit/49e5f7e45775957f8d69de668405ad8c07b5e3df)
+
+#### Changed
+- ♻️ Hardened OpenCode panel internals — shared availability guard, warm-job send delay (50 ms vs 500 ms cold boot), and a `selection=exclusive`-aware visual-selection trim [\[002a537\]](https://github.com/k0d3x8its/kodex-ide/commit/002a537163fd658b8376607d85ec18399bb7a4ae)
+- ♻️ Migrated the deprecated `vim.loop` to `vim.uv` across the init bootstrap, keymaps, and PlatformIO status [\[1f2a11d\]](https://github.com/k0d3x8its/kodex-ide/commit/1f2a11d8535ed3cf0a34cd8e2e2c9811fb5ed575) [\[a92f996\]](https://github.com/k0d3x8its/kodex-ide/commit/a92f99661d94f054a509c3433bb06fe02436aa47) [\[b4cd97f\]](https://github.com/k0d3x8its/kodex-ide/commit/b4cd97f36ece96c075a84108a6b04e23c5e90f20)
+- ♻️ Recorded `make test` as the repo's verify command in KNOWLEDGE.md [\[658867f\]](https://github.com/k0d3x8its/kodex-ide/commit/658867f7fc43f9cbb6ee8f342902d44359c48f56)
+
+#### Removed
+- ❌ Deleted the dead `lua/core/lazy.lua` bootstrap duplicate — `init.lua` already bootstraps lazy.nvim inline [\[bd69cdc\]](https://github.com/k0d3x8its/kodex-ide/commit/bd69cdc8e1fe853db7ff0845fa0e6b2437bad0c9)
+
 ## v1.1.0 (2026-06-13)
 #### Added
 - ➕ Project picker on launch — `KODEX_IDE=1` triggers a project chooser at `VimEnter` so the IDE opens straight into a chosen project [\[c5e813f\]](https://github.com/k0d3x8its/kodex-ide/commit/c5e813f7795ab7aa57ca0380ef04b6ea9f8ab516)

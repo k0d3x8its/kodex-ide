@@ -13,7 +13,7 @@ local PioStatus = {}
 local function get_buffer_directory(buffer_number)
   local buffer_full_path = vim.api.nvim_buf_get_name(buffer_number)
   if buffer_full_path == "" then
-    return vim.loop.cwd()
+    return vim.uv.cwd()
   end
   return vim.fs.dirname(buffer_full_path)
 end
@@ -38,7 +38,7 @@ local function list_immediate_subdirectories(parent_directory)
   local subdirectories = {}
 
   local scan_root_directory = parent_directory or ""
-  local handle_or_iterator, legacy_dir_handle = vim.loop.fs_scandir(scan_root_directory)
+  local handle_or_iterator, legacy_dir_handle = vim.uv.fs_scandir(scan_root_directory)
   if not handle_or_iterator then
     return subdirectories
   end
@@ -47,7 +47,7 @@ local function list_immediate_subdirectories(parent_directory)
     local scandir_handle = handle_or_iterator
 
     while true do
-      local entry_name, entry_type = vim.loop.fs_scandir_next(scandir_handle)
+      local entry_name, entry_type = vim.uv.fs_scandir_next(scandir_handle)
 
       if not entry_name then
         break

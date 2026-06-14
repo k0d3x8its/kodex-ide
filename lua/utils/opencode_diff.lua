@@ -69,25 +69,63 @@ end
 
 function M.accept_all()
   local s = M.state
+  -- The original buffer can be :bd'd while the scratch diff is still open;
+  -- writing into an invalid buffer throws. Bail to the next queue item instead.
+  if not (s.scratch and vim.api.nvim_buf_is_valid(s.scratch)
+      and s.orig_buf and vim.api.nvim_buf_is_valid(s.orig_buf)) then
+    log("accept-all-skipped-invalid:" .. tostring(s.current))
+    close_diff()
+    return
+  end
   local lines = vim.api.nvim_buf_get_lines(s.scratch, 0, -1, false)
   vim.api.nvim_buf_set_lines(s.orig_buf, 0, -1, false, lines)
   -- CORRECTION #5: bang required — disk changed since last *read*, and the FCS
   -- event doesn't sync the read-timestamp the overwrite check uses. Plain :w
   -- prompts "changed since reading it!!!" and blocks the UI.
-  vim.api.nvim_buf_call(s.orig_buf, function() vim.cmd("silent write!") end)
+  local name = vim.fn.fnamemodify(s.current or "?", ":t")
+  local ok, err = pcall(vim.api.nvim_buf_call, s.orig_buf, function()
+    vim.cmd("silent write!")
+  end)
+  if not ok then
+    -- write failed (perms, disk full): the accepted content is in the buffer
+    -- but NOT on disk. Warn and keep the diff open so the user can retry,
+    -- rather than advancing as if the write succeeded.
+    log("accept-all-FAILED:" .. tostring(err))
+    vim.schedule(function()
+      vim.notify("OpenCode: write FAILED for " .. name .. " — " .. tostring(err),
+        vim.log.levels.ERROR)
+    end)
+    return
+  end
   log("accept-all:" .. s.current)
   close_diff()
 end
 
 function M.reject_all()
   local s = M.state
+  if not (s.orig_buf and vim.api.nvim_buf_is_valid(s.orig_buf)) then
+    close_diff()
+    return
+  end
   -- opencode already wrote the file: closing without writing leaves disk
   -- modified → next checktime re-queues the same file forever. Write original
   -- buffer content back to disk to neutralize (bang: see CORRECTION #5 above).
+  local name = vim.fn.fnamemodify(s.current or "?", ":t")
   local ok, err = pcall(vim.api.nvim_buf_call, s.orig_buf, function()
     vim.cmd("silent write!")
   end)
-  log(ok and ("reject-all:" .. s.current) or ("reject-all-FAILED:" .. tostring(err)))
+  if not ok then
+    -- write failed → opencode's changes are STILL on disk. Silently advancing
+    -- here would make the user believe the revert succeeded (data loss). Warn
+    -- loudly and keep the diff open so they can fix the cause and retry.
+    log("reject-all-FAILED:" .. tostring(err))
+    vim.schedule(function()
+      vim.notify("OpenCode: revert FAILED for " .. name
+        .. " — changes still on disk: " .. tostring(err), vim.log.levels.ERROR)
+    end)
+    return
+  end
+  log("reject-all:" .. s.current)
   close_diff()
 end
 
@@ -96,9 +134,17 @@ local function open_diff(path)
   local buf = vim.fn.bufnr(path)
   if buf == -1 then
     log("no-buffer:" .. path) -- v1 limitation, see header comment
+    vim.schedule(M.process_next) -- don't strand the rest of the queue
     return
   end
-  local disk = vim.fn.readfile(path)
+  -- opencode may have DELETED the file (FCS fires for deletion too); readfile
+  -- then throws inside this scheduled callback. Skip and drain the queue.
+  local ok, disk = pcall(vim.fn.readfile, path)
+  if not ok then
+    log("readfile-failed:" .. path)
+    vim.schedule(M.process_next)
+    return
+  end
 
   local scratch = vim.api.nvim_create_buf(false, true) -- nofile scratch
   vim.api.nvim_buf_set_lines(scratch, 0, -1, false, disk)

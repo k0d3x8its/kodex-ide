@@ -16,19 +16,19 @@ end
 local function get_start_directory_from_buffer(buffer_number)
   local buffer_full_path = vim.api.nvim_buf_get_name(buffer_number)
   if type(buffer_full_path) ~= "string" or buffer_full_path == "" then
-    return vim.loop.cwd()
+    return vim.uv.cwd()
   end
 
   local directory_name = vim.fs.dirname(buffer_full_path)
   if type(directory_name) ~= "string" or directory_name == "" then
-    return vim.loop.cwd()
+    return vim.uv.cwd()
   end
   return directory_name
 end
 
 -- tiny wrapper so to never pass a boolean path to vim.fs.find
 local function safe_fs_find(name, start_directory)
-  local path_arg = (type(start_directory) == "string" and start_directory) or vim.loop.cwd()
+  local path_arg = (type(start_directory) == "string" and start_directory) or vim.uv.cwd()
   return vim.fs.find(name, { path = path_arg, upward = true })[1]
 end
 

@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-### 2026-06-13
+## v1.2.0 (2026-06-13)
 #### Added
 - ➕ Dock-launch project pick now prompts "Restore session" vs "New session" when the chosen project already has a saved session, instead of silently auto-restoring [\[00b8c25\]](https://github.com/k0d3x8its/kodex-ide/commit/00b8c25f28b78d9e83903803509c66be447e4be5)
 - ➕ Headless test harness — `make test` runs each `tests/*_spec.lua` in its own `nvim --headless -u NONE`, covering the diff-queue mechanism (9 hard cases) plus regressions for every v1.1.0 review fix [\[c334e18\]](https://github.com/k0d3x8its/kodex-ide/commit/c334e18d7e15ee311a881b0231f86e49f62362a2) [\[ce2fff9\]](https://github.com/k0d3x8its/kodex-ide/commit/ce2fff9ed9ada98f1004913a06830604fe530bda) [\[abfcfbf\]](https://github.com/k0d3x8its/kodex-ide/commit/abfcfbf048616578090ce6f7d22c1424616839d6) [\[a9c6dab\]](https://github.com/k0d3x8its/kodex-ide/commit/a9c6dabcefb9267d9f06fe7c9dfaea705e251029) [\[4df5d31\]](https://github.com/k0d3x8its/kodex-ide/commit/4df5d31f5b83227d3d0331df96b5f384f9ed985a)

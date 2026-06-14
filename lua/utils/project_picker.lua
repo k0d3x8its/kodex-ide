@@ -120,7 +120,14 @@ function mod.pick()
     -- nil means the user dismissed the picker — do nothing.
     if not choice then return end
 
-    local proj
+    -- Shared tail. Defer 200 ms so any restore_session() source() call finishes
+    -- opening buffers before open_workspace inspects the window layout.
+    local function finish(proj)
+      vim.defer_fn(function()
+        open_workspace(proj)
+      end, 200)
+    end
+
     if choice == RESUME then
       -- get_root_dir() returns the session-storage dir on disk, not a project root.
       -- We search only sessions matching known ~/dev/* projects so that sessions
@@ -134,22 +141,41 @@ function mod.pick()
       -- restore_session(name) re-escapes the path to locate the session file,
       -- then sources it — which cds and reopens the saved buffers.
       AutoSession.restore_session(latest)
-      proj = latest
-    else
-      -- Change cwd first so restore_session() (called with no args) resolves
-      -- the session file for this project's directory.
-      vim.cmd("cd " .. vim.fn.fnameescape(choice))
-      -- No session for this project yet → restore_session is a no-op and the
-      -- dashboard stays open so the user can start fresh.
-      AutoSession.restore_session()
-      proj = choice
+      finish(latest)
+      return
     end
 
-    -- Defer 200 ms: gives the session source() call time to finish opening
-    -- buffers before we inspect the window layout and open the sidebar.
-    vim.defer_fn(function()
-      open_workspace(proj)
-    end, 200)
+    -- Project chosen. cd first so a fresh start roots correctly and so
+    -- restore_session() (called with no args) resolves this project's session file.
+    vim.cmd("cd " .. vim.fn.fnameescape(choice))
+
+    -- Detect an existing saved session for this project (getftime → -1 if absent).
+    local Lib = require("auto-session.lib")
+    local session_file = AutoSession.get_root_dir() .. Lib.escape_session_name(choice) .. ".vim"
+    local has_session = vim.fn.getftime(session_file) ~= -1
+
+    if not has_session then
+      -- No session yet → straight to fresh: open_workspace opens the sidebar and
+      -- defers OpenCode until the first file is picked. No prompt.
+      finish(choice)
+      return
+    end
+
+    -- Existing session → let the user choose restore vs fresh instead of silently
+    -- auto-restoring (user decision 2026-06-13).
+    vim.ui.select({ "Restore session", "New session" }, {
+      prompt = "Session found for " .. vim.fn.fnamemodify(choice, ":t") .. ":",
+    }, function(action)
+      -- Dismiss (Esc) defaults to Restore — preserves the old silent-restore
+      -- behavior the user is accustomed to, least surprising.
+      if not action or action == "Restore session" then
+        AutoSession.restore_session()
+      end
+      -- "New session": skip restore entirely. The stale session file is left in
+      -- place and gets overwritten by auto-session's autosave on next exit
+      -- (user decision 2026-06-13 — no explicit delete, lower risk than rm).
+      finish(choice)
+    end)
   end)
 end
 

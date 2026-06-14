@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+## v1.1.0 (2026-06-13)
+#### Added
+- ➕ Project picker on launch — `KODEX_IDE=1` triggers a project chooser at `VimEnter` so the IDE opens straight into a chosen project [\[c5e813f\]](https://github.com/k0d3x8its/kodex-ide/commit/c5e813f7795ab7aa57ca0380ef04b6ea9f8ab516)
+- ➕ Project picker utility backing the launch chooser [\[6f942a5\]](https://github.com/k0d3x8its/kodex-ide/commit/6f942a5f12e0dbd91170c1dffd62225bc0156b21)
+- ➕ File tree now roots at the selected project's cwd instead of a fixed `~/dev`, with `<C-s>` bound to toggle the tree rooted at project cwd [\[6f86630\]](https://github.com/k0d3x8its/kodex-ide/commit/6f8663054ad9be8c7535b2d1159a7d29cb892e80)
+- ➕ nvim-tree toggle rooted at project cwd rather than the hard-coded `~/dev` path [\[2649f39\]](https://github.com/k0d3x8its/kodex-ide/commit/2649f397e31886da6565795df9a20479db5d37c1)
+- ➕ Fresh project pick opens the sidebar immediately and defers the OpenCode panel until the first file is chosen [\[5d00972\]](https://github.com/k0d3x8its/kodex-ide/commit/5d00972d8ddf34db609a9158f196121b65ea6f1e)
+- ➕ Bufferline tab stays labelled by the active file even when the OpenCode panel holds focus [\[5c89c9f\]](https://github.com/k0d3x8its/kodex-ide/commit/5c89c9f72a3038ae9e0489d411f55b6953e13838)
+- ➕ OpenCode terminal buffer renamed to `opencode` for a clean statusline label [\[e2f09f8\]](https://github.com/k0d3x8its/kodex-ide/commit/e2f09f8e9874de411735cb471d5c164a69bead24)
+- ➕ `ask_selection()` sends the current visual selection plus a question to OpenCode [\[124273f\]](https://github.com/k0d3x8its/kodex-ide/commit/124273f8f71f1b2a3f75e5bb6f1b4a03b10616f0)
+- ➕ `<leader>oq` visual-mode keymap wired to the OpenCode ask-selection flow [\[5d9ff3c\]](https://github.com/k0d3x8its/kodex-ide/commit/5d9ff3c8f8342a6cbc926a32105c2b5e48fc5f3d)
+
+#### Fixed
+- 🛠️ OpenCode ask now flushes visual marks before reading the selection, so the correct range is sent [\[6dbb600\]](https://github.com/k0d3x8its/kodex-ide/commit/6dbb60004f8c8947a8207ba6b5059e4076938427)
+- 🛠️ Auto-session restore purges terminal buffers in `pre_save_cmds`, preventing the "Invalid terminal direction" error on reload [\[774fb2b\]](https://github.com/k0d3x8its/kodex-ide/commit/774fb2bed109bda2dd4c9be9d87948d8aa73a53a)
+- 🛠️ Resume-last-session scoped to `~/dev/*` projects only, so it no longer fires in unrelated directories [\[81d9feb\]](https://github.com/k0d3x8its/kodex-ide/commit/81d9feb920248fe90221a1d9de38901d9e2ea247)
+- 🛠️ Dashboard Recent Files auto-widths so `SPC N` labels no longer overlap file paths [\[982ea4a\]](https://github.com/k0d3x8its/kodex-ide/commit/982ea4a7eb68f23e432ac5875d35ccd6432b5e17)
+- 🛠️ nvim-notify `background_colour` set to silence the `NotifyBackground` warning [\[e0ff97e\]](https://github.com/k0d3x8its/kodex-ide/commit/e0ff97e3703b6f2605af9bf7ceef3261a593ce48)
+- 🛠️ `<Esc>` now passes through to the OpenCode TUI in terminal mode [\[1548630\]](https://github.com/k0d3x8its/kodex-ide/commit/1548630393fa23c4cc0249cd43339683bb3f5948)
+
+#### Changed
+- ❌ Removed throwaway `proto/` scaffolding after the diff workflow was verified [\[3c2d1bc\]](https://github.com/k0d3x8its/kodex-ide/commit/3c2d1bc3ff0d26a22dc0fd1c029df745e4b55777)
+- ♻️ Fixed string-concat indentation in `opencode_diff` [\[c308ca1\]](https://github.com/k0d3x8its/kodex-ide/commit/c308ca1e5642c6179ce929222aebf4942f2d70a7)
+- ⬆️ Refreshed the plugin lockfile [\[199b8df\]](https://github.com/k0d3x8its/kodex-ide/commit/199b8df3ac572b9a0a004fb5078b79d7230e994a)
+
 ## v1.0.1b (2026-05-24)
 
 - **♻️:** update install instructions for the `kodex-ide` repo

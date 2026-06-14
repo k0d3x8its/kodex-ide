@@ -12,6 +12,19 @@ function mod.is_available()
   return vim.fn.executable(mod.OPENCODE_BIN) == 1
 end
 
+-- Shared entry-point guard: notify once + return false when the binary is
+-- missing. Both toggle() and ask_selection() gate on this.
+local function ensure_available()
+  if mod.is_available() then
+    return true
+  end
+  vim.notify(
+    "opencode not found at ~/.opencode/bin/opencode — install from opencode.ai",
+    vim.log.levels.ERROR
+  )
+  return false
+end
+
 -- Panel state (findings Q5, Q11). Exposed so the diff workflow (Goal 3)
 -- can gate on opencode_active and share diff_queue.
 mod.state = {
@@ -84,11 +97,7 @@ end
 
 --- Toggle panel open/close (`<leader>oc`)
 function mod.toggle()
-  if not mod.is_available() then
-    vim.notify(
-      "opencode not found at ~/.opencode/bin/opencode — install from opencode.ai",
-      vim.log.levels.ERROR
-    )
+  if not ensure_available() then
     return
   end
 
@@ -117,9 +126,15 @@ local function get_visual_selection()
   -- nvim_buf_get_lines is 0-indexed, end-exclusive
   local lines = vim.api.nvim_buf_get_lines(0, s[2] - 1, e[2], false)
   if #lines == 0 then return "" end
+  -- '> col is inclusive under the default selection=inclusive; with
+  -- selection=exclusive it points one past the last char, so drop one.
+  local end_col = e[3]
+  if vim.o.selection == "exclusive" then
+    end_col = end_col - 1
+  end
   -- trim the last line to the end-column first (before trimming the first
   -- line shifts index [1] when the selection is a single line)
-  lines[#lines] = lines[#lines]:sub(1, e[3])
+  lines[#lines] = lines[#lines]:sub(1, end_col)
   -- trim the first line to start at the selection's start-column
   lines[1] = lines[1]:sub(s[3])
   return table.concat(lines, "\n")
@@ -131,11 +146,7 @@ end
 -- vim.ui.input is used so dressing.nvim / noice.nvim can style the float
 -- (matches the "Ask opencode  @selection:" UI shown in the design reference).
 function mod.ask_selection()
-  if not mod.is_available() then
-    vim.notify(
-      "opencode not found at ~/.opencode/bin/opencode — install from opencode.ai",
-      vim.log.levels.ERROR
-    )
+  if not ensure_available() then
     return
   end
 
@@ -158,14 +169,16 @@ function mod.ask_selection()
   vim.ui.input({ prompt = "Ask opencode  @selection: " }, function(question)
     if not question or question == "" then return end
 
-    -- snapshot open state BEFORE mod.open() so we know whether the TUI was
-    -- already running or is booting cold right now
-    local already_open = state.term and state.term:is_open()
+    -- snapshot BEFORE mod.open() so we know whether the TUI job already exists.
+    -- close_on_exit=false keeps the job alive across toggles, so a term that
+    -- exists at all (even toggled closed) is already at its input loop — only a
+    -- never-created term is a true cold boot.
+    local warm = state.term ~= nil
     mod.open()
 
     -- cold-boot needs ~500 ms for opencode's TUI to reach its input loop;
-    -- an already-open panel just needs a tick for focus to settle
-    local delay = already_open and 50 or 500
+    -- a warm job just needs a tick for focus/redraw to settle
+    local delay = warm and 50 or 500
     vim.defer_fn(function()
       -- fenced code block so opencode renders the selection as code, not prose
       local msg = question .. "\n\n```\n" .. selection .. "\n```"

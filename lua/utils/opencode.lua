@@ -73,6 +73,12 @@ local function create_term(root)
     -- interceptor autocmds (findings Q6 prototype correction #1).
     on_open         = function(term)
       state.opencode_active = true
+      -- Force the far-right column on every open. Without this, opening the
+      -- panel while the dev terminal is up anchors the split to the terminal's
+      -- window and OpenCode lands as a horizontal strip UNDER it instead of a
+      -- vertical panel on the right. See utils.term_layout for the toggleterm
+      -- grouping behaviour this works around.
+      require("utils.term_layout").place_vertical(panel_width())
       require("utils.opencode_diff").on_panel_open()
       -- Pass <Esc> through to the TUI (e.g. dismiss ctrl+p palette).
       -- Use <C-\><C-n> to exit terminal mode instead.

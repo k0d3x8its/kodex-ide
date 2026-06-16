@@ -62,8 +62,6 @@ by *excluding* terminals + sidebars (`EXCLUDE_FT`) rather than requiring an empt
 buftype, so the dashboard counts as a valid anchor. Regression covered by the
 `alpha-dashboard` scenario in the spec.
 
-_Not committed — left in the working tree for review._
-
 ## What would have prevented this
 A real-layout test seam. Every existing spec **stubs** toggleterm
 (`tests/helpers.lua:15`), so split/grouping behaviour — the exact thing that
@@ -71,12 +69,14 @@ broke — was untestable. Added `tests/term_layout_spec.lua`, which loads the re
 plugin and asserts the canonical 3-pane layout in both open orders.
 
 ## Follow-up
-- `tests/term_layout_spec.lua` **duplicates** the dev-terminal re-pin
-  orchestration inline rather than driving the real `term_toggle` + `opencode`
-  wiring (those gate on the OpenCode binary and spawn real `cmd` jobs). The
-  `term_layout` *primitives* are exercised for real, but a drift in the
-  `on_open` orchestration wouldn't be caught. → `[BACKLOG][TEST]` written to
-  TODOS.md.
-- `<C-x>` in terminal mode now also intercepts `<C-x>` inside the OpenCode TUI
-  (deliberate, so the terminal can be summoned from there). If OpenCode itself
-  needs `<C-x>`, revisit. → noted as `[LOW]` in TODOS.md.
+- **Test seam still partial.** `tests/term_layout_spec.lua` **duplicates** the
+  dev-terminal re-pin orchestration inline rather than driving the real
+  `term_toggle` + `opencode` wiring (those gate on the OpenCode binary and spawn
+  real `cmd` jobs). The `term_layout` *primitives* are exercised for real, but a
+  drift in the `on_open` orchestration wouldn't be caught. A HITL/`run`-based
+  check that opens the real OpenCode TUI and screenshots the panel after
+  dev-terminal open/reopen would close the gap.
+- **`<C-x>` reaches into the OpenCode TUI.** The terminal-mode bind
+  (`mode = { "n", "t" }`) means `<C-x>` is intercepted inside the OpenCode TUI
+  too — deliberate, so the dev terminal can be summoned from there. Revisit if
+  OpenCode itself ever needs `<C-x>`.

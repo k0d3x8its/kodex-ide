@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## v1.2.1 (2026-06-16)
+#### Added
+- ➕: `term_layout` utility places the dev terminal and the OpenCode panel independently, working around toggleterm grouping every terminal split into the first terminal's window [\[3f56ca1\]](https://github.com/k0d3x8its/kodex-ide/commit/3f56ca10c0af6aa10e6f733b33454d6327a6deda)
+
+#### Fixed
+- 🛠️: OpenCode panel now pins to the far-right vertical column on open instead of inheriting the dev terminal's split position [\[3b9a217\]](https://github.com/k0d3x8its/kodex-ide/commit/3b9a21736dd130843c769c7c3d0cf0e0b36593ef)
+- 🛠️: Dev terminal is homed as a short strip under the editor window rather than spanning full width [\[4cec87d\]](https://github.com/k0d3x8its/kodex-ide/commit/4cec87d7187390e3be1a591737153d2e7f3785a1)
+- 🛠️: Dropped the conflicting toggleterm `open_mapping` and bound `<C-x>` in terminal mode so the toggle no longer clashes [\[b0361a0\]](https://github.com/k0d3x8its/kodex-ide/commit/b0361a056b02ef520a2fc7f82c8b61d146094997)
+
+#### Changed
+- ♻️: Added a real-toggleterm layout regression spec covering dev→oc, oc→dev, reopen, and alpha-dashboard cases [\[e0f8b81\]](https://github.com/k0d3x8its/kodex-ide/commit/e0f8b81a432b83cfd6a4ad01610b3a249a0b8799)
+- ♻️: Post-mortem documenting the OpenCode/terminal layout bug and the live-TUI relocation pitfall [\[f0c9635\]](https://github.com/k0d3x8its/kodex-ide/commit/f0c9635ba596b3eb73bb1e7752f0f938434c5b3b)
+- ♻️: Recorded toggleterm split-grouping and live-TUI `win_splitmove` relocation gotchas in KNOWLEDGE.md [\[6cb1e09\]](https://github.com/k0d3x8its/kodex-ide/commit/6cb1e0981a38e3d2609216a9c20f33da51a69b66)
+- ♻️: Bumped SchemaStore.nvim and nvim-tree.lua lockfile pins [\[026198e\]](https://github.com/k0d3x8its/kodex-ide/commit/026198eade50804bf07f0637e188b9f443bab7fe)
+
 ## v1.2.0 (2026-06-13)
 #### Added
 - ➕: Dock-launch project pick now prompts "Restore session" vs "New session" when the chosen project already has a saved session, instead of silently auto-restoring [\[00b8c25\]](https://github.com/k0d3x8its/kodex-ide/commit/00b8c25f28b78d9e83903803509c66be447e4be5)

@@ -5,3 +5,10 @@ venv/
 # Claude artifacts
 RELEASE-NOTES.md
 session-log.md
+
+# Un-ignore planning files so git-crypt can track them (overrides global gitignore)
+!TODOS.md
+!SESSION-LOG.md
+!findings.md
+!progress.md
+!task_plan.md

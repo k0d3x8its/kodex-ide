@@ -12,6 +12,12 @@
 -- plugin — layout is exactly the behaviour under test, so a stub proves nothing.
 -- If toggleterm isn't installed (e.g. a clean checkout with no plugins synced),
 -- the spec skips rather than failing the suite.
+--
+-- SCOPE: this exercises the term_layout PRIMITIVES against the real plugin, but
+-- it copies the on_open wiring inline and uses a `sleep` job — it does NOT drive
+-- the real term_toggle/opencode orchestration, and a `sleep` is not a TUI, so it
+-- cannot catch on_open drift or the blank-OpenCode redraw bug. Those are covered
+-- by the human-in-the-loop checklist in tests/MANUAL-opencode-layout.md.
 local H = dofile("tests/helpers.lua")
 
 -- Generous grid so 40%/10-row splits have unambiguous room.

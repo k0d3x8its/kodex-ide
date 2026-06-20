@@ -69,13 +69,17 @@ broke — was untestable. Added `tests/term_layout_spec.lua`, which loads the re
 plugin and asserts the canonical 3-pane layout in both open orders.
 
 ## Follow-up
-- **Test seam still partial.** `tests/term_layout_spec.lua` **duplicates** the
-  dev-terminal re-pin orchestration inline rather than driving the real
-  `term_toggle` + `opencode` wiring (those gate on the OpenCode binary and spawn
-  real `cmd` jobs). The `term_layout` *primitives* are exercised for real, but a
-  drift in the `on_open` orchestration wouldn't be caught. A HITL/`run`-based
-  check that opens the real OpenCode TUI and screenshots the panel after
-  dev-terminal open/reopen would close the gap.
+- **Test seam still partial — addressed via HITL checklist (2026-06-20).**
+  `tests/term_layout_spec.lua` **duplicates** the dev-terminal re-pin
+  orchestration inline rather than driving the real `term_toggle` + `opencode`
+  wiring (those gate on the OpenCode binary and spawn real `cmd` jobs). The
+  `term_layout` *primitives* are exercised for real, but a drift in the
+  `on_open` orchestration wouldn't be caught, and a `sleep` job is not a TUI so
+  the blank-OpenCode redraw bug can only be caught live. Rather than add a
+  tmux/pty dependency for a fully-automated run-based check, this is closed with
+  a human-in-the-loop checklist: `tests/MANUAL-opencode-layout.md` drives the
+  real `<C-x>`/`<leader>oc` keybindings against the real OpenCode TUI and has the
+  human verify the panel is rendered (not blank) after dev-terminal open/reopen.
 - **`<C-x>` reaches into the OpenCode TUI.** The terminal-mode bind
   (`mode = { "n", "t" }`) means `<C-x>` is intercepted inside the OpenCode TUI
   too — deliberate, so the dev terminal can be summoned from there. Revisit if

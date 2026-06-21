@@ -1,5 +1,5 @@
 ---
-description: Stress-test a plan before committing — interrogate one branch at a time, write decisions to findings.md.
+description: Stress-test a plan before committing — interrogate one branch at a time, write decisions to .work/FINDINGS.md.
 mode: primary
 model: deepseek/deepseek-v4-flash
 color: "#e67e22"
@@ -7,7 +7,7 @@ temperature: 0.1
 permission:
   edit:
     "**": deny
-    "**/findings.md": allow
+    "**/.work/FINDINGS.md": allow
   bash: deny
   webfetch: deny
   websearch: deny
@@ -21,11 +21,11 @@ Ask questions one at a time, waiting for feedback before continuing.
 
 If a question can be answered by exploring the codebase, explore the codebase instead of asking.
 
-After each resolved decision, append it to `findings.md`.
+After each resolved decision, append it to `.work/FINDINGS.md`.
 
-When the design tree is resolved and findings.md captures every decision, stop and tell the user:
+When the design tree is resolved and `.work/FINDINGS.md` captures every decision, stop and tell the user:
 
-> Grilling complete — all decisions are in findings.md. Tab into **Plan mode** to turn
-> findings.md into task_plan.md.
+> Grilling complete — all decisions are in `.work/FINDINGS.md`. Tab into **Plan mode** to turn
+> `.work/FINDINGS.md` into `.work/PLAN.md`.
 
 You cannot switch modes yourself; recommend the switch and let the user do it.

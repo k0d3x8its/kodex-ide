@@ -146,14 +146,14 @@ When the user is ready to act:
 
 ````md
 ---
-description: Stress-test a plan before committing — interrogate one branch at a time, write decisions to findings.md.
+description: Stress-test a plan before committing — interrogate one branch at a time, write decisions to .work/FINDINGS.md.
 mode: primary
 model: deepseek/deepseek-v4-flash
 temperature: 0.1
 permission:
   edit:
     "**": deny
-    "**/findings.md": allow
+    "**/.work/FINDINGS.md": allow
   bash: deny
   webfetch: deny
   websearch: deny
@@ -167,12 +167,12 @@ Ask questions one at a time, waiting for feedback before continuing.
 
 If a question can be answered by exploring the codebase, explore the codebase instead of asking.
 
-After each resolved decision, append it to `findings.md`.
+After each resolved decision, append it to `.work/FINDINGS.md`.
 
-When the design tree is resolved and findings.md captures every decision, stop and tell the user:
+When the design tree is resolved and .work/FINDINGS.md captures every decision, stop and tell the user:
 
-> Grilling complete — all decisions are in findings.md. Tab into **Plan mode** to turn
-> findings.md into task_plan.md.
+> Grilling complete — all decisions are in .work/FINDINGS.md. Tab into **Plan mode** to turn
+> .work/FINDINGS.md into .work/PLAN.md.
 
 You cannot switch modes yourself; recommend the switch and let the user do it.
 ````
@@ -181,7 +181,7 @@ You cannot switch modes yourself; recommend the switch and let the user do it.
 
 ````md
 ---
-description: Turn a grilled design (findings.md + design doc) into an executable task_plan.md.
+description: Turn a grilled design (.work/FINDINGS.md + design doc) into an executable .work/PLAN.md.
 mode: primary
 model: deepseek/deepseek-v4-flash
 temperature: 0.2
@@ -189,22 +189,22 @@ permission:
   edit:
     "**": deny
     "docs/**": allow
-    "**/task_plan.md": allow
+    "**/.work/PLAN.md": allow
   bash: deny
 ---
 
-You are in Plan mode. This is a read-mostly posture: you may write `task_plan.md` and files
+You are in Plan mode. This is a read-mostly posture: you may write `.work/PLAN.md` and files
 under `docs/`, but you do not edit source code. On entry, follow the write-plan procedure.
 
 ## Step 1 — Gather inputs
 - Design doc: the path the user gives, else the newest file in `docs/brainstorm/`. If neither
   exists, stop and recommend `/brainstorm` first — planning without a design doc skips the
   tradeoff work.
-- `findings.md`: read if present. Resolved decisions there override the design doc (they're newer).
+- `.work/FINDINGS.md`: read if present. Resolved decisions there override the design doc (they're newer).
 - If the design doc still has unanswered **Open questions**, stop and recommend the user Tab back
   into **Grill mode** — every open question becomes a wrong guess baked into the plan.
 
-## Step 2 — Emit task_plan.md
+## Step 2 — Emit .work/PLAN.md
 Use the hierarchy `/sync-trello` parses:
 
 ```markdown
@@ -220,12 +220,12 @@ Rules:
 - Every Task carries a `verify:` sub-bullet — indented, no checkbox. No machine command possible
   → `- verify: manual — [UX] checklist`.
 - Goals map to outcomes, Micro-Goals to milestones, Tasks to single sittings.
-- If `task_plan.md` already exists: append new Goals, never clobber existing Goals or their
+- If `.work/PLAN.md` already exists: append new Goals, never clobber existing Goals or their
   `[trello:ID]` tags.
 
 ## Step 3 — Offer sync
 End with:
-> task_plan.md written: [N] Goals, [M] Tasks. Recommend `/sync-trello` if this project tracks
+> .work/PLAN.md written: [N] Goals, [M] Tasks. Recommend `/sync-trello` if this project tracks
 > work on a board — it's idempotent and annotates Goals with card IDs. Skip it for small or
 > local-only work.
 
@@ -577,12 +577,12 @@ clean, say so plainly rather than inventing nits. Do not edit files — reportin
    tdd/diagnose); each loads its prompt. Report the real order.
 4. **Discuss scope + model** — in Discuss: no edit/write/bash; read + grep work; active model is the
    flash tier.
-5. **Grill write-scope (critical proof)** — in Grill, write to `findings.md` is **allowed**; an edit
+5. **Grill write-scope (critical proof)** — in Grill, write to `.work/FINDINGS.md` is **allowed**; an edit
    to a real source file (e.g. `lua/plugins/opencode.lua`) is **denied**. Proves the `**`-first /
    last-wins scoping. If a source edit slips through, the glob/order fix didn't take — stop, report.
-6. **Handoff chain** — Grill "complete" → recommends Plan → Tab into Plan → reads `findings.md` →
-   produces `task_plan.md` → offers `/sync-trello`.
-7. **Plan write-scope** — Plan writes `task_plan.md`/`docs/**`; a source edit is denied.
+6. **Handoff chain** — Grill "complete" → recommends Plan → Tab into Plan → reads `.work/FINDINGS.md` →
+   produces `.work/PLAN.md` → offers `/sync-trello`.
+7. **Plan write-scope** — Plan writes `.work/PLAN.md`/`docs/**`; a source edit is denied.
 8. **Provider switch** — in any capable mode, `/models` → pick a Gemini and an OpenAI model; confirm
    a trivial prompt returns from each (proves all three keys resolve).
 9. **Subagent isolation** — from build, `@mutation-testing run on <a lua file>` returns a survivor

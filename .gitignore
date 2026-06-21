@@ -8,7 +8,9 @@ session-log.md
 
 # Un-ignore planning files so git-crypt can track them (overrides global gitignore)
 !TODOS.md
-!SESSION-LOG.md
-!findings.md
-!progress.md
-!task_plan.md
+!.memory/SESSION-LOG.md
+# .memory/ARCHIVE-LOG.md stays machine-local (large, low sync value)
+/.memory/ARCHIVE-LOG.md
+!.work/FINDINGS.md
+!.work/PROGRESS.md
+!.work/PLAN.md

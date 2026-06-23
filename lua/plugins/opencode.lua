@@ -7,20 +7,8 @@ return {
   init = function()
     -- cheap at startup: utils/opencode requires toggleterm only on first toggle
     require("utils.opencode").setup({ width_pct = 0.40 })
-
-    -- Dock-launch flow: KODEX_IDE=1 is set by ~/.local/bin/kodex-ide.
-    -- VimEnter fires after all plugins init; the 100 ms defer lets alpha and
-    -- auto-session finish rendering before the project picker overlay appears.
-    vim.api.nvim_create_autocmd("VimEnter", {
-      once = true,
-      callback = function()
-        if vim.env.KODEX_IDE == "1" then
-          vim.defer_fn(function()
-            require("utils.project_picker").pick()
-          end, 100)
-        end
-      end,
-    })
+    -- VimEnter dock-launch hook removed — dock.lua owns the single VimEnter
+    -- for both KODEX_IDE and KODEX_CLAUDE launchers (FINDINGS.md § A2).
   end,
 
   keys = {

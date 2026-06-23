@@ -1,6 +1,6 @@
 {
   "LuaSnip": { "branch": "master", "commit": "0abc8f390b278c3b4aabc4c004ac8a088b65cf24" },
-  "SchemaStore.nvim": { "branch": "main", "commit": "c73e2b170a4927d1dc1b48e878bba6cf0ed9b07c" },
+  "SchemaStore.nvim": { "branch": "main", "commit": "e034560c0266d5a99d811f595b04ce839ab868ff" },
   "ale": { "branch": "master", "commit": "d0ea94323207abcdee717d76bb57b38d46055664" },
   "alpha-nvim": { "branch": "main", "commit": "6c6a89d5b068b5251c8bdf0dd57bb921bcfeeb09" },
   "auto-session": { "branch": "main", "commit": "6cde3874a9283c2db55627acca5f28e4fa402320" },

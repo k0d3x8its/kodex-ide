@@ -107,6 +107,18 @@ function mod.toggle()
     return
   end
 
+  -- Mutex: close the Claude panel if it is open before opening OpenCode.
+  -- Both panels use term_layout.place_vertical (wincmd L); running both
+  -- simultaneously strands one on a stale alternate screen (FINDINGS.md § A5).
+  local ok, claude = pcall(require, "utils.claude")
+  if ok and claude.state and claude.state.claude_active then
+    claude.toggle()
+    vim.notify(
+      "OpenCode panel open — Claude closed (<leader>cc to switch)",
+      vim.log.levels.INFO
+    )
+  end
+
   local root = require("utils.project_root").detect()
 
   if state.term == nil then

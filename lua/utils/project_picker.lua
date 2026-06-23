@@ -1,6 +1,8 @@
 -- lua/utils/project_picker.lua
--- Shown on dock launch (KODEX_IDE=1). Lets the user pick a project or resume
--- the last session before the OpenCode panel opens.
+-- Shown on dock launch (KODEX_IDE=1 / KODEX_CLAUDE=1). Lets the user pick a
+-- project or resume the last session before the AI panel opens.
+-- Both sites that open the panel branch on KODEX_CLAUDE to route to the correct
+-- panel (FINDINGS.md § A1 / Goal 9 MG 9.3).
 
 local mod = {}
 
@@ -29,9 +31,10 @@ local function latest_project_session(session_dir, projects)
 end
 
 -- After the project root is resolved, open the file-tree sidebar and arrange
--- for the OpenCode panel to launch when the user opens their first file.
--- User decision (2026-06-13): OpenCode starts AFTER a file is chosen, seeded
--- with that file, rather than immediately on project pick.
+-- for the AI panel to launch when the user opens their first file.
+-- User decision (2026-06-13): the AI panel starts AFTER a file is chosen,
+-- seeded with that file, rather than immediately on project pick.
+-- Which panel opens is determined by the launcher env var at both call sites.
 local function open_workspace(proj)
   -- Resumed session: a real file window is already open. Launch OpenCode now,
   -- seeded with that file. Do NOT open the sidebar — the tree is only wanted on
@@ -47,7 +50,12 @@ local function open_workspace(proj)
 
   if file_win then
     vim.api.nvim_set_current_win(file_win)
-    require("utils.opencode").open()
+    -- Branch: KODEX_CLAUDE=1 → Claude panel; KODEX_IDE=1 → OpenCode panel.
+    if vim.env.KODEX_CLAUDE == "1" then
+      require("utils.claude").open(proj)
+    else
+      require("utils.opencode").open()
+    end
     return
   end
 
@@ -55,7 +63,9 @@ local function open_workspace(proj)
   -- when the user opens their first file (one-shot BufWinEnter), seeded with it.
   -- After it launches, focus returns to the sidebar so the user is NOT dropped
   -- into OpenCode's insert prompt — they close the tree manually when ready.
-  local group = vim.api.nvim_create_augroup("KodexOpenCodeFirstFile", { clear = true })
+  -- KodexAIFirstFile: shared augroup name for both OpenCode and Claude dock
+  -- flows — either launcher fires this one-shot BufWinEnter (MG 9.3).
+  local group = vim.api.nvim_create_augroup("KodexAIFirstFile", { clear = true })
   vim.api.nvim_create_autocmd("BufWinEnter", {
     group = group,
     callback = function(args)
@@ -65,8 +75,13 @@ local function open_workspace(proj)
       local ft = vim.bo[args.buf].filetype
       if ft == "alpha" or ft == "NvimTree" then return end
       vim.api.nvim_del_augroup_by_id(group)
-      require("utils.opencode").open()
-      -- Return focus to the sidebar instead of OpenCode's insert prompt.
+      -- Branch: same logic as the resumed-session path above (MG 9.3 site 2).
+      if vim.env.KODEX_CLAUDE == "1" then
+        require("utils.claude").open(proj)
+      else
+        require("utils.opencode").open()
+      end
+      -- Return focus to the sidebar instead of the AI panel's insert prompt.
       -- Deferred so it runs after toggleterm finishes opening + entering insert.
       vim.schedule(function()
         for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do

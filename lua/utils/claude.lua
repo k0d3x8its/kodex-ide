@@ -1,0 +1,1774 @@
+-- lua/utils/claude.lua
+--
+-- Claude Code panel — bidirectional stream-json subprocess + custom renderer.
+--
+-- Architecture: NOT a toggleterm TUI panel (unlike opencode.lua). Instead,
+-- `claude` is spawned as a long-lived subprocess via vim.fn.jobstart() with
+-- stdin="pipe", and its stdout is parsed as newline-delimited JSON events that
+-- are rendered into a custom nomodifiable scratch buffer ("claude"). This is a
+-- direct port of kos-capture/screens/ingest.py into Lua.
+--
+-- Why jobstart, not vim.system?
+--   vim.system is fire-and-forget (one-shot async). jobstart keeps the channel
+--   open so we can write JSON user messages to stdin at any time — the only API
+--   that works for an interactive bidirectional subprocess.
+--
+-- Why a custom render buffer, not :terminal?
+--   :terminal would show Claude Code's raw TUI (ANSI escape sequences, blinking
+--   cursors, status bars). We want IDE-native rendering: Neovim highlight groups,
+--   manual folds for thinking blocks, and a virtual-text input hint. The custom
+--   buffer gives us full control over what the panel looks like.
+--
+-- Design references:
+--   FINDINGS.md § Claude Code Panel  — all architectural decisions
+--   neo-claude.md §6                 — implementation outline
+--   kos-capture/screens/ingest.py   — Python reference implementation (port source)
+
+local mod = {}
+
+-- Full path required — ~/.local/bin is only on PATH in interactive bash, never
+-- in Neovim's environment. Matches the OPENCODE_BIN pattern in opencode.lua
+-- (findings Q12). vim.fn.expand resolves "~" at call time.
+mod.CLAUDE_BIN = vim.fn.expand("~/.local/bin/claude")
+
+--- Guard: returns true iff the claude binary exists and is executable.
+-- Does NOT attempt /login or any auth check — /login is interactive inside
+-- the agent and cannot be tested programmatically at launch.
+---@return boolean
+function mod.is_available()
+  return vim.fn.executable(mod.CLAUDE_BIN) == 1
+end
+
+-- Centralised guard called before toggle / ask_selection. Shows an error notify
+-- once and returns false, so callers can exit early with a single line.
+local function ensure_available()
+  if mod.is_available() then return true end
+  vim.notify(
+    "claude not found at ~/.local/bin/claude — install Claude Code",
+    vim.log.levels.ERROR
+  )
+  return false
+end
+
+-- ─── Shared state ─────────────────────────────────────────────────────────────
+--
+-- Exposed as mod.state so claude_diff.lua can read claude_active and share
+-- diff_queue without coupling to the internal spawn/close logic.
+
+mod.state = {
+  -- true while the panel window is visible; gates the FileChangedShell interceptor
+  -- in claude_diff.lua so diff events are only captured during claude sessions.
+  claude_active = false,
+
+  -- Project root captured when the panel first opens. Compared on each re-open
+  -- to detect cross-project root changes (FINDINGS.md Q11 pattern).
+  stored_root   = nil,
+
+  -- Queue of file paths pending vimdiff review. Owned here so reset() can clear
+  -- it; consumed by claude_diff.lua via the queue() accessor there.
+  diff_queue    = {},
+
+  -- vim.fn.jobstart channel handle. nil when no subprocess is running.
+  -- jobstop(job_id) sends SIGTERM; on_exit fires after the process dies.
+  job_id        = nil,
+
+  -- Panel-owned conversation session UUID. nil until the first send, which
+  -- generates one and passes it via --session-id (creating a fresh session).
+  -- Every later send resumes it with --resume. We DON'T use --continue: that
+  -- resumes the most-recent session in cwd, which collides with (and hangs on)
+  -- any other claude session running in the same project root. Owning our own
+  -- id isolates the panel's conversation. (FINDINGS.md § D2)
+  session_id    = nil,
+
+  -- Scratch buffer id for the rendered panel content (nomodifiable).
+  panel_buf     = nil,
+
+  -- Window id of the panel window. nil when closed.
+  panel_win     = nil,
+
+  -- Flipped to true when the system/init event is parsed. Used only to guard
+  -- the hint update in dispatch (not to block sends — see send() comment).
+  system_ready  = false,
+
+  -- true between a user send and the corresponding result event. Used to block
+  -- new input and show the "⣾ Working… <Esc> to interrupt" hint.
+  working       = false,
+
+  -- true while claude_diff.lua has an unreviewed diff open. Blocks new input:
+  -- we must not send a follow-up message while the previous edit is unreviewed.
+  diff_pending  = false,
+
+  -- Extmark namespace for the virtual-text "Reply to Claude…" hint at bottom of
+  -- panel. Cleared and re-set on every state transition.
+  hint_ns       = nil,
+
+  -- Active braille-spinner timer handle while a turn is in flight; nil otherwise.
+  spin_timer    = nil,
+
+  -- Model alias/id passed to --model on (re)spawn. nil = CLI default model.
+  -- Set by the <leader>cm picker; changing it respawns the process (model is a
+  -- spawn-time flag, so the running session can't switch mid-flight).
+  model         = nil,
+
+  -- Permission mode passed to --permission-mode on (re)spawn. "acceptEdits" by
+  -- default; <leader>cp toggles it to "plan" (and back), respawning the process.
+  permission_mode = "acceptEdits",
+
+  -- Messages the user typed while a turn was in flight, FIFO. Shown as shaded
+  -- virtual lines at the panel bottom; drained one-by-one as each turn ends
+  -- (each then echoes in the normal user colour when actually sent).
+  queue         = {},
+
+  -- Extmark namespace for the shaded queued-message virtual lines. Separate from
+  -- hint_ns so the 110ms spinner refresh (which clears hint_ns) doesn't wipe it.
+  queue_ns      = nil,
+}
+local state = mod.state
+
+local opts = {
+  width_pct = 0.40,
+  -- Caveman intensity for the panel's claude subprocess. Default "off" so the
+  -- panel speaks normally even when the user's interactive sessions default to
+  -- caveman — passed as CAVEMAN_DEFAULT_MODE to the spawn (the caveman plugin's
+  -- env override). Set to false/nil to inherit the user's global default.
+  caveman_mode = "off",
+}
+
+--- Merge user-provided options from the lazy plugin spec (FINDINGS.md Q9).
+-- Idempotent — safe to call multiple times (last call wins for each key).
+function mod.setup(user_opts)
+  opts = vim.tbl_deep_extend("force", opts, user_opts or {})
+end
+
+-- Panel width in columns, recomputed on every open so the panel tracks
+-- terminal resizes rather than freezing at the width set at creation.
+local function panel_width()
+  return math.floor(vim.o.columns * opts.width_pct)
+end
+
+-- ─── Model display names + session id (port of ingest.py _MODEL_NAMES) ───────
+
+-- Model-id → friendly display name. Substring match (model ids carry date
+-- suffixes), so "claude-opus-4-8" → "Opus 4.8". Mirrors ingest.py _MODEL_NAMES;
+-- the most recent ids come first so a longer id never shadows a shorter prefix.
+local MODEL_NAMES = {
+  { "claude-opus-4-8",            "Opus 4.8" },
+  { "claude-opus-4-7",           "Opus 4.7" },
+  { "claude-sonnet-4-6",         "Sonnet 4.6" },
+  { "claude-haiku-4-5",          "Haiku 4.5" },
+  { "claude-opus-4-5",           "Opus 4.5" },
+  { "claude-sonnet-4-5",         "Sonnet 4.5" },
+  { "claude-3-5-sonnet",         "Sonnet 3.5" },
+  { "claude-3-opus",             "Opus 3" },
+  { "claude-3-haiku",            "Haiku 3" },
+  -- Bare aliases (from the <leader>cm picker, before system/init confirms the
+  -- exact id) → the friendly name of the latest model in each family. Listed
+  -- LAST so a full date-suffixed id always matches its specific entry first.
+  { "opus",                      "Opus 4.8" },
+  { "sonnet",                    "Sonnet 4.6" },
+  { "haiku",                     "Haiku 4.5" },
+}
+
+-- Map a raw model id to its friendly name, falling back to the id itself when
+-- unknown (so a new model still shows something rather than a blank line).
+local function friendly_model(model_id)
+  if not model_id or model_id == "" then return "" end
+  for _, pair in ipairs(MODEL_NAMES) do
+    if model_id:find(pair[1], 1, true) then return pair[2] end
+  end
+  return model_id
+end
+
+-- Claude Code version derived from the binary's install path WITHOUT spawning a
+-- session. The launcher (~/.local/bin/claude) symlinks into
+-- ~/.local/share/claude/versions/<version>, so the realpath's basename is the
+-- version string (e.g. "2.1.186"). Lets the banner show the version at panel
+-- open, before system/init (which only arrives after the first message). Mirrors
+-- KOS Capture's realpath fallback. Returns "" if the path can't be resolved.
+local function binary_version()
+  local rp = vim.loop.fs_realpath(mod.CLAUDE_BIN)
+  if not rp then return "" end
+  local base = vim.fn.fnamemodify(rp, ":t")
+  -- Only accept a version-looking basename (digits + dots); otherwise blank.
+  return base:match("^%d[%d%.]*$") and base or ""
+end
+
+-- Generate a RFC-4122 v4 UUID in pure Lua (no shell-out to uuidgen). Used once
+-- per panel session for --session-id. math.random is seeded once at require.
+math.randomseed(os.time() + (vim.loop.hrtime() % 1000000))
+local function uuid4()
+  local template = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"
+  return (template:gsub("[xy]", function(c)
+    local v = (c == "x") and math.random(0, 15) or math.random(8, 11)
+    return string.format("%x", v)
+  end))
+end
+
+-- ─── Tool verb table (port of ingest.py _TOOL_VERB) ──────────────────────────
+
+-- Maps Claude tool names to human-readable action verbs shown in the panel.
+-- Matches the verb table in kos-capture/screens/ingest.py so the panel UX
+-- feels consistent with KOS Capture.
+local TOOL_VERB = {
+  Read         = "Reading",
+  Write        = "Wrote",
+  Edit         = "Editing",
+  MultiEdit    = "Editing",
+  Bash         = "Running",
+  Glob         = "Listing",
+  Grep         = "Searching",
+  WebFetch     = "Fetching",
+  WebSearch    = "Searching",
+  NotebookRead = "Reading",
+  NotebookEdit = "Editing",
+}
+
+-- Extract the most meaningful target string from a tool_use input dict.
+-- Priority: file_path > path > pattern > query > command (truncated to 70 chars).
+-- Falls back to "" when none present, so callers can skip the target display.
+local function tool_target(input)
+  return input.file_path
+    or input.path
+    or input.pattern
+    or input.query
+    or (input.command and tostring(input.command):sub(1, 70))
+    or ""
+end
+
+-- ─── Buffer append helper ─────────────────────────────────────────────────────
+
+-- Fraction of the panel width a separator spans. Less than full width so the
+-- divider reads as a light turn-marker, not a hard rule across the whole panel.
+local SEP_FRAC = 0.5
+
+-- Separator line — a fraction (SEP_FRAC) of the panel width, recomputed each
+-- call so it shrinks/extends with the window instead of wrapping. Falls back to
+-- the configured width when the window isn't realised yet (e.g. cold render).
+local function sep_line()
+  local w = panel_width()
+  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+    w = vim.api.nvim_win_get_width(state.panel_win)
+  end
+  return string.rep("─", math.max(math.floor(w * SEP_FRAC), 1))
+end
+
+-- Append lines to the panel buffer, bypassing its nomodifiable lock.
+--
+-- Why toggle modifiable rather than use a plain writeable buffer?
+--   nomodifiable prevents accidental edits (the user pressing random keys while
+--   the panel is focused). We toggle it only for programmatic writes from this
+--   module and immediately restore it, so the invariant holds for all user input.
+--
+-- Why scroll the panel window after each append?
+--   Without this, the cursor stays at line 1 (where it was when the buffer was
+--   created) and new content scrolls off-screen. Streaming output should auto-
+--   follow to the bottom so the user sees it arrive in real time.
+local function buf_append(lines)
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  vim.bo[buf].modifiable = true
+  local last = vim.api.nvim_buf_line_count(buf)
+  vim.api.nvim_buf_set_lines(buf, last, last, false, lines)
+  vim.bo[buf].modifiable = false
+  -- auto-follow: keep the newest line in view as output streams. We use
+  -- nvim_win_call + `normal! G` rather than nvim_win_set_cursor because setting
+  -- the cursor of a NON-focused window (the common case — focus is in the input
+  -- float or editor while Claude streams) doesn't reliably scroll that window's
+  -- view; `G` inside win_call moves to the last line AND scrolls it into view.
+  -- Guarded on the displayed buffer so we don't disturb a diff-review retarget.
+  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)
+      and vim.api.nvim_win_get_buf(state.panel_win) == buf then
+    pcall(vim.api.nvim_win_call, state.panel_win, function()
+      vim.cmd("keepjumps normal! G")
+    end)
+  end
+end
+
+-- ─── Highlight helpers ────────────────────────────────────────────────────────
+
+-- Apply a highlight group to a contiguous range of lines (0-indexed) in the
+-- panel buffer. Used after buf_append to colour newly appended content.
+-- ns_id = -1 lets Neovim assign a default priority; if two highlights cover the
+-- same bytes on the same line the LAST one applied wins (used in render_banner
+-- to paint ClaudeHeader on the glyph and ClaudeProse on the sidebar text).
+local function hl_lines(first_line, last_line, group)
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  for ln = first_line, last_line do
+    vim.api.nvim_buf_add_highlight(buf, -1, group, ln, 0, -1)
+  end
+end
+
+-- Apply a highlight group to a byte sub-range of a single line (0-indexed).
+-- Used to apply mixed-color highlighting within one line (logo glyph vs text).
+local function hl_range(line_0idx, byte_start, byte_end, group)
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  vim.api.nvim_buf_add_highlight(buf, -1, group, line_0idx, byte_start, byte_end)
+end
+
+-- Decide the display text + highlight group for an inline `…` span. Priority:
+--   1. Known file type → its nvim-web-devicons glyph + the language's DevIcon
+--      highlight group (correct brand/theme colour), e.g. `init.lua` → " init.lua"
+--      in DevIconLua blue. Falls back gracefully when devicons isn't loaded.
+--   2. [bracket] tag       → ClaudeBracket (pink)
+--   3. path (~ ./ or has /) → ClaudePath (green)
+--   4. anything else        → ClaudeCode (cyan)
+-- Returns: display_text, hl_group.
+local function span_style(inner)
+  local fname = inner:match("([^/%s]+)$")          -- basename of a path
+  local ext   = fname and fname:match("%.([%w]+)$")
+  if ext then
+    local ok, dev = pcall(require, "nvim-web-devicons")
+    if ok then
+      local icon, hl = dev.get_icon(fname, ext, { default = false })
+      if icon and hl then
+        return icon .. " " .. inner, hl
+      end
+    end
+  end
+  if inner:match("^%[.*%]$") then return inner, "ClaudeBracket" end
+  if inner:match("^~") or inner:match("^%.?%./") or inner:find("/", 1, true) then
+    return inner, "ClaudePath"
+  end
+  return inner, "ClaudeCode"
+end
+
+-- Parse one line of inline markdown, STRIPPING the markers (so the panel reads
+-- like rendered markdown, not raw text) and recording highlight ranges over the
+-- cleaned line. Handles **bold** → ClaudeBold and `code` → ClaudeCode.
+-- Returns: clean_line, { {byte_start0, byte_end, group}, ... }  (byte offsets are
+-- 0-indexed start / end-exclusive, matching nvim_buf_add_highlight).
+-- Defined above render_prose because Lua `local function` is only visible to
+-- code that follows it.
+local function parse_inline(line)
+  local parts, hls, blen, i, n = {}, {}, 0, 1, #line
+  while i <= n do
+    if line:sub(i, i + 1) == "**" then
+      local close = line:find("**", i + 2, true)
+      if close then
+        local inner = line:sub(i + 2, close - 1)
+        parts[#parts + 1] = inner
+        hls[#hls + 1] = { blen, blen + #inner, "ClaudeBold" }
+        blen = blen + #inner
+        i = close + 2
+      else
+        parts[#parts + 1] = "**"; blen = blen + 2; i = i + 2
+      end
+    elseif line:sub(i, i) == "`" then
+      local close = line:find("`", i + 1, true)
+      if close then
+        local inner = line:sub(i + 1, close - 1)
+        -- span_style picks the display text (with a file glyph when it's a known
+        -- file type) and the colour (DevIcon / bracket / path / code).
+        local disp, group = span_style(inner)
+        parts[#parts + 1] = disp
+        hls[#hls + 1] = { blen, blen + #disp, group }
+        blen = blen + #disp
+        i = close + 1
+      else
+        parts[#parts + 1] = "`"; blen = blen + 1; i = i + 1
+      end
+    elseif line:sub(i, i) == "[" then
+      -- Bracketed spans (e.g. [VERIFY], [link text]) — kept verbatim (brackets
+      -- are meaningful) but coloured distinctly from inline code so they don't
+      -- read as teal. Requires a closing "]" on the same line.
+      local close = line:find("]", i + 1, true)
+      if close then
+        local seg = line:sub(i, close)        -- includes the [ and ]
+        parts[#parts + 1] = seg
+        hls[#hls + 1] = { blen, blen + #seg, "ClaudeBracket" }
+        blen = blen + #seg
+        i = close + 1
+      else
+        parts[#parts + 1] = "["; blen = blen + 1; i = i + 1
+      end
+    else
+      local c = line:sub(i, i)
+      parts[#parts + 1] = c; blen = blen + #c; i = i + 1
+    end
+  end
+  return table.concat(parts), hls
+end
+
+-- ─── Markdown table rendering ────────────────────────────────────────────────
+
+-- A markdown table row: trimmed line that starts with "|".
+local function is_table_row(s) return s:match("^%s*|") ~= nil end
+
+-- A table separator row (|---|:--:|): only |, -, :, spaces.
+local function is_table_sep(s)
+  return is_table_row(s) and (s:gsub("[%s|:%-]", "") == "") and s:find("%-") ~= nil
+end
+
+-- Split "| a | b |" into trimmed cell strings (drops the outer pipes).
+local function split_row(s)
+  s = s:gsub("^%s*|", ""):gsub("|%s*$", "")
+  local cells = {}
+  for cell in (s .. "|"):gmatch("(.-)|") do
+    cells[#cells + 1] = cell:match("^%s*(.-)%s*$")
+  end
+  return cells
+end
+
+-- Render a run of markdown table rows into display lines + highlight ranges:
+-- cells are inline-parsed (so paths/code/brackets keep their colours), columns
+-- are padded to a common display width, separated by a dim "│", and the header
+-- row is bolded. The |---| separator row is dropped. Returns out_lines, out_hls
+-- (out_hls[i] = list of {start0, end, group} over out_lines[i]).
+local TABLE_BAR = " │ "
+local function render_table(rows)
+  -- Parse every non-separator row into per-cell {clean, hls}.
+  local data_rows, ncols = {}, 0
+  for _, r in ipairs(rows) do
+    if not is_table_sep(r) then
+      local cells = split_row(r)
+      ncols = math.max(ncols, #cells)
+      local pc = {}
+      for _, c in ipairs(cells) do
+        local cl, h = parse_inline(c)
+        pc[#pc + 1] = { clean = cl, hls = h }
+      end
+      data_rows[#data_rows + 1] = pc
+    end
+  end
+
+  -- Column display widths.
+  local widths = {}
+  for c = 1, ncols do widths[c] = 0 end
+  for _, pc in ipairs(data_rows) do
+    for c = 1, ncols do
+      local cell = pc[c]
+      local w = cell and vim.fn.strdisplaywidth(cell.clean) or 0
+      if w > widths[c] then widths[c] = w end
+    end
+  end
+
+  -- Build aligned lines + shifted highlight ranges.
+  local out_lines, out_hls = {}, {}
+  for ri, pc in ipairs(data_rows) do
+    local segs, line_hls, blen = {}, {}, 0
+    for c = 1, ncols do
+      if c > 1 then
+        line_hls[#line_hls + 1] = { blen, blen + #TABLE_BAR, "ClaudeDim" }
+        segs[#segs + 1] = TABLE_BAR
+        blen = blen + #TABLE_BAR
+      end
+      local cell = pc[c] or { clean = "", hls = {} }
+      local text = cell.clean
+      for _, h in ipairs(cell.hls) do
+        line_hls[#line_hls + 1] = { blen + h[1], blen + h[2], h[3] }
+      end
+      if ri == 1 then  -- header row → bold over the cell text
+        line_hls[#line_hls + 1] = { blen, blen + #text, "ClaudeBold" }
+      end
+      segs[#segs + 1] = text
+      blen = blen + #text
+      if c < ncols then  -- pad to column width (no trailing pad on last col)
+        local pad = widths[c] - vim.fn.strdisplaywidth(text)
+        if pad > 0 then segs[#segs + 1] = string.rep(" ", pad); blen = blen + pad end
+      end
+    end
+    out_lines[#out_lines + 1] = table.concat(segs)
+    out_hls[#out_hls + 1]     = line_hls
+  end
+  return out_lines, out_hls
+end
+
+-- ─── Directory-tree rendering ────────────────────────────────────────────────
+
+-- Folder glyph (nf-fa-folder) prefixed to directory entries in a tree.
+local TREE_FOLDER_GLYPH = ""
+
+-- True when a line is part of an ASCII/Unicode directory tree: it either has a
+-- box-drawing connector (│ ├ └ ──) OR is a lone path token (a single dir ending
+-- "/" or a file with an extension), optionally trailed by a "# comment".
+local function is_tree_line(line)
+  if line:find("│", 1, true) or line:find("├", 1, true)
+      or line:find("└", 1, true) or line:find("──", 1, true) then
+    return true
+  end
+  local body  = line:match("^%s*(.-)%s*$")
+  local first = body:match("^(%S+)")
+  if not first then return false end
+  local after = body:sub(#first + 1):match("^%s*(.-)%s*$")
+  local lone  = (after == "" or after:sub(1, 1) == "#")
+  return lone and (first:sub(-1) == "/" or first:match("%.%w+$") ~= nil) or false
+end
+
+-- Byte index of the end of the box-drawing structure prefix (0 when none).
+local function tree_prefix_end(line)
+  local pos = 0
+  for _, b in ipairs({ "│", "├", "└", "─" }) do
+    local s = 1
+    while true do
+      local a, e = line:find(b, s, true)
+      if not a then break end
+      if e > pos then pos = e end
+      s = e + 1
+    end
+  end
+  return pos
+end
+
+-- Render one tree line: dim the box-drawing structure, then colour each entry
+-- token — directories (trailing "/") get a folder glyph + ClaudeDir, files get
+-- their devicons glyph + language colour (same as everywhere else), a leading
+-- "#" comment is dimmed, and anything else stays prose. Returns display, hls.
+local function render_tree_line(line)
+  local out, hls, blen = {}, {}, 0
+  local pend = tree_prefix_end(line)
+  if pend > 0 then
+    local pref = line:sub(1, pend)
+    out[#out + 1] = pref
+    hls[#hls + 1] = { 0, #pref, "ClaudeDim" }
+    blen = #pref
+  end
+
+  local rest = line:sub(pend + 1)
+  local idx  = 1
+  while idx <= #rest do
+    local ws = rest:match("^(%s+)", idx)
+    if ws then out[#out + 1] = ws; blen = blen + #ws; idx = idx + #ws end
+    if idx > #rest then break end
+    local tok = rest:match("^(%S+)", idx)
+    if not tok then break end
+    idx = idx + #tok
+
+    if tok:sub(1, 1) == "#" then
+      -- comment: dim to end of line
+      local comment = tok .. rest:sub(idx)
+      out[#out + 1] = comment
+      hls[#hls + 1] = { blen, blen + #comment, "ClaudeDim" }
+      blen = blen + #comment
+      idx  = #rest + 1
+    elseif #tok > 1 and tok:sub(-1) == "/" then
+      local seg = TREE_FOLDER_GLYPH .. " " .. tok
+      out[#out + 1] = seg
+      hls[#hls + 1] = { blen, blen + #seg, "ClaudeDir" }
+      blen = blen + #seg
+    else
+      local fname = tok:match("([^/]+)$")
+      local ext   = fname and fname:match("%.([%w]+)$")
+      local icon, hl
+      if ext then
+        local ok, dev = pcall(require, "nvim-web-devicons")
+        if ok then icon, hl = dev.get_icon(fname, ext, { default = false }) end
+      end
+      if icon and hl then
+        local seg = icon .. " " .. tok
+        out[#out + 1] = seg
+        hls[#hls + 1] = { blen, blen + #seg, hl }
+        blen = blen + #seg
+      else
+        out[#out + 1] = tok
+        blen = blen + #tok
+      end
+    end
+  end
+  return table.concat(out), hls
+end
+
+-- ─── Virtual text hint (bottom of panel) ─────────────────────────────────────
+
+-- Replace the hint at the end of the buffer with new text. The hint is a
+-- virtual-text extmark — it appears after the last real line but is not buffer
+-- content (cannot be yanked, deleted, or accidentally submitted as input).
+--
+-- Why extmark virtual text instead of a real line?
+--   If we wrote "Reply to Claude…" as a real buffer line and the user pressed
+--   <CR>, the input remaps (see set_panel_keymaps) would fire — but the text
+--   would also be visible in :Telescope buffers, grep results, etc. Virtual text
+--   is display-only.
+local function set_hint(text, hl)
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  vim.api.nvim_buf_clear_namespace(buf, state.hint_ns, 0, -1)
+  local last = vim.api.nvim_buf_line_count(buf) - 1
+  if last < 0 then last = 0 end
+  vim.api.nvim_buf_set_extmark(buf, state.hint_ns, last, 0, {
+    virt_text     = { { text, hl or "ClaudeInput" } },
+    virt_text_pos = "eol",
+  })
+end
+
+local function clear_hint()
+  local buf = state.panel_buf
+  if buf and vim.api.nvim_buf_is_valid(buf) then
+    vim.api.nvim_buf_clear_namespace(buf, state.hint_ns, 0, -1)
+  end
+end
+
+-- ─── Queued-message display (type-ahead while Claude works) ───────────────────
+
+-- Render the pending message queue as shaded virtual lines anchored to the
+-- buffer's current last line, so they sit at the very bottom under the spinner.
+-- Re-anchored on each spinner tick (the last line moves as output streams) and
+-- whenever the queue changes. Cleared when the queue empties.
+local function render_queue()
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf) and state.queue_ns) then return end
+  vim.api.nvim_buf_clear_namespace(buf, state.queue_ns, 0, -1)
+  if #state.queue == 0 then return end
+  local last = vim.api.nvim_buf_line_count(buf) - 1
+  if last < 0 then last = 0 end
+  local vlines = {}
+  for _, t in ipairs(state.queue) do
+    -- compact single-line preview (queued multi-line messages collapse to line 1)
+    local preview = vim.split(t, "\n", { plain = true })[1]
+    vlines[#vlines + 1] = { { "❯ " .. preview .. "   (queued)", "ClaudeQueued" } }
+  end
+  vim.api.nvim_buf_set_extmark(buf, state.queue_ns, last, 0, {
+    virt_lines = vlines,
+  })
+end
+
+-- ─── Working spinner ──────────────────────────────────────────────────────────
+
+-- Braille frames cycled while a turn is in flight. The hint is anchored to the
+-- buffer's last line; in send() we append a blank line after the user echo so
+-- the spinner first appears on its OWN line beneath the entry, then trails the
+-- streaming output as it arrives.
+local SPINNER = { "⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷" }
+local spin_i  = 1
+
+local function stop_spinner()
+  if state.spin_timer then
+    vim.fn.timer_stop(state.spin_timer)
+    state.spin_timer = nil
+  end
+end
+
+local function start_spinner()
+  stop_spinner()
+  spin_i = 1
+  set_hint(SPINNER[spin_i] .. " Working…  <Esc> to interrupt", "ClaudeInput")
+  render_queue()
+  state.spin_timer = vim.fn.timer_start(110, function()
+    if not state.working then stop_spinner(); return end
+    spin_i = spin_i % #SPINNER + 1
+    set_hint(SPINNER[spin_i] .. " Working…  <Esc> to interrupt", "ClaudeInput")
+    -- Re-anchor the queue to the (now lower) last line as output streams in.
+    render_queue()
+  end, { ["repeat"] = -1 })
+end
+
+-- ─── Render functions (Goal 6.3) ──────────────────────────────────────────────
+
+-- Render assistant prose text. Strips trailing blank lines so consecutive
+-- text blocks don't double-space; empty blocks (e.g. lone "\n") are silently
+-- dropped rather than leaving a gap in the panel.
+local function render_prose(text)
+  if not text or text == "" then return end
+  local raw = vim.split(text, "\n", { plain = true })
+  while #raw > 0 and raw[#raw] == "" do
+    table.remove(raw)
+  end
+  if #raw == 0 then return end
+
+  -- Build the cleaned display lines + per-line highlight ranges. Contiguous runs
+  -- of "| … |" rows are rendered as an aligned table (the |---| separator row is
+  -- dropped, so output line count differs from input); every other line is
+  -- inline-parsed (markers stripped, paths/code/brackets coloured).
+  local clean, per_line_hls = {}, {}
+  local idx = 1
+  while idx <= #raw do
+    if is_table_row(raw[idx]) then
+      local j, rows = idx, {}
+      while j <= #raw and is_table_row(raw[j]) do
+        rows[#rows + 1] = raw[j]; j = j + 1
+      end
+      local t_lines, t_hls = render_table(rows)
+      for k, tl in ipairs(t_lines) do
+        clean[#clean + 1]        = tl
+        per_line_hls[#clean]     = t_hls[k]
+      end
+      idx = j
+    elseif is_tree_line(raw[idx]) then
+      -- directory-tree line: dim structure, colour dirs (folder glyph) + files
+      -- (devicons glyph + language colour).
+      local tl, hls          = render_tree_line(raw[idx])
+      clean[#clean + 1]      = tl
+      per_line_hls[#clean]   = hls
+      idx = idx + 1
+    else
+      local cl, hls          = parse_inline(raw[idx])
+      clean[#clean + 1]      = cl
+      per_line_hls[#clean]   = hls
+      idx = idx + 1
+    end
+  end
+
+  local first = vim.api.nvim_buf_line_count(state.panel_buf)
+  buf_append(clean)
+  hl_lines(first, first + #clean - 1, "ClaudeProse")
+
+  for li, cl in ipairs(clean) do
+    local ln = first + li - 1
+    -- Whole-line darker burnt-orange for a line Claude poses as a question, so
+    -- prompts to the user pop out of the standard prose orange. Applied before
+    -- the inline ranges so bold/code spans inside still override on their bytes.
+    if cl:match("%?%s*$") then
+      hl_lines(ln, ln, "ClaudeQuestion")
+    end
+    for _, h in ipairs(per_line_hls[li]) do
+      hl_range(ln, h[1], h[2], h[3])
+    end
+  end
+end
+
+-- Echo the user's submitted message into the transcript so the conversation
+-- reads as a dialogue (their entry, then Claude's reply). The first line gets
+-- the special "❯" prompt arrow (highlighted clay); continuation lines align
+-- under it. Mirrors the input bar's arrow so input and echo feel connected.
+local USER_ARROW = "❯ "   -- U+276F, deliberately not a keyboard char
+
+-- True when the buffer's last non-blank line is already an all-dash separator.
+-- Used to avoid stacking a turn separator directly under the banner's own
+-- separator on the first turn (the banner divider already serves as the top).
+local function last_line_is_sep()
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return false end
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  for i = #lines, 1, -1 do
+    local l = lines[i]
+    if l ~= "" then
+      -- all-dashes test: stripping every "─" leaves nothing (byte-safe).
+      return (l:gsub("─", "")) == ""
+    end
+  end
+  return false
+end
+
+local function render_user(text)
+  if not text or text == "" then return end
+  -- Draw the turn separator at the TOP of this turn (above the echo), unless a
+  -- separator already sits there (banner divider on the first turn). Responses
+  -- no longer end with a trailing divider — the next turn's top one divides them.
+  if not last_line_is_sep() then
+    local sep_at = vim.api.nvim_buf_line_count(state.panel_buf)
+    buf_append({ sep_line() })
+    hl_lines(sep_at, sep_at, "ClaudeHeader")
+  end
+  local raw = vim.split(text, "\n", { plain = true })
+  local lines = {}
+  for i, l in ipairs(raw) do
+    lines[i] = (i == 1 and USER_ARROW or "  ") .. l
+  end
+  local first = vim.api.nvim_buf_line_count(state.panel_buf)
+  buf_append(lines)
+  hl_lines(first, first + #lines - 1, "ClaudeUser")
+  -- Paint just the arrow glyph terminal-green so it reads like a shell prompt
+  -- and matches the input bar's arrow.
+  hl_range(first, 0, #USER_ARROW, "ClaudeArrow")
+end
+
+-- Render a thinking block as a collapsible manual fold (FINDINGS.md Q3).
+--
+-- Why manual folds, not marker/indent folds?
+--   foldmethod=marker would pollute the buffer content with fold markers.
+--   foldmethod=indent is fragile (the indented body lines would auto-fold
+--   to depth 1, but prose lines wouldn't fold at all). Manual folds let us
+--   set exact start/end lines programmatically after each block is appended.
+--
+-- Why zR immediately after fold creation?
+--   Without zR, newly created folds start closed. The spec calls for thinking
+--   blocks to be expanded by default so the user can read them; they can toggle
+--   individually with `za` or close all with `zM`.
+local function render_thinking(text)
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+
+  -- fold header line
+  local header_idx = vim.api.nvim_buf_line_count(buf)  -- 0-indexed insertion point
+  buf_append({ "▼ Thinking" })
+  hl_lines(header_idx, header_idx, "ClaudeLabel")
+
+  -- body: indent two spaces so it reads as a sub-block under the header
+  local body_lines = vim.split(text or "", "\n", { plain = true })
+  while #body_lines > 0 and body_lines[#body_lines] == "" do
+    table.remove(body_lines)
+  end
+  for i, l in ipairs(body_lines) do
+    body_lines[i] = "  " .. l
+  end
+  local body_start = vim.api.nvim_buf_line_count(buf)
+  buf_append(body_lines)
+  hl_lines(body_start, body_start + #body_lines - 1, "ClaudeThink")
+
+  -- set the manual fold over header + body; Vim fold ranges are 1-indexed
+  local fold_start = header_idx + 1
+  local fold_end   = vim.api.nvim_buf_line_count(buf)
+  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+    vim.api.nvim_win_call(state.panel_win, function()
+      vim.cmd(fold_start .. "," .. fold_end .. "fold")
+      vim.cmd("normal! zR")  -- open all folds: blocks expand by default
+    end)
+  end
+end
+
+-- Render a tool_use block as a single-line "⚙ Verb: target" entry.
+-- One line per tool call keeps the panel scannable during long multi-tool turns.
+-- Matches the compact format from ingest.py _fmt_tool_use_rich.
+-- A blank line is appended after the tool entry so the working spinner has its
+-- own line below (the spinner timer re-anchors EOL virt_text to the buffer's
+-- last line on every tick; without the blank it shares the tool line).
+local function render_tool(name, input)
+  local verb   = TOOL_VERB[name] or name
+  local target = tool_target(input)
+  local line   = "  ⚙ " .. verb .. (target ~= "" and (": " .. target) or "")
+  local first  = vim.api.nvim_buf_line_count(state.panel_buf)
+  buf_append({ line })
+  hl_lines(first, first, "ClaudeTool")
+  buf_append({ "" })   -- spinner gets its own line below
+end
+
+-- Render the result event that closes a turn. The turn separator is drawn at
+-- the TOP of the NEXT turn (by render_user), not here — so a response never
+-- ends with a trailing divider. The result event's text duplicates the
+-- assistant prose already rendered and may contain embedded newlines (which
+-- nvim_buf_set_lines forbids in a single line — the old crash), so we render
+-- nothing for it. Kept as a named no-op for the dispatch turn-close semantics.
+local function render_result(_text) end
+
+-- Logo glyphs — must match ingest.py _show_banner (lines 580–582) exactly.
+-- Each block element is a 3-byte UTF-8 char; the byte lengths are hardcoded
+-- below for the highlight ranges (they never change).
+--   G1 " ▐▛███▜▌"  — top of the head   (display width 8, 22 bytes)
+--   G2 "▝▜█████▛▘" — belly             (display width 9, 27 bytes)
+--   G3 "  ▘▘ ▝▝"   — feet              (display width 7, 15 bytes)
+local BANNER_G1 = " ▐▛███▜▌"
+local BANNER_G2 = "▝▜█████▛▘"
+local BANNER_G3 = "  ▘▘ ▝▝"
+-- Per-line right padding so the sidebar text starts at the SAME column on all
+-- three lines despite the glyphs having different display widths (8/9/7 → all
+-- align to column 11, matching ingest.py's "   "/"  "/"    " spacing).
+local BANNER_P1 = "   "   -- 8 + 3 = 11
+local BANNER_P2 = "  "    -- 9 + 2 = 11
+local BANNER_P3 = "    "  -- 7 + 4 = 11
+
+-- Blank padding line(s) above the glyph so the icon isn't flush against the top
+-- window edge. All banner line indices below are expressed relative to this pad.
+local BANNER_PAD = 1
+local BANNER_L0  = BANNER_PAD        -- "Claude Code v…" / glyph row 1
+local BANNER_L1  = BANNER_PAD + 1    -- model           / glyph row 2
+local BANNER_L2  = BANNER_PAD + 2    -- cwd             / glyph row 3
+local BANNER_SEP = BANNER_PAD + 3    -- separator underline
+
+-- Render the three-line Claude logo banner on cold start.
+--
+-- Each line has mixed coloring: logo glyph in ClaudeHeader (clay #D97757) and
+-- sidebar text in ClaudeProse (orange #F4A261). We apply ClaudeHeader first to
+-- the whole line, then override the text byte-range with ClaudeProse (last
+-- highlight wins for overlapping ranges at the same priority).
+--
+-- Sidebar text (matches ingest.py exactly):
+--   line 0  "Claude Code v<version>"
+--   line 1  "<friendly model>"        — filled by system/init when model known
+--   line 2  "<cwd>"                    — the project root the session runs in
+local function render_banner(model, version, cwd)
+  local ver = (version and version ~= "") and (" v" .. version) or ""
+
+  -- Top pad blank line(s) keep the icon off the window's top edge.
+  local lines = {}
+  for _ = 1, BANNER_PAD do lines[#lines + 1] = "" end
+  lines[#lines + 1] = BANNER_G1 .. BANNER_P1 .. "Claude Code" .. ver
+  lines[#lines + 1] = BANNER_G2 .. BANNER_P2 .. friendly_model(model)
+  lines[#lines + 1] = BANNER_G3 .. BANNER_P3 .. (cwd or "")
+  lines[#lines + 1] = sep_line()
+
+  -- Replace the entire buffer so the banner always starts at line 0.
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+
+  -- Glyph in ClaudeHeader (clay) across the three glyph rows + the separator.
+  hl_lines(BANNER_L0, BANNER_SEP, "ClaudeHeader")
+
+  -- Override sidebar text on the three glyph lines, each a distinct colour
+  -- (KOS-style): "Claude Code" prose + dim version, model line, path line.
+  local t0 = #BANNER_G1 + #BANNER_P1                                -- 25
+  hl_range(BANNER_L0, t0,      -1, "ClaudeProse")
+  hl_range(BANNER_L0, t0 + 11, -1, "ClaudeDim")                     -- version
+  hl_range(BANNER_L1, #BANNER_G2 + #BANNER_P2, -1, "ClaudeModel")   -- 29
+  hl_range(BANNER_L2, #BANNER_G3 + #BANNER_P3, -1, "ClaudePath")    -- 19
+end
+
+-- Rewrite just the banner's cwd line in place. Called on DirChanged so the path
+-- always reflects the directory the user is in, without redrawing the whole
+-- banner (which would wipe the rendered conversation).
+local function update_banner_cwd(cwd)
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if vim.api.nvim_buf_line_count(buf) <= BANNER_L2 then return end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, BANNER_L2, BANNER_L2 + 1, false,
+    { BANNER_G3 .. BANNER_P3 .. (cwd or "") })
+  vim.bo[buf].modifiable = false
+  hl_range(BANNER_L2, 0,                       #BANNER_G3, "ClaudeHeader")
+  hl_range(BANNER_L2, #BANNER_G3 + #BANNER_P3, -1,         "ClaudePath")
+end
+
+-- Rewrite just the banner's model line in place (line 1). Called by the model
+-- picker so the chosen model shows immediately, without redrawing the banner.
+-- `friendly` is the already-friendly display name (or "" to blank the line).
+local function update_banner_model(friendly)
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if vim.api.nvim_buf_line_count(buf) <= BANNER_L1 then return end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, BANNER_L1, BANNER_L1 + 1, false,
+    { BANNER_G2 .. BANNER_P2 .. (friendly or "") })
+  vim.bo[buf].modifiable = false
+  hl_range(BANNER_L1, 0,                       #BANNER_G2, "ClaudeHeader")
+  hl_range(BANNER_L1, #BANNER_G2 + #BANNER_P2, -1,         "ClaudeModel")
+end
+
+-- Rewrite every separator line (a line made entirely of "─") to the current
+-- panel width so the orange dividers shrink/extend with the window instead of
+-- wrapping to the next line. Called on resize.
+local function refit_separators()
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  local new   = sep_line()
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  vim.bo[buf].modifiable = true
+  for i, l in ipairs(lines) do
+    -- all-dashes test: stripping every "─" leaves nothing (byte-safe, unlike a
+    -- multibyte Lua pattern with "+").
+    if l ~= "" and (l:gsub("─", "")) == "" and l ~= new then
+      vim.api.nvim_buf_set_lines(buf, i - 1, i, false, { new })
+      vim.api.nvim_buf_add_highlight(buf, -1, "ClaudeHeader", i - 1, 0, -1)
+    end
+  end
+  vim.bo[buf].modifiable = false
+end
+
+-- ─── Stream-json event dispatcher (Goal 6.3) ──────────────────────────────────
+
+-- stdout arrives as arbitrary-sized chunks from Neovim's libuv layer — a single
+-- chunk may contain multiple JSON lines, or a line may be split across chunks.
+-- We accumulate incomplete data across calls in this module-level string, flush
+-- complete lines when a newline arrives, and leave the tail in the buffer.
+-- (Mirrors ingest.py's line-by-line iteration over proc.stdout.)
+local stdout_buf = ""
+
+-- Dispatch one fully parsed stream-json event object.
+local function dispatch(event)
+  local ev_type = event.type or ""
+
+  if ev_type == "system" and event.subtype == "init" then
+    -- Fill the banner's version (line 0) and model (line 1) now that they're
+    -- known. The banner was pre-rendered at panel open with the cwd but no model
+    -- or version (those only arrive in system/init). With per-message spawning
+    -- system/init fires on every turn; we patch the lines in-place so a second
+    -- banner is never appended.
+    -- The init event carries the CLI version under `claude_code_version`
+    -- (NOT `version`); fall back to `version` only for forward-compatibility.
+    local model    = friendly_model(event.model or "")
+    local raw_ver  = event.claude_code_version or event.version or ""
+    local ver      = (raw_ver ~= "") and (" v" .. raw_ver) or ""
+    local buf   = state.panel_buf
+    if buf and vim.api.nvim_buf_is_valid(buf)
+        and vim.api.nvim_buf_line_count(buf) > BANNER_L1 then
+      vim.bo[buf].modifiable = true
+      if ver ~= "" then
+        vim.api.nvim_buf_set_lines(buf, BANNER_L0, BANNER_L0 + 1, false,
+          { BANNER_G1 .. BANNER_P1 .. "Claude Code" .. ver })
+      end
+      if model ~= "" then
+        vim.api.nvim_buf_set_lines(buf, BANNER_L1, BANNER_L1 + 1, false,
+          { BANNER_G2 .. BANNER_P2 .. model })
+      end
+      vim.bo[buf].modifiable = false
+      if ver ~= "" then
+        local t0 = #BANNER_G1 + #BANNER_P1
+        hl_range(BANNER_L0, 0,       #BANNER_G1, "ClaudeHeader")
+        hl_range(BANNER_L0, t0,      -1,         "ClaudeProse")
+        hl_range(BANNER_L0, t0 + 11, -1,         "ClaudeDim")
+      end
+      if model ~= "" then
+        hl_range(BANNER_L1, 0,                       #BANNER_G2, "ClaudeHeader")
+        hl_range(BANNER_L1, #BANNER_G2 + #BANNER_P2, -1,         "ClaudeModel")
+      end
+    end
+    state.system_ready = true
+    -- working hint already set by send(); don't clobber it
+
+  elseif ev_type == "assistant" then
+    -- assistant events carry a message with a content array. Each block is one
+    -- of: text (prose), thinking (extended thinking), or tool_use.
+    local content = (event.message or {}).content or {}
+    for _, block in ipairs(content) do
+      local btype = block.type or ""
+      if btype == "text" then
+        render_prose(block.text or "")
+      elseif btype == "thinking" then
+        render_thinking(block.thinking or "")
+      elseif btype == "tool_use" then
+        render_tool(block.name or "", block.input or {})
+      end
+      -- tool_result body rendering is deferred to v2 (TODOS.md backlog)
+    end
+
+  elseif ev_type == "result" then
+    -- result closes the current turn. After this, claude is waiting for more
+    -- input — unlock the input bar (unless a diff review is still pending).
+    local result_text = event.result or ""
+    render_result(result_text)
+    state.working = false
+    stop_spinner()
+    if state.diff_pending then
+      -- Hold queued messages until the edit is reviewed (on_diff_close drains).
+      set_hint("⚠ Awaiting review — <leader>ca accept  <leader>cx reject", "ClaudeLabel")
+    else
+      clear_hint()
+      -- Turn finished: send the next type-ahead message if one is queued.
+      mod._maybe_send_next()
+    end
+  end
+end
+
+-- Neovim's on_stdout callback. CRITICAL: jobstart splits stdout on "\n" and
+-- STRIPS the newlines before calling us — `data` is a list of line fragments,
+-- NOT raw bytes. The convention (see :h channel-lines):
+--   * data[1] continues the partial line left over from the previous call,
+--   * data[#data] is this call's new partial line (often "" when the stream
+--     ended exactly on a newline).
+-- So we prepend the saved tail to data[1], pop the last element as the new
+-- tail, and every remaining element is a complete line. (Concatenating the
+-- fragments and re-splitting on "\n" would be wrong: there are no "\n" left,
+-- so all events collapse into one invalid-JSON blob and nothing renders.)
+local function on_stdout(_, data, _)
+  if not data then return end
+  data[1]    = stdout_buf .. data[1]
+  stdout_buf = table.remove(data)  -- new partial tail for the next call
+
+  for _, line in ipairs(data) do
+    local trimmed = line:match("^%s*(.-)%s*$")
+    if trimmed ~= "" then
+      -- pcall: ANSI noise lines that slip through (e.g. cursor movement codes)
+      -- are not valid JSON; silently skip rather than surfacing an error.
+      local ok, event = pcall(vim.json.decode, trimmed)
+      if ok and type(event) == "table" then
+        -- vim.schedule: dispatch modifies the buffer (appends lines, sets
+        -- highlights, creates folds). These operations are forbidden inside an
+        -- on_stdout callback because libuv callbacks run on the event loop,
+        -- not inside the Neovim API safe zone. vim.schedule defers to the next
+        -- safe iteration of the event loop.
+        vim.schedule(function()
+          dispatch(event)
+        end)
+      end
+    end
+  end
+end
+
+-- on_exit fires when the persistent process ends — process crash, model/plan
+-- respawn (jobstop), reset(), or panel close. Unlike the old per-message arch,
+-- a clean exit here is NOT a turn boundary (turns end on the `result` event);
+-- it means the whole session is gone. We clear job_id so the next send respawns
+-- a fresh process (conversation context is lost — note the warning on crashes).
+--   code 0 / 143 (SIGTERM) / -1 = intentional stop or graceful end → quiet
+--   anything else               = crash → notify (panel stays; next send respawns)
+local function on_exit(_, code, _)
+  state.job_id       = nil
+  state.working      = false
+  state.system_ready = false
+  stdout_buf         = ""
+  stop_spinner()
+
+  vim.schedule(function()
+    local clean = (code == 0 or code == 143 or code == -1)
+    if not clean then
+      vim.notify(
+        "Claude session exited (code " .. code .. ") — next message starts a fresh session",
+        vim.log.levels.WARN
+      )
+    end
+    -- Either way the panel stays open. Restore the reply hint unless a diff is
+    -- still pending review.
+    if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+      if state.diff_pending then
+        set_hint("⚠ Awaiting review — <leader>ca accept  <leader>cx reject", "ClaudeLabel")
+      else
+        clear_hint()
+      end
+    end
+  end)
+end
+
+-- ─── Panel buffer setup ───────────────────────────────────────────────────────
+
+-- Create (or reuse) the panel scratch buffer. Called by toggle() before opening
+-- the panel window. Idempotent: if the buffer already exists and is valid,
+-- returns it immediately so the scrollback survives panel close/reopen within
+-- the same session. reset() deletes the buffer explicitly to start blank.
+local function ensure_panel_buf()
+  if state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf) then
+    return state.panel_buf
+  end
+
+  local buf = vim.api.nvim_create_buf(false, true)   -- unlisted, scratch
+  vim.bo[buf].buftype    = "nofile"
+  vim.bo[buf].bufhidden  = "hide"   -- don't wipe on window close; keep scrollback
+  vim.bo[buf].swapfile   = false
+  vim.bo[buf].modifiable = false    -- prevent accidental edits; toggled by buf_append
+  -- foldmethod is window-local, not buffer-local; set it in open_panel_window.
+  -- Name the buffer "claude" so bufferline and lualine show something readable
+  -- instead of "[No Name]". pcall guards the rare E95 name-collision.
+  pcall(vim.api.nvim_buf_set_name, buf, "claude")
+
+  state.panel_buf = buf
+  state.hint_ns   = vim.api.nvim_create_namespace("claude_hint")
+  state.queue_ns  = vim.api.nvim_create_namespace("claude_queue")
+  state.folds     = {}
+  stdout_buf      = ""
+  return buf
+end
+
+-- ─── Panel buffer keymaps ─────────────────────────────────────────────────────
+
+-- Remap insert-mode triggers to open the reply float instead of editing.
+--
+-- Why remap rather than ignore?
+--   The buffer is nomodifiable, so i/a/o/CR would normally throw E21 ("cannot
+--   make changes"). An E21 in the middle of a conversation is jarring. The
+--   remaps intercept all natural "I want to type something" gestures and route
+--   them to prompt_input(), which is exactly what the user intends.
+--
+-- Why not remap in the plugin spec keys table?
+--   keys-table keymaps are global. These must be buffer-local (active only
+--   when cursor is in the claude panel) to avoid clobbering i/a/o globally.
+local function set_panel_keymaps(buf)
+  local function open_input()
+    mod.prompt_input()
+  end
+  for _, key in ipairs({ "i", "a", "o", "<CR>" }) do
+    vim.keymap.set("n", key, open_input, {
+      buffer  = buf,
+      noremap = true,
+      silent  = true,
+      desc    = "Claude: open reply float",
+    })
+  end
+  -- <Esc> in normal mode = interrupt the current turn (control_request) while
+  -- keeping the session alive. Matches the Claude Code TUI's Esc behaviour.
+  vim.keymap.set("n", "<Esc>", function()
+    mod.interrupt()
+  end, {
+    buffer  = buf,
+    noremap = true,
+    silent  = true,
+    desc    = "Claude: interrupt current turn",
+  })
+end
+
+-- ─── Persistent bidirectional subprocess (spawn + send) ──────────────────────
+
+-- Architecture: ONE long-lived `claude` process per panel session, driven over
+-- stdin/stdout as newline-delimited stream-json — the same mode KOS Capture uses
+-- (kos-capture/screens/ingest.py). Spawn args:
+--   --print --input-format stream-json --output-format stream-json --verbose
+-- Each user turn is a stream-json `user` message written to stdin; the process
+-- streams events back and STAYS ALIVE for the next turn, holding conversation
+-- context natively (no --resume/--session-id juggling).
+--
+-- Why this and not per-message --print?
+--   The old per-message design existed only to dodge a stdout-buffering bug: with
+--   plain `--print` + an OPEN stdin pipe, Claude's Node runtime buffers all
+--   stdout until stdin EOF, so on_stdout never fires. That bug is specific to
+--   --print WITHOUT --input-format stream-json. In stream-json INPUT mode Claude
+--   runs a read-eval-stream loop and flushes per message with stdin held open —
+--   verified against the real binary (two sequential messages on one process,
+--   system/init emitted up front). Keeping the process alive is what lets the
+--   panel run slash commands, skills, and plan mode like the terminal does:
+--   those are just message text (e.g. "/kos-ingest") the same way KOS sends them.
+
+-- Build the argv for the persistent process from current session settings
+-- (model + permission mode). Separated out so respawns (model/plan changes)
+-- reuse the exact same construction.
+local function build_args()
+  local args = {
+    mod.CLAUDE_BIN,
+    "--print",
+    "--input-format",    "stream-json",
+    "--output-format",   "stream-json",
+    "--verbose",
+    "--permission-mode", state.permission_mode or "acceptEdits",
+  }
+  -- --model accepts an alias (opus/sonnet/haiku) or a full id. nil = CLI default.
+  if state.model and state.model ~= "" then
+    table.insert(args, "--model")
+    table.insert(args, state.model)
+  end
+  return args
+end
+
+-- Spawn the persistent process if it isn't already running. Returns the job id,
+-- or nil on failure (after notifying). stdin is deliberately LEFT OPEN — every
+-- turn writes a new stream-json message to it; closing it would EOF the session.
+local function ensure_process()
+  if state.job_id then return state.job_id end
+  stdout_buf = ""
+  local job = vim.fn.jobstart(build_args(), {
+    cwd = state.stored_root or vim.fn.getcwd(),
+    -- Disable caveman for the panel's claude by default (opts.caveman_mode):
+    -- CAVEMAN_DEFAULT_MODE is the caveman plugin's env override, so the panel
+    -- speaks normally even when interactive sessions default to caveman. env
+    -- extends (not replaces) the inherited environment.
+    env       = opts.caveman_mode and { CAVEMAN_DEFAULT_MODE = opts.caveman_mode } or nil,
+    on_stdout = on_stdout,
+    on_stderr = function() end,
+    on_exit   = on_exit,
+  })
+  if job <= 0 then
+    vim.notify("Claude: failed to start subprocess", vim.log.levels.ERROR)
+    return nil
+  end
+  state.job_id = job
+  return job
+end
+
+-- Stop the persistent process (panel close / reset / model+plan respawn).
+-- jobstop sends SIGTERM; on_exit fires asynchronously and clears job_id, so we
+-- null it here too to make an immediate respawn safe.
+local function stop_process()
+  if state.job_id then
+    pcall(vim.fn.jobstop, state.job_id)
+    state.job_id = nil
+  end
+  stop_spinner()
+  state.working = false
+end
+mod._stop_process = stop_process
+
+-- Write a stream-json user message to the live process and arm the working
+-- state + spinner. Spawns the process on first use. Does NOT echo — callers that
+-- want the transcript echo call render_user first (see send).
+local function dispatch_send(text)
+  if not ensure_process() then
+    clear_hint()
+    return false
+  end
+  state.system_ready = false
+  state.working      = true
+  start_spinner()
+  -- One stream-json `user` message per turn, newline-terminated. The process
+  -- reads it from stdin, streams events back, and waits for the next message.
+  local msg = vim.json.encode({
+    type    = "user",
+    message = { role = "user", content = { { type = "text", text = text } } },
+  })
+  pcall(vim.fn.chansend, state.job_id, msg .. "\n")
+  return true
+end
+
+-- Send a brand-new turn: echo the message into the transcript (normal colour),
+-- a blank line so the spinner gets its own line, then dispatch it.
+local function send(text)
+  render_user(text)
+  buf_append({ "" })
+  dispatch_send(text)
+end
+mod._send = send
+
+-- Queue a message typed while a turn is in flight. It shows as a shaded virtual
+-- line at the panel bottom (render_queue) and is drained when the turn ends.
+local function enqueue(text)
+  state.queue[#state.queue + 1] = text
+  render_queue()
+end
+
+-- After a turn ends, send the next queued message (if any). The queued item then
+-- echoes in the normal user colour via send() — i.e. it "registers" with Claude.
+local function maybe_send_next()
+  if state.working or #state.queue == 0 then return end
+  local text = table.remove(state.queue, 1)
+  render_queue()
+  send(text)
+end
+mod._maybe_send_next = maybe_send_next
+
+-- Public submit used by the input float: send immediately when idle, otherwise
+-- queue (type-ahead while Claude is working, like the Claude Code TUI).
+local function submit(text)
+  if state.working then
+    enqueue(text)
+  else
+    send(text)
+  end
+end
+
+-- ─── Chat input float (Goal 6.5) ─────────────────────────────────────────────
+
+-- Open a custom floating input anchored to the bottom of the Claude panel.
+--
+-- Why not vim.ui.input / dressing.nvim?
+--   dressing.nvim computes float position internally; raw nvim_open_win params
+--   (anchor, row, col) are overwritten after get_config runs. Hand-rolled float
+--   is the only way to guarantee bottom-of-panel placement + exact panel width.
+--
+-- Layout (SW anchor → (row,col) = outer bottom-left corner including border):
+--   col        = panel left edge + pad_l  (2-char visible gap on left)
+--   width      = panel_w - pad_l - pad_r - 2  (-2 for the two border chars)
+--   right gap  = pad_r chars of visible space between right border + screen edge
+--
+-- Border colour: ClaudeHeader (#D97757 clay) via winhighlight — matches the
+-- Claude logo glyph colour so the input feels part of the same design language.
+--
+-- Inner left padding: buftype=prompt with a 1-space prompt string. The prompt
+-- is display-only (not submitted with the text) and positions the cursor one
+-- char in from the left border so it doesn't feel cramped.
+local function open_chat_float(title, callback)
+  -- Stretch the bar across the full panel width: left edge flush with the panel,
+  -- width = panel minus the two border chars. (Earlier insets made it float in
+  -- the middle; the user wants it spanning the whole Claude side.)
+  local panel_w   = panel_width()
+  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+    panel_w = vim.api.nvim_win_get_width(state.panel_win)
+  end
+  local float_col = vim.o.columns - panel_w
+  local float_w   = math.max(panel_w - 2, 1)   -- -2 for left+right border chars
+
+  local ibuf = vim.api.nvim_create_buf(false, true)
+  vim.bo[ibuf].buftype   = "prompt"   -- <CR> fires prompt_setcallback; no manual map needed
+  vim.bo[ibuf].bufhidden = "wipe"
+  vim.bo[ibuf].swapfile  = false
+
+  -- Surface the active mode in the title so the user always knows whether the
+  -- panel will edit files. Applies to every entry point (reply, ask-selection).
+  local mode_title = title
+  if state.permission_mode == "plan" then
+    mode_title = title .. " - Plan Mode"
+  end
+
+  local win = vim.api.nvim_open_win(ibuf, true, {
+    relative  = "editor",
+    anchor    = "SW",
+    row       = vim.o.lines - 2,
+    col       = float_col,
+    width     = float_w,
+    height    = 1,
+    border    = "rounded",
+    style     = "minimal",
+    title     = " " .. mode_title .. " ",
+    title_pos = "left",
+  })
+
+  -- Border + title colour signals the mode at a glance: clay (ClaudeHeader) for
+  -- normal edits, blue (ClaudePlan) when Plan mode is active so the user can see
+  -- the panel won't write files. NormalFloat:Normal keeps the bg theme-consistent.
+  local border_hl = (state.permission_mode == "plan") and "ClaudePlan" or "ClaudeHeader"
+  vim.wo[win].winhighlight =
+    "FloatBorder:" .. border_hl .. ",FloatTitle:" .. border_hl .. ",NormalFloat:Normal"
+
+  -- Soft-wrap long input onto new lines (a growing paragraph) instead of
+  -- scrolling horizontally off-screen. linebreak wraps at word boundaries.
+  vim.wo[win].wrap      = true
+  vim.wo[win].linebreak = true
+
+  -- Grow the float upward as the wrapped text needs more rows (SW anchor keeps
+  -- the bottom pinned just above the status line, so extra rows extend into the
+  -- panel). Capped so a huge paste doesn't cover the whole panel.
+  local MAX_INPUT_ROWS = 12
+  local function fit_height()
+    if not vim.api.nvim_win_is_valid(win) then return end
+    local lines = vim.api.nvim_buf_get_lines(ibuf, 0, -1, false)
+    local rows  = 0
+    for _, l in ipairs(lines) do
+      rows = rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / float_w))
+    end
+    rows = math.min(math.max(rows, 1), MAX_INPUT_ROWS)
+    local cfg = vim.api.nvim_win_get_config(win)
+    if cfg.height ~= rows then
+      cfg.height = rows
+      vim.api.nvim_win_set_config(win, cfg)
+    end
+  end
+  vim.api.nvim_create_autocmd({ "TextChangedI", "TextChanged", "TextChangedP" }, {
+    buffer   = ibuf,
+    callback = fit_height,
+  })
+
+  -- "❯ " prompt arrow (U+276F — not a keyboard char), highlighted terminal-green
+  -- via a window-local match so it reads like a shell prompt. The arrow is
+  -- display-only; the text passed to the callback excludes it.
+  vim.fn.prompt_setprompt(ibuf, "❯ ")
+  vim.fn.matchadd("ClaudeArrow", "^❯")
+
+  local function close()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end
+
+  vim.fn.prompt_setcallback(ibuf, function(text)
+    close()
+    callback(text ~= "" and text or nil)
+  end)
+
+  vim.keymap.set("i", "<Esc>", function() close(); callback(nil) end,
+    { buffer = ibuf, nowait = true, silent = true })
+  vim.keymap.set("n", "<Esc>", close, { buffer = ibuf, nowait = true, silent = true })
+  vim.keymap.set("n", "q",     close, { buffer = ibuf, nowait = true, silent = true })
+
+  -- Auto-dismiss the bar whenever focus leaves it (clicking the panel/editor, or
+  -- after a submit closes the window). Without this the float can linger if the
+  -- prompt callback doesn't fire. once=true so it self-removes; close() guards an
+  -- already-closed window.
+  vim.api.nvim_create_autocmd({ "WinLeave", "BufLeave" }, {
+    buffer   = ibuf,
+    once     = true,
+    callback = function() close() end,
+  })
+
+  vim.cmd("startinsert!")   -- ! = start after existing content (end of prompt)
+end
+
+-- Test seam: the input float is a real nvim_open_win prompt buffer, which can't
+-- be driven from a headless spec (no interactive <CR>). Routing both input
+-- entry points (prompt_input, ask_selection) through this indirection lets the
+-- spec override it with a stub that invokes the callback synchronously. In
+-- production it's just open_chat_float.
+mod._open_chat_float = open_chat_float
+
+--- Open the chat float for the user to type a reply to Claude.
+function mod.prompt_input()
+  -- Block new input when a diff is pending: accepting/rejecting the edit must
+  -- happen before the conversation can continue, so we don't create a race
+  -- between a follow-up message and the pending file change on disk.
+  if state.diff_pending then
+    vim.notify("⚠ Awaiting review — accept or reject first", vim.log.levels.WARN)
+    return
+  end
+  -- NOTE: we no longer block while Claude is working. submit() queues the message
+  -- (type-ahead) and shows it shaded at the panel bottom until the current turn
+  -- ends, then sends it — mirroring the Claude Code TUI.
+  mod._open_chat_float("Reply to Claude", function(text)
+    if not text then return end
+    submit(text)
+  end)
+end
+
+-- ─── Interrupt (Goal 6.6) ─────────────────────────────────────────────────────
+
+--- Interrupt the current turn WITHOUT killing the session.
+-- Sends a stream-json control_request {subtype="interrupt"} to the live process
+-- (the Claude Code control protocol). The process aborts the in-flight turn but
+-- stays alive, so conversation context is preserved and the user can keep
+-- chatting. Falls back to a no-op when nothing is in flight.
+-- (Contrast: mod.reset() tears the whole session down and starts blank.)
+function mod.interrupt()
+  if not (state.job_id and state.working) then return end
+  local req = vim.json.encode({
+    type       = "control_request",
+    request_id = uuid4(),
+    request    = { subtype = "interrupt" },
+  })
+  pcall(vim.fn.chansend, state.job_id, req .. "\n")
+  -- The process emits a result/error for the aborted turn; dispatch clears
+  -- working + spinner there. Clear the spinner now too so the UI feels snappy.
+  state.working = false
+  stop_spinner()
+  if not state.diff_pending then clear_hint() end
+end
+
+-- ─── Panel window placement ───────────────────────────────────────────────────
+
+-- Open a new vertical split, place it at the far-right column (via
+-- term_layout.place_vertical), and associate it with the panel buffer.
+-- Also hooks up claude_diff autocmds (on_panel_open) and the input keymaps.
+local function open_panel_window(buf)
+  local width = panel_width()
+  -- vsplit creates a new window; the new window becomes current.
+  -- We immediately retarget it to the panel buffer before resizing.
+  vim.cmd("vsplit")
+  local win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(win, buf)
+
+  -- place_vertical calls `wincmd L` to push the panel to the far-right column,
+  -- then resizes it to `width` columns. Same strategy as the OpenCode panel;
+  -- see term_layout.lua header for why this defeats toggleterm's split grouping.
+  require("utils.term_layout").place_vertical(width)
+
+  state.panel_win    = win
+  state.claude_active = true
+  -- foldmethod must be window-local (vim.wo), not buffer-local (vim.bo).
+  -- Set it here, after the window is created and associated with the buffer,
+  -- so render_thinking's nvim_win_call fold commands work correctly.
+  vim.wo[win].foldmethod = "manual"
+
+  -- Pin the panel width so growing the OS/terminal window adds columns to the
+  -- editor (the non-fixed window), not the panel. Without this the rightmost
+  -- window absorbs the extra width and the Claude panel balloons on resize.
+  vim.wo[win].winfixwidth = true
+
+  -- Distinct panel background (KOS Burn Bar #111010) so the Claude side reads as
+  -- its own surface, separate from the editor. Scoped to this window only.
+  vim.wo[win].winhighlight = "Normal:ClaudeNormal,NormalNC:ClaudeNormal,EndOfBuffer:ClaudeNormal"
+
+  -- Enable FileChangedShell interceptor + disable autoread for the session.
+  require("utils.claude_diff").on_panel_open()
+
+  local grp = vim.api.nvim_create_augroup("ClaudeDirTrack", { clear = true })
+
+  -- Keep the banner path (and claude's run cwd) tracking the directory the user
+  -- is in. DirChanged fires on every :cd / :lcd / autochdir move; we update
+  -- stored_root so the next send runs there, and rewrite the banner path line.
+  vim.api.nvim_create_autocmd("DirChanged", {
+    group = grp,
+    callback = function()
+      if not state.claude_active then return end
+      state.stored_root = vim.fn.getcwd()
+      update_banner_cwd(vim.fn.fnamemodify(state.stored_root, ":~"))
+    end,
+  })
+
+  -- Re-fit the separator lines to the panel width whenever the window resizes
+  -- (OS window drag, :resize, terminal size change) so the dividers never wrap.
+  vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
+    group = grp,
+    callback = function()
+      if not state.claude_active then return end
+      refit_separators()
+    end,
+  })
+
+  -- Buffer-local keymaps: must be set after the buffer is associated with a
+  -- window (some keymaps reference the window for focus checks).
+  set_panel_keymaps(buf)
+  clear_hint()
+  return win
+end
+
+-- ─── Toggle / open / reset (Goals 6.8, 6.6) ──────────────────────────────────
+
+--- Toggle the panel open or closed (`<leader>cc`).
+-- @param root_override string|nil  When given (dock-launch flow), this is the
+--   authoritative project root the panel anchors to — claude runs in it and the
+--   banner shows it. Without it (<leader>cc) the root is detected from the
+--   current buffer/cwd. The override exists because the dock picker knows the
+--   chosen project, while cwd may still be the launcher dir (~/dev) at this point.
+function mod.toggle(root_override)
+  if not ensure_available() then return end
+
+  -- Mutex: if OpenCode is open, close it before opening Claude (FINDINGS.md § A5).
+  -- Both panels use place_vertical(wincmd L); running both simultaneously would
+  -- strand one of them on a stale alternate screen. One panel at a time.
+  local ok, opencode = pcall(require, "utils.opencode")
+  if ok and opencode.state and opencode.state.opencode_active then
+    opencode.toggle()
+    vim.notify(
+      "Claude panel open — OpenCode closed (<leader>oc to switch)",
+      vim.log.levels.INFO
+    )
+  end
+
+  -- If the panel window is currently visible, close it. The persistent process
+  -- is torn down too — a hidden panel shouldn't keep a claude session running.
+  if state.claude_active and state.panel_win
+      and vim.api.nvim_win_is_valid(state.panel_win) then
+    stop_process()
+    vim.api.nvim_win_close(state.panel_win, true)
+    state.panel_win    = nil
+    state.claude_active = false
+    pcall(vim.api.nvim_del_augroup_by_name, "ClaudeDirTrack")
+    require("utils.claude_diff").on_panel_close()
+    return
+  end
+
+  -- Opening: the panel anchors to whatever directory the user is in — the
+  -- current working directory (vim.fn.getcwd()) — so claude runs there and the
+  -- banner path matches the editor cwd shown in the title bar. A dock launch may
+  -- pass an explicit root before cwd has settled, so it takes precedence. The
+  -- DirChanged autocmd (see open_panel_window) keeps this live as the user moves.
+  local root        = root_override or vim.fn.getcwd()
+  state.stored_root = root
+
+  local buf = ensure_panel_buf()
+  open_panel_window(buf)
+
+  -- Render banner on fresh buffer only (reopen after close reuses scrollback).
+  -- The persistent subprocess is NOT spawned here; the first send() spawns it.
+  if vim.api.nvim_buf_line_count(buf) <= 1 then
+    -- cwd + version known now (version from the binary path); model shows the
+    -- picked --model if set, else fills from system/init after the first message.
+    -- Show ~-relative path so long absolute roots don't overflow the panel.
+    render_banner(state.model or "", binary_version(),
+      vim.fn.fnamemodify(state.stored_root or root, ":~"))
+  end
+  clear_hint()
+end
+
+--- Open the panel without toggling — dock-launch flow (FINDINGS.md § A2).
+-- Idempotent: if the panel is already visible, does nothing.
+-- @param root string|nil  Authoritative project root (passed by the dock picker).
+function mod.open(root)
+  if state.claude_active and state.panel_win
+      and vim.api.nvim_win_is_valid(state.panel_win) then
+    return
+  end
+  mod.toggle(root)
+end
+
+--- Hard reset: kill the current session and start a completely blank one.
+-- Unlike <Esc> (interrupt that keeps the session + history), this kills the
+-- process and clears the panel buffer so the next send spawns a brand-new
+-- session with an empty scrollback. Model + permission-mode choices persist.
+function mod.reset()
+  -- Kill the persistent process if running. on_exit fires asynchronously but
+  -- stop_process nulls job_id now so it becomes a no-op when it arrives.
+  stop_process()
+
+  -- Clear all state synchronously so toggle() below starts with a clean slate.
+  -- session_id is cleared too so the next send starts a fresh session rather
+  -- than carrying anything over from the one we just abandoned.
+  state.job_id        = nil
+  state.session_id    = nil
+  state.stored_root   = nil
+  state.diff_queue    = {}
+  state.queue         = {}
+  state.working       = false
+  state.system_ready  = false
+  state.diff_pending  = false
+  state.claude_active = false
+  stdout_buf          = ""
+
+  -- Delete the old panel buffer so ensure_panel_buf() creates a fresh one.
+  -- Without this, the new session would append to the old scrollback.
+  if state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf) then
+    vim.api.nvim_buf_delete(state.panel_buf, { force = true })
+  end
+  state.panel_buf = nil
+  state.panel_win = nil
+
+  require("utils.claude_diff").on_panel_close()
+  mod.toggle()
+end
+
+-- ─── Model picker + plan-mode toggle ─────────────────────────────────────────
+
+-- Selectable model aliases. "default" clears --model (CLI/account default).
+-- Aliases resolve to the latest of each family at spawn time, matching the
+-- terminal's `--model opus|sonnet|haiku`.
+local MODEL_CHOICES = { "default", "opus", "sonnet", "haiku" }
+
+--- Pick the model for the panel session (`<leader>cm`).
+-- Model is a spawn-time flag, so a running session can't switch mid-flight: we
+-- stop the current process and let the next send respawn with the new --model.
+-- That resets conversation context, so we tell the user. The banner updates at
+-- once to reflect the choice.
+function mod.pick_model()
+  vim.ui.select(MODEL_CHOICES, { prompt = "Claude model" }, function(choice)
+    if not choice then return end
+    state.model = (choice == "default") and nil or choice
+    -- Tear down the live process so the next message respawns with --model.
+    local had_session = state.job_id ~= nil
+    stop_process()
+    -- Reflect immediately in the banner. friendly_model maps the alias to the
+    -- full display name ("sonnet" → "Sonnet 4.6"); "default" blanks the line so
+    -- system/init fills the real model after the first message.
+    update_banner_model(state.model and friendly_model(state.model) or "")
+    vim.notify(
+      "Claude model → " .. choice ..
+      (had_session and "  (new session — context reset)" or ""),
+      vim.log.levels.INFO
+    )
+  end)
+end
+
+--- Toggle Plan mode for the panel session (`<leader>cp`).
+-- Plan mode is the --permission-mode plan flag (read-only planning; no edits).
+-- Like the model, it's spawn-time, so toggling respawns; context resets.
+function mod.toggle_plan()
+  state.permission_mode = (state.permission_mode == "plan") and "acceptEdits" or "plan"
+  local on = state.permission_mode == "plan"
+  local had_session = state.job_id ~= nil
+  stop_process()
+  vim.notify(
+    "Claude Plan mode " .. (on and "ON" or "OFF") ..
+    (had_session and "  (new session — context reset)" or ""),
+    vim.log.levels.INFO
+  )
+end
+
+-- ─── Ask-selection (`<leader>cq`, Goal 6.7) ───────────────────────────────────
+
+-- Read the last visual selection from '< and '> marks.
+-- Must be called after leaving visual mode — the marks are only flushed to the
+-- current selection when visual mode is exited. Matches the implementation in
+-- opencode.lua get_visual_selection (same edge cases apply).
+local function get_visual_selection()
+  local s = vim.fn.getpos("'<")
+  local e = vim.fn.getpos("'>")
+  local lines = vim.api.nvim_buf_get_lines(0, s[2] - 1, e[2], false)
+  if #lines == 0 then return "" end
+  local end_col = e[3]
+  -- selection=exclusive: '> points one past the last char; subtract 1 to match
+  -- the actual last character byte (mirrors the opencode.lua correction).
+  if vim.o.selection == "exclusive" then
+    end_col = end_col - 1
+  end
+  lines[#lines] = lines[#lines]:sub(1, end_col)
+  lines[1]      = lines[1]:sub(s[3])
+  return table.concat(lines, "\n")
+end
+
+--- Ask Claude about a visual selection (`<leader>cq`).
+-- Opens the panel if needed, then sends "question\n\n```\nselection\n```"
+-- as a JSON user message. The fenced code block tells Claude the selection
+-- is code, not prose.
+function mod.ask_selection()
+  if not ensure_available() then return end
+
+  -- This is a mode="v" keymap: it fires while still in visual mode.
+  -- Escape to normal mode first so '< and '> flush to the CURRENT selection.
+  -- Without this, the marks hold the PREVIOUS selection (empty on first use).
+  if vim.fn.mode():match("[vV\22]") then
+    vim.cmd("normal! \27")
+  end
+
+  local selection = get_visual_selection()
+  if selection == "" then
+    vim.notify("Claude: no text selected", vim.log.levels.WARN)
+    return
+  end
+
+  mod._open_chat_float("Ask claude @selection", function(question)
+    if not question then return end
+    -- Open the panel first (idempotent if already open), then send.
+    mod.open()
+    -- vim.schedule: mod.open() may have triggered autocmds and UI redraws;
+    -- sending the message after a scheduler tick ensures the panel is fully
+    -- initialised before we try to write to the subprocess stdin.
+    vim.schedule(function()
+      submit(question .. "\n\n```\n" .. selection .. "\n```")
+    end)
+  end)
+end
+
+-- ─── Diff state bridge (called by claude_diff.lua) ────────────────────────────
+
+--- Called by claude_diff when a vimdiff opens — locks the input bar.
+-- The user must accept or reject the proposed edit before sending another
+-- message; allowing a follow-up while the file is in-diff risks confusing
+-- Claude with a half-applied change still on disk.
+function mod.on_diff_open()
+  state.diff_pending = true
+  set_hint("⚠ Awaiting review — <leader>ca accept  <leader>cx reject", "ClaudeLabel")
+end
+
+--- Called by claude_diff when the current diff is resolved — unlocks input.
+function mod.on_diff_close()
+  state.diff_pending = false
+  if not state.working then
+    clear_hint()
+    -- Review done: release any messages queued during the diff.
+    mod._maybe_send_next()
+  end
+end
+
+return mod

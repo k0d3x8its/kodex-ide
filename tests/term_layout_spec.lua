@@ -156,4 +156,65 @@ dev:toggle()
 assert_canonical("alpha-dashboard:")
 oc:close(); dev:close()
 
+-- ── Mutex tests (MG 10.3) ────────────────────────────────────────────────────
+--
+-- Verify that each panel's toggle() closes the sibling panel when it is open.
+-- These tests don't need real panel processes — stubs capture the call count.
+-- They run here (not in claude_spec / opencode_spec) because A5 (dual-panel
+-- contention) is a term_layout concern: both panels call place_vertical, so
+-- simultaneous open strands one on a stale window.
+
+-- Stubs that claude.toggle() / opencode.toggle() depend on at runtime.
+-- (term_layout is already the real module from the scenarios above.)
+package.loaded["utils.claude_diff"] = {
+  on_panel_open  = function() end,
+  on_panel_close = function() end,
+  on_diff_open   = function() end,
+  on_diff_close  = function() end,
+}
+H.stub_project_root("/tmp")
+vim.fn.jobstart = function() return 99 end  -- fake job_id
+vim.fn.chansend = function() end
+vim.fn.jobstop  = function() end
+
+-- Mutex A: opencode is marked active → claude.toggle() must call opencode.toggle()
+-- (so OpenCode collapses before Claude opens its panel window).
+local oc_toggle_calls = 0
+package.loaded["utils.opencode"] = {
+  state  = { opencode_active = true },
+  toggle = function() oc_toggle_calls = oc_toggle_calls + 1 end,
+}
+local claude = require("utils.claude")
+claude.state.claude_active = false  -- panel closed — put module in "will open" state
+claude.is_available = function() return true end  -- bypass binary check on CI
+
+claude.toggle()
+vim.wait(50)
+H.check("mutex A: claude.toggle() calls opencode.toggle() when opencode active",
+  oc_toggle_calls == 1, "calls=" .. oc_toggle_calls)
+
+-- Clean up the panel window that toggle() just opened.
+if claude.state.panel_win and vim.api.nvim_win_is_valid(claude.state.panel_win) then
+  vim.api.nvim_win_close(claude.state.panel_win, true)
+end
+claude.state.claude_active = false
+claude.state.job_id        = nil
+
+-- Mutex B: claude is marked active → opencode.toggle() must call claude.toggle()
+-- Before calling opencode.toggle(), override package.loaded["utils.claude"] so
+-- the pcall(require) inside opencode.toggle() gets our spy instead of the real module.
+local cl_toggle_calls = 0
+package.loaded["utils.claude"] = {
+  state  = { claude_active = true },
+  toggle = function() cl_toggle_calls = cl_toggle_calls + 1 end,
+}
+package.loaded["utils.opencode"] = nil  -- force fresh require of real opencode
+local opencode = require("utils.opencode")
+opencode.is_available = function() return true end  -- bypass binary check on CI
+
+opencode.toggle()
+vim.wait(100)
+H.check("mutex B: opencode.toggle() calls claude.toggle() when claude active",
+  cl_toggle_calls == 1, "calls=" .. cl_toggle_calls)
+
 H.summary("term_layout")

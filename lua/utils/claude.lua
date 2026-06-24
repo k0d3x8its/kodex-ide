@@ -80,6 +80,13 @@ mod.state = {
   -- id isolates the panel's conversation. (FINDINGS.md § D2)
   session_id    = nil,
 
+  -- Cumulative USD cost of THIS panel's own subprocess session, captured from each
+  -- `result` event's total_cost_usd (which is session-cumulative). nil before the
+  -- first turn. Statusline reads it via mod.session_cost(). Distinct from the burn
+  -- state file's cost, which belongs to whatever interactive CC session last wrote
+  -- it — this tracks the fresh session the panel spawned. Cleared on reset().
+  session_cost  = nil,
+
   -- Scratch buffer id for the rendered panel content (nomodifiable).
   panel_buf     = nil,
 
@@ -620,24 +627,56 @@ end
 -- just above the bar. Re-applied as the float grows; cleared when the bar closes.
 -- The over-scroll clamp only limits USER scroll, so this programmatic follow isn't
 -- fought.
+-- Pin the panel's view so the last REAL content line sits `reserve` screen rows
+-- above the window bottom: `reserve` = the chat bar's reserved rows (lift output
+-- above the bar), or 0 to reflow flush to the bottom when the bar closes. A short
+-- conversation that can't fill the space just anchors at the top.
+--
+-- topline is computed directly from buffer + window geometry rather than a
+-- relative `G` + <C-e>, so it's IDEMPOTENT. The old relative scroll compounded
+-- across re-opens: `G` is a no-op whenever the last line is already on screen
+-- (which it is after a close left the view lifted), so each re-open's <C-e>
+-- stacked another push-up. (nvim_win_text_height is wrap- and fold-aware.)
+local function anchor_last_line(win, reserve)
+  if not (win and vim.api.nvim_win_is_valid(win)) then return end
+  pcall(vim.api.nvim_win_call, win, function()
+    local winh = vim.api.nvim_win_get_height(win)
+    local last = vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(win)) - 1
+    if last < 0 then return end
+    local need = math.max(0, winh - reserve)   -- content rows to show above the bar
+    -- Walk up from the last line, summing each line's on-screen height until the
+    -- tail covers `need` rows; that line becomes topline. Bounded by ~winh steps.
+    local top, acc = last, 0
+    while top > 0 and acc < need do
+      acc = acc + vim.api.nvim_win_text_height(win, { start_row = top, end_row = top }).all
+      if acc >= need then break end
+      top = top - 1
+    end
+    local view = vim.fn.winsaveview()
+    view.topline = top + 1   -- text_height rows are 0-indexed; topline is 1-indexed
+    vim.fn.winrestview(view)
+  end)
+end
+
 local function set_bottom_pad(rows)
   local buf = state.panel_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf) and state.pad_ns) then return end
   vim.api.nvim_buf_clear_namespace(buf, state.pad_ns, 0, -1)
-  -- Record the pad height BEFORE the G-scroll below so the WinScrolled clamp (which
-  -- that scroll triggers) already knows to allow the extra rows.
+  -- Record the pad height BEFORE anchoring so the WinScrolled clamp (which the
+  -- topline change triggers) already knows to allow the extra rows.
   state.pad_rows = (rows and rows >= 1) and rows or 0
   if not rows or rows < 1 then return end
   local last = vim.api.nvim_buf_line_count(buf) - 1
   if last < 0 then last = 0 end
+  -- `rows` blank pad lines below the last real line fill the area the float covers
+  -- (plus one visible separator row). They also give the view real content below
+  -- the last line so topline can lift it clear of the bar.
   local vlines = {}
   for _ = 1, rows do vlines[#vlines + 1] = { { "", "ClaudeNormal" } } end
   vim.api.nvim_buf_set_extmark(buf, state.pad_ns, last, 0, { virt_lines = vlines })
   if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)
       and vim.api.nvim_win_get_buf(state.panel_win) == buf then
-    pcall(vim.api.nvim_win_call, state.panel_win, function()
-      vim.cmd("keepjumps normal! G")
-    end)
+    anchor_last_line(state.panel_win, rows)
   end
 end
 
@@ -646,6 +685,13 @@ local function clear_bottom_pad()
   local buf = state.panel_buf
   if buf and vim.api.nvim_buf_is_valid(buf) and state.pad_ns then
     vim.api.nvim_buf_clear_namespace(buf, state.pad_ns, 0, -1)
+    -- Reflow the newest output flush to the window bottom now the bar's gone, so a
+    -- close doesn't leave the conversation stranded mid-window with blank space
+    -- below (and so the next open recomputes from a clean bottom-anchored view).
+    if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)
+        and vim.api.nvim_win_get_buf(state.panel_win) == buf then
+      anchor_last_line(state.panel_win, 0)
+    end
   end
 end
 
@@ -1069,6 +1115,12 @@ local function dispatch(event)
     -- input — unlock the input bar (unless a diff review is still pending).
     local result_text = event.result or ""
     render_result(result_text)
+    -- total_cost_usd is the session's cumulative cost so far; store it for the
+    -- statusline. type-guard for the same reason the burn reader does (a missing
+    -- field would be nil; never compare/format a non-number).
+    if type(event.total_cost_usd) == "number" then
+      state.session_cost = event.total_cost_usd
+    end
     state.working = false
     stop_spinner()
     if state.diff_pending then
@@ -1452,7 +1504,7 @@ local function open_chat_float(title, callback)
       c.height = h
       vim.api.nvim_win_set_config(win, c)
     end
-    set_bottom_pad(h + 2)   -- + top/bottom border
+    set_bottom_pad(h + 3)   -- h interior + 2 border + 1 blank separator row
   end
 
   local function fit_height_now()
@@ -1801,6 +1853,7 @@ function mod.reset()
   -- than carrying anything over from the one we just abandoned.
   state.job_id        = nil
   state.session_id    = nil
+  state.session_cost  = nil
   state.stored_root   = nil
   state.diff_queue    = {}
   state.queue         = {}
@@ -1867,6 +1920,13 @@ function mod.current_model()
   local bm = require("utils.claude_burn").model()
   if bm ~= "" then return bm end
   return "Claude"
+end
+
+--- Session cost of the panel's OWN subprocess, formatted "$0.42", for the
+--- statusline. "$0.00" before the first turn completes; tracks the fresh session
+--- spawned in this Neovim, not the shared burn-state file's last writer.
+function mod.session_cost()
+  return string.format("$%.2f", state.session_cost or 0)
 end
 
 --- Toggle Plan mode for the panel session (`<leader>cp`).

@@ -48,4 +48,32 @@ H.check(
 -- negative.
 H.check("empty label list returns gap+shortcut", layout.button_width({}, 5, 4) == 9)
 
+-- ── truncate_left ───────────────────────────────────────────────────────────
+-- A string that already fits is returned untouched (no spurious ellipsis).
+H.check(
+  "fitting string unchanged",
+  layout.truncate_left("~/dev/foo", 20) == "~/dev/foo"
+)
+
+-- A long string is cut from the LEFT, keeps the tail, fits the budget exactly.
+do
+  local s = "~/dev/kos-burn-bar/.compound-engineering/config.local.example.yaml"
+  local t = layout.truncate_left(s, 20)
+  H.check("long string truncated to budget", vim.fn.strdisplaywidth(t) <= 20, vim.fn.strdisplaywidth(t))
+  H.check("truncation keeps the tail (filename)", t:sub(-4) == "yaml", t)
+  H.check("truncation prepends ellipsis", t:sub(1, string.len("…")) == "…", t)
+end
+
+-- Budget never exceeded even when the kept tail starts with a 2-cell glyph: the
+-- glyph is dropped whole rather than straddling the boundary.
+H.check(
+  "2-cell glyph never straddles the budget",
+  vim.fn.strdisplaywidth(layout.truncate_left("aaaa", 2)) <= 2,
+  vim.fn.strdisplaywidth(layout.truncate_left("aaaa", 2))
+)
+
+-- Degenerate budgets return empty, never error or go negative.
+H.check("zero budget returns empty", layout.truncate_left("anything", 0) == "")
+H.check("negative budget returns empty", layout.truncate_left("anything", -3) == "")
+
 H.summary("alpha_layout_spec")

@@ -977,6 +977,8 @@ local function render_banner(model, version, cwd)
   lines[#lines + 1] = BANNER_G2 .. BANNER_P2 .. friendly_model(model)
   lines[#lines + 1] = BANNER_G3 .. BANNER_P3 .. (cwd or "")
   lines[#lines + 1] = sep_line()
+  lines[#lines + 1] = ""   -- breathing room: the cursor rests here, not on the
+                           -- separator, so it never blanks the orange divider.
 
   -- Replace the entire buffer so the banner always starts at line 0.
   local buf = state.panel_buf
@@ -1738,6 +1740,11 @@ local function open_panel_window(buf)
   -- cursor rests on (e.g. the banner separator) — that strip is the "orange line
   -- background not flush" artifact. Off here, every row shares the panel bg.
   vim.wo[win].cursorline = false
+
+  -- Panel is a read-only output surface — line numbers add noise and imply an
+  -- editable file. Disable both absolute and relative numbers in this window.
+  vim.wo[win].number         = false
+  vim.wo[win].relativenumber = false
 
   -- Enable FileChangedShell interceptor + disable autoread for the session.
   require("utils.claude_diff").on_panel_open()

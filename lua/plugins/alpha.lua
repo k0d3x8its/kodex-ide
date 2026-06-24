@@ -130,16 +130,33 @@ return {
     populate_recent()
 
     -- Re-flow when the alpha window changes size (terminal resize OR a split like
-    -- the Claude panel opening beside it), so truncation matches the new width.
-    vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
+    -- the Claude panel opening/closing beside it), so the path truncation tracks
+    -- the new width. We must NOT guard on the *current* buffer being alpha: when
+    -- the Claude panel opens, focus moves to the PANEL, so the resize event fires
+    -- with a non-alpha current buffer. Instead, act whenever an alpha window is
+    -- still displayed anywhere. (alpha's own resize handler redraws too, but it
+    -- re-renders the STATIC button labels — only populate_recent() re-truncates.)
+    vim.api.nvim_create_autocmd({ "VimResized", "WinResized", "WinClosed", "WinNew" }, {
       group = vim.api.nvim_create_augroup("AlphaRecentReflow", { clear = true }),
       callback = function()
-        if vim.bo.filetype ~= "alpha" then
+        local has_alpha = false
+        for _, w in ipairs(vim.api.nvim_list_wins()) do
+          if vim.bo[vim.api.nvim_win_get_buf(w)].filetype == "alpha" then
+            has_alpha = true
+            break
+          end
+        end
+        if not has_alpha then
           return
         end
-        populate_recent()
-        pcall(function()
-          require("alpha").redraw()
+        -- Deferred so the split's final geometry has settled before we measure
+        -- the alpha window width and rebuild. redraw() with no args resolves the
+        -- live alpha state itself, so it works while focus is in the Claude panel.
+        vim.schedule(function()
+          populate_recent()
+          pcall(function()
+            require("alpha").redraw()
+          end)
         end)
       end,
     })

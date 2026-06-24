@@ -101,9 +101,12 @@ return {
       recent.val = {
         { type = "text", val = "  Recent Files", opts = { hl = "Title", position = "center" } },
       }
-      -- Per-label display budget: keep the button (label + gap + shortcut) inside
-      -- the window with a 4-cell margin so alpha can still center it.
-      local budget = alpha_win_width() - GAP - SHORTCUT_W - 4
+      -- Cap label width so the shared btn_width stays compact on wide windows.
+      -- Without a cap, the widest path dominates btn_width and short entries get
+      -- 50+ cells of dead space before SPC N. The cap keeps the gap similar to
+      -- the keymap section's alpha default (≈40 cells wide) even at full-screen.
+      local MAX_LABEL = 44
+      local budget = math.min(alpha_win_width() - GAP - SHORTCUT_W - 4, MAX_LABEL)
 
       local labels = {}
       for _, file in ipairs(files) do
@@ -191,8 +194,23 @@ return {
       footer[i] = buidl_txt[i] .. "" .. avalanche_logo[i]
     end
 
-    dashboard.section.footer.val = footer
-    dashboard.section.footer.opts = { position = "center" }
+    -- alpha's text centering uses #string (byte count), not strdisplaywidth.
+    -- The multi-byte block characters make the byte count >> the display width,
+    -- so alpha computes a large negative offset and left-aligns every row.
+    -- Fix: pre-pad using strdisplaywidth. We keep buidl_txt + avalanche_logo
+    -- strings UNSTRIPPED so all rows have the same display width (the padding in
+    -- each source array was designed to make all rows uniform → uniform centering).
+    dashboard.section.footer.val = function()
+      local w = alpha_win_width()
+      local out = {}
+      for _, line in ipairs(footer) do
+        local lw = vim.fn.strdisplaywidth(line)
+        local pad = math.max(0, math.floor((w - lw) / 2))
+        table.insert(out, string.rep(" ", pad) .. line)
+      end
+      return out
+    end
+    dashboard.section.footer.opts = {}  -- already padded; no alpha position needed
 
     -- custom layout: header → buttons → recent → footer
     dashboard.config.layout = {

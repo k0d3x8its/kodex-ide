@@ -100,6 +100,33 @@ return {
       -- Clay background — diff-add color in the [Claude proposed] scratch buffer.
       -- Reuses the header clay so the diff palette is consistent with the panel.
       vim.api.nvim_set_hl(0, "ClaudeDiffAdd", { bg = "#D97757" })
+
+      -- ── Burn-bar meters (panel winbar: 5h block + weekly limit) ───────────
+      -- Reads ~/.claude/kos-burn-bar-state.json (utils/claude_burn.lua). The
+      -- filled run is coloured by severity (green→amber→red as usage climbs);
+      -- the label, empty track, and reset countdown stay dim so the fill pops.
+      vim.api.nvim_set_hl(0, "ClaudeBurnLabel", { fg = "#6272a4" })            -- "5h"/"7d", pct
+      vim.api.nvim_set_hl(0, "ClaudeBurnTrack", { fg = "#3b3b52" })            -- ░ empty + ▕▏ brackets
+      vim.api.nvim_set_hl(0, "ClaudeBurnReset", { fg = "#6272a4", italic = true }) -- ↻ countdown
+      vim.api.nvim_set_hl(0, "ClaudeBurnOk",    { fg = "#A3BE8C", bold = true })   -- < 60% green
+      vim.api.nvim_set_hl(0, "ClaudeBurnWarn",  { fg = "#F4A261", bold = true })   -- 60–85% amber
+      vim.api.nvim_set_hl(0, "ClaudeBurnCrit",  { fg = "#D9531E", bold = true })   -- ≥ 85% red
+
+      -- ── Chat-bar flush surface (meters drawn inside the rounded box) ───────
+      -- The chat float's interior AND border share one gray so the whole bar —
+      -- input row + meters row + rounded outline — reads as a single solid
+      -- surface "flush" with the panel, not a box floating over it. The user
+      -- identified that gray as the one "seen behind the orange line at the top
+      -- and surrounding the chat bar": Neovim's CursorLine (cursorline=true in
+      -- options.lua). Derive from the live CursorLine bg so it tracks the theme;
+      -- fall back to Dracula's current-line gray (#44475a) if it's unset.
+      local cl = vim.api.nvim_get_hl(0, { name = "CursorLine" })
+      local bar_bg = cl and cl.bg or 0x44475a
+      vim.api.nvim_set_hl(0, "ClaudeBarBg",         { bg = bar_bg })
+      -- Border: clay (default) / plan-blue, on the same gray so the outline is
+      -- the only thing that pops — the fill blends into the surface.
+      vim.api.nvim_set_hl(0, "ClaudeBarBorder",     { fg = "#D97757", bg = bar_bg })
+      vim.api.nvim_set_hl(0, "ClaudeBarBorderPlan", { fg = "#61AFEF", bg = bar_bg })
     end
 
     define_highlights()

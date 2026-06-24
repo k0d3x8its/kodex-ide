@@ -171,15 +171,24 @@ return {
         -- chat float, the panel is "inactive", so without this its bar would fall
         -- back to the default filename → the ugly "claude [-]". Show a clean
         -- "CLAUDE … ✻ model … CODE" instead; the filename stays for normal buffers.
+        -- Mirror the ACTIVE layout section-for-section so the panel's bar looks
+        -- identical whether the chat bar is focused (panel inactive) or not. The
+        -- earlier "fg-only, all in lualine_c" inactive layout dropped the left
+        -- powerline arrows: an arrow cap needs a coloured block to terminate, and
+        -- with CLAUDE/model/✻ all in one section there are no section transitions
+        -- to draw the right-pointing caps. Putting CLAUDE in lualine_a (orange
+        -- block + pl_right) and model/✻ in lualine_b restores both left arrows.
         inactive_sections = {
-          lualine_a = {},
-          lualine_b = {},
-          lualine_c = {
-            { function() return "CLAUDE" end, cond = in_claude, color = { fg = "#D97757", gui = "bold" } },
-            -- Model then sparkle, mirroring the active layout (CLAUDE → model → ✻).
+          lualine_a = {
+            { function() return "CLAUDE" end, cond = in_claude, color = claude_orange, separator = { right = pl_right } },
+          },
+          lualine_b = {
             { function() return require("utils.claude").current_model() end, cond = in_claude, color = meta_color },
             { function() return "✻" end, cond = in_claude, color = { fg = "#D97757" } },
+          },
+          lualine_c = {
             { "filename", cond = function() return not in_claude() end },
+            { pio_status.badge, padding = { left = 0, right = 0 } },
           },
           lualine_x = {
             { "location", cond = function() return not in_claude() end },
@@ -193,9 +202,7 @@ return {
             {
               function() return "CODE" end,
               cond      = in_claude,
-              -- fg-only orange matches inactive CLAUDE (lualine_c) — both appear as
-              -- bold orange text, no orange background block, when the panel is inactive.
-              color     = { fg = "#D97757", gui = "bold" },
+              color     = claude_orange,
               separator = { left = pl_left },
             },
           },

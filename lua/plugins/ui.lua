@@ -56,6 +56,14 @@ return {
       local pl_right = "\238\130\176"
       local pl_left  = "\238\130\178"
 
+      -- Model (left, lualine_b) and session cost (right, lualine_y) must read as
+      -- the SAME meta tier in both chat-bar states. Dracula maps b and y to the
+      -- lightgray tier, but when the chat bar opens the panel goes inactive and
+      -- the model falls into lualine_c (darker gray) while cost stays in y —
+      -- giving a mismatch. Pinning both to the explicit b-tier colour locks them
+      -- identical, active or inactive.
+      local meta_color = { bg = "#5f6a8e", fg = "#f8f8f2" }
+
       lualine.setup({
         options = {
           theme                = "dracula",
@@ -89,7 +97,8 @@ return {
             -- place of the OS penguin (preview: "CLAUDE  Opus 4.8  ✻").
             {
               function() return require("utils.claude").current_model() end,
-              cond = in_claude,
+              cond  = in_claude,
+              color = meta_color,
             },
             {
               function() return "✻" end,
@@ -134,7 +143,8 @@ return {
           lualine_y = {
             {
               function() return require("utils.claude").session_cost() end,
-              cond = in_claude,
+              cond  = in_claude,
+              color = meta_color,
             },
             {
               "progress",
@@ -167,7 +177,7 @@ return {
           lualine_c = {
             { function() return "CLAUDE" end, cond = in_claude, color = { fg = "#D97757", gui = "bold" } },
             -- Model then sparkle, mirroring the active layout (CLAUDE → model → ✻).
-            { function() return require("utils.claude").current_model() end, cond = in_claude },
+            { function() return require("utils.claude").current_model() end, cond = in_claude, color = meta_color },
             { function() return "✻" end, cond = in_claude, color = { fg = "#D97757" } },
             { "filename", cond = function() return not in_claude() end },
           },
@@ -177,7 +187,7 @@ return {
           -- Session cost sits right next to CODE so its arrow caps the cost segment,
           -- mirroring the CLAUDE → model arrow on the left.
           lualine_y = {
-            { function() return require("utils.claude").session_cost() end, cond = in_claude },
+            { function() return require("utils.claude").session_cost() end, cond = in_claude, color = meta_color },
           },
           lualine_z = {
             {

@@ -64,6 +64,12 @@ return {
       -- identical, active or inactive.
       local meta_color = { bg = "#5f6a8e", fg = "#f8f8f2" }
 
+      -- Inactive (chat bar open) CLAUDE / CODE: dim the orange block down to the
+      -- panel gray #44475a with orange text. Because lualine colours a separator
+      -- arrow as fg = block.bg, giving the block a #44475a bg also makes the
+      -- powerline arrow glyph #44475a — the cap reads as the same gray, not orange.
+      local claude_dim = { bg = "#44475a", fg = "#D97757", gui = "bold" }
+
       lualine.setup({
         options = {
           theme                = "dracula",
@@ -180,7 +186,7 @@ return {
         -- block + pl_right) and model/✻ in lualine_b restores both left arrows.
         inactive_sections = {
           lualine_a = {
-            { function() return "CLAUDE" end, cond = in_claude, color = claude_orange, separator = { right = pl_right } },
+            { function() return "CLAUDE" end, cond = in_claude, color = claude_dim, separator = { right = pl_right } },
           },
           lualine_b = {
             { function() return require("utils.claude").current_model() end, cond = in_claude, color = meta_color },
@@ -202,7 +208,7 @@ return {
             {
               function() return "CODE" end,
               cond      = in_claude,
-              color     = claude_orange,
+              color     = claude_dim,
               separator = { left = pl_left },
             },
           },

@@ -190,6 +190,11 @@ return {
           },
           lualine_b = {
             { function() return require("utils.claude").current_model() end, cond = in_claude, color = meta_color },
+            -- Dedicated arrow glyph (NOT a separator= field, whose bg is locked to
+            -- the right-hand block) pointing from the model into the ✻. fg = model
+            -- block bg (#5f6a8e), bg = ✻ block bg (#44475a) draws a filled powerline
+            -- triangle that caps the lightgray model and points at the sparkle.
+            { function() return pl_right end, cond = in_claude, color = { fg = "#5f6a8e", bg = "#44475a" }, padding = 0 },
             -- ✻ gets the #44475a block bg so it matches the CLAUDE/CODE sections
             -- when the chat bar is open (panel inactive), instead of sitting on the
             -- lightgray model tier.

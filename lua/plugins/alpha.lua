@@ -62,18 +62,17 @@ return {
     end
 
     -- ────────────────────────────────────────────────────────────────────────────
-    -- 3) RECENT FILES SECTION — buttons auto-width to the longest path so the
-    --    "SPC N" shortcut extends past the path instead of overlapping it
+    -- 3) RECENT FILES SECTION — buttons size to the widest label so the
+    --    right-aligned "SPC N" shortcut clears the path. Long paths are
+    --    left-truncated ("…/tail") to fit the alpha WINDOW, so opening the
+    --    Claude panel (which narrows this window) can't push the shortcut into
+    --    the path. Re-flows on resize.
     -- ────────────────────────────────────────────────────────────────────────────
+    local layout = require("utils.alpha_layout")
+    local GAP, SHORTCUT_W = 4, 5 -- "SPC 5" = 5 cells; 4 blank cells of slack
     local recent = { type = "group", val = {}, opts = { spacing = 1 } }
 
-    table.insert(recent.val, {
-      type = "text",
-      val = "  Recent Files",
-      opts = { hl = "Title", position = "center" },
-    })
-
-    -- Keep only real files
+    -- Keep only the 5 most-recent real files.
     local files = {}
     for _, f in ipairs(vim.v.oldfiles) do
       if #files >= 5 then
@@ -84,30 +83,66 @@ return {
       end
     end
 
-    -- Build each button's full label (icon + ~-relative path) up front so the
-    -- shared width can be sized from real label display widths below.
-    local GAP, SHORTCUT_W = 4, 5 -- "SPC 5" = 5 cells; 4 blank cells of slack
-    local labels = {}
-    for _, file in ipairs(files) do
-      local display = vim.fn.fnamemodify(file, ":~")
-      local ext = vim.fn.fnamemodify(file, ":e")
-      local icon = devicons.get_icon(file, ext, { default = true }) or " "
-      table.insert(labels, icon .. "  " .. display)
+    -- Display width of the alpha window right now (falls back to &columns before
+    -- the window exists). Splitting in the Claude panel shrinks this AFTER the
+    -- first draw, which is exactly when long paths overflowed into "SPC N".
+    local function alpha_win_width()
+      for _, w in ipairs(vim.api.nvim_list_wins()) do
+        if vim.bo[vim.api.nvim_win_get_buf(w)].filetype == "alpha" then
+          return vim.api.nvim_win_get_width(w)
+        end
+      end
+      return vim.o.columns
     end
-    -- Size the shared button width from the ACTUAL label display widths, not a
-    -- guessed path-length + icon fudge: a nerd-font icon can be 2 cells and the
-    -- widest LABEL is not always the longest PATH, which let "SPC N" bleed in.
-    local btn_width = require("utils.alpha_layout").button_width(labels, SHORTCUT_W, GAP)
 
-    for i, file in ipairs(files) do
-      -- fnameescape = handles spaces, #, etc.
-      local cmd = "<cmd>e " .. vim.fn.fnameescape(file) .. "<CR>"
+    -- (Re)build the recent-files buttons sized to the current window. Called at
+    -- setup and on resize so the truncation tracks the live window width.
+    local function populate_recent()
+      recent.val = {
+        { type = "text", val = "  Recent Files", opts = { hl = "Title", position = "center" } },
+      }
+      -- Per-label display budget: keep the button (label + gap + shortcut) inside
+      -- the window with a 4-cell margin so alpha can still center it.
+      local budget = alpha_win_width() - GAP - SHORTCUT_W - 4
 
-      local btn = dashboard.button("SPC " .. i, labels[i], cmd)
-      btn.opts.position = "center"
-      btn.opts.width = btn_width
-      table.insert(recent.val, btn)
+      local labels = {}
+      for _, file in ipairs(files) do
+        local ext = vim.fn.fnamemodify(file, ":e")
+        local icon = devicons.get_icon(file, ext, { default = true }) or " "
+        local prefix = icon .. "  "
+        local path = vim.fn.fnamemodify(file, ":~")
+        -- Truncate only the path; the icon prefix always survives.
+        path = layout.truncate_left(path, budget - vim.fn.strdisplaywidth(prefix))
+        table.insert(labels, prefix .. path)
+      end
+
+      -- Size the shared width from the ACTUAL (post-truncation) label widths.
+      local btn_width = layout.button_width(labels, SHORTCUT_W, GAP)
+      for i, file in ipairs(files) do
+        local cmd = "<cmd>e " .. vim.fn.fnameescape(file) .. "<CR>" -- fnameescape: spaces/#
+        local btn = dashboard.button("SPC " .. i, labels[i], cmd)
+        btn.opts.position = "center"
+        btn.opts.width = btn_width
+        table.insert(recent.val, btn)
+      end
     end
+
+    populate_recent()
+
+    -- Re-flow when the alpha window changes size (terminal resize OR a split like
+    -- the Claude panel opening beside it), so truncation matches the new width.
+    vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
+      group = vim.api.nvim_create_augroup("AlphaRecentReflow", { clear = true }),
+      callback = function()
+        if vim.bo.filetype ~= "alpha" then
+          return
+        end
+        populate_recent()
+        pcall(function()
+          require("alpha").redraw()
+        end)
+      end,
+    })
 
     -- ────────────────────────────────────────────────────────────────────────────
     -- 4) PROJECTS SECTION

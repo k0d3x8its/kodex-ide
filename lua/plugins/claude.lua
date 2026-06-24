@@ -102,6 +102,12 @@ return {
       local bar_bg = (cl and cl.bg) or 0x44475a
       vim.api.nvim_set_hl(0, "ClaudeNormal",  { bg = bar_bg })
 
+      -- Invisible cursor: fg+bg both match the panel surface color so the cursor
+      -- block blends away. Applied via Cursor:ClaudeCursorHidden in winhighlight
+      -- when the chat bar is closed; cleared when it opens (see open_chat_float).
+      local hex_bg = string.format("#%06x", bar_bg)
+      vim.api.nvim_set_hl(0, "ClaudeCursorHidden", { fg = hex_bg, bg = hex_bg, nocombine = true })
+
       -- Clay background — diff-add color in the [Claude proposed] scratch buffer.
       -- Reuses the header clay so the diff palette is consistent with the panel.
       vim.api.nvim_set_hl(0, "ClaudeDiffAdd", { bg = "#D97757" })

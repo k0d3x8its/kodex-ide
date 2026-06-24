@@ -194,23 +194,16 @@ return {
       footer[i] = buidl_txt[i] .. "" .. avalanche_logo[i]
     end
 
-    -- alpha's text centering uses #string (byte count), not strdisplaywidth.
-    -- The multi-byte block characters make the byte count >> the display width,
-    -- so alpha computes a large negative offset and left-aligns every row.
-    -- Fix: pre-pad using strdisplaywidth. We keep buidl_txt + avalanche_logo
-    -- strings UNSTRIPPED so all rows have the same display width (the padding in
-    -- each source array was designed to make all rows uniform → uniform centering).
-    dashboard.section.footer.val = function()
-      local w = alpha_win_width()
-      local out = {}
-      for _, line in ipairs(footer) do
-        local lw = vim.fn.strdisplaywidth(line)
-        local pad = math.max(0, math.floor((w - lw) / 2))
-        table.insert(out, string.rep(" ", pad) .. line)
-      end
-      return out
-    end
-    dashboard.section.footer.opts = {}  -- already padded; no alpha position needed
+    -- Let alpha center the footer. alpha's align_center uses strdisplaywidth
+    -- (longest_line, alpha.lua) and applies ONE shared left-offset to every row
+    -- in the block, so multi-byte block glyphs center correctly AND uniformly —
+    -- it re-runs on each redraw (recomputing the live window width), so it tracks
+    -- the alpha window narrowing when the Claude panel opens. (An earlier manual
+    -- pre-pad per line — on the false premise that alpha centers by byte count —
+    -- gave each row a different offset → crooked footer once the panel narrowed
+    -- the window.)
+    dashboard.section.footer.val = footer
+    dashboard.section.footer.opts = { position = "center" }
 
     -- custom layout: header → buttons → recent → footer
     dashboard.config.layout = {

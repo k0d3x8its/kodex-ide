@@ -149,7 +149,9 @@ return {
             {
               function() return "CODE" end,
               cond      = in_claude,
-              color     = claude_orange,
+              -- Mirror CLAUDE's color: orange in normal mode, default otherwise
+              -- (e.g. when the user visually selects text in the panel).
+              color     = mode_color,
               -- Left arrow so CODE gets a powerline cap into its orange block.
               separator = { left = pl_left },
             },
@@ -181,8 +183,10 @@ return {
             {
               function() return "CODE" end,
               cond      = in_claude,
-              color     = claude_orange,
-              separator = { left = pl_left },   -- arrow pointing back at the cost
+              -- fg-only orange matches inactive CLAUDE (lualine_c) — both appear as
+              -- bold orange text, no orange background block, when the panel is inactive.
+              color     = { fg = "#D97757", gui = "bold" },
+              separator = { left = pl_left },
             },
           },
         },

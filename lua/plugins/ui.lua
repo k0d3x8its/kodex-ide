@@ -84,13 +84,23 @@ return {
           -- CLAUDE word so the mode word points straight at what it's running. Every
           -- other buffer keeps lualine's default B section (branch/diff/diagnostics).
           lualine_b = {
+            -- Claude sparkle ✻ in place of the OS penguin while in the panel —
+            -- it caps the "CLAUDE … ✻ model" run with the Claude mark instead of
+            -- the irrelevant fileformat glyph. Sits LEFT of the model (preview:
+            -- "✻  Opus 4.8").
+            {
+              function() return "✻" end,
+              cond = in_claude,
+              color = { fg = "#D97757" },
+            },
             {
               function() return require("utils.claude").current_model() end,
               cond = in_claude,
             },
-            -- File format (the OS glyph,  on Linux) lives on the LEFT now — it
-            -- reads more naturally beside the file's identity than off on the right.
-            "fileformat",
+            -- File format (the OS glyph,  on Linux) for NON-panel windows only —
+            -- the panel shows ✻ above instead. Reads naturally beside the file's
+            -- identity on the left.
+            { "fileformat", cond = function() return not in_claude() end },
             { "branch",      cond = function() return not in_claude() end },
             { "diff",        cond = function() return not in_claude() end },
             { "diagnostics", cond = function() return not in_claude() end },
@@ -155,7 +165,8 @@ return {
           lualine_b = {},
           lualine_c = {
             { function() return "CLAUDE" end, cond = in_claude, color = { fg = "#D97757", gui = "bold" } },
-            -- Model right after CLAUDE here too, mirroring the active layout.
+            -- Sparkle + model right after CLAUDE here too, mirroring the active layout.
+            { function() return "✻" end, cond = in_claude, color = { fg = "#D97757" } },
             { function() return require("utils.claude").current_model() end, cond = in_claude },
             { "filename", cond = function() return not in_claude() end },
           },

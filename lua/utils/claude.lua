@@ -1720,9 +1720,15 @@ local function open_panel_window(buf)
   -- window absorbs the extra width and the Claude panel balloons on resize.
   vim.wo[win].winfixwidth = true
 
-  -- Distinct panel background (KOS Burn Bar #111010) so the Claude side reads as
-  -- its own surface, separate from the editor. Scoped to this window only.
+  -- Panel background = ClaudeNormal (CursorLine-derived gray) so the whole Claude
+  -- column reads as one flush surface with the chat bar. Scoped to this window.
   vim.wo[win].winhighlight = "Normal:ClaudeNormal,NormalNC:ClaudeNormal,EndOfBuffer:ClaudeNormal"
+
+  -- Disable cursorline in the panel. It's a read-only output surface, and the
+  -- global cursorline=true otherwise paints a gray strip across whatever row the
+  -- cursor rests on (e.g. the banner separator) — that strip is the "orange line
+  -- background not flush" artifact. Off here, every row shares the panel bg.
+  vim.wo[win].cursorline = false
 
   -- Enable FileChangedShell interceptor + disable autoread for the session.
   require("utils.claude_diff").on_panel_open()

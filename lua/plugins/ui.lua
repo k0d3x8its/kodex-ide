@@ -84,18 +84,17 @@ return {
           -- CLAUDE word so the mode word points straight at what it's running. Every
           -- other buffer keeps lualine's default B section (branch/diff/diagnostics).
           lualine_b = {
-            -- Claude sparkle ✻ in place of the OS penguin while in the panel —
-            -- it caps the "CLAUDE … ✻ model" run with the Claude mark instead of
-            -- the irrelevant fileformat glyph. Sits LEFT of the model (preview:
-            -- "✻  Opus 4.8").
+            -- Panel layout: CLAUDE (mode, lualine_a) → model → ✻. The model name
+            -- sits right of CLAUDE, then the Claude sparkle ✻ caps the run in
+            -- place of the OS penguin (preview: "CLAUDE  Opus 4.8  ✻").
+            {
+              function() return require("utils.claude").current_model() end,
+              cond = in_claude,
+            },
             {
               function() return "✻" end,
               cond = in_claude,
               color = { fg = "#D97757" },
-            },
-            {
-              function() return require("utils.claude").current_model() end,
-              cond = in_claude,
             },
             -- File format (the OS glyph,  on Linux) for NON-panel windows only —
             -- the panel shows ✻ above instead. Reads naturally beside the file's
@@ -165,9 +164,9 @@ return {
           lualine_b = {},
           lualine_c = {
             { function() return "CLAUDE" end, cond = in_claude, color = { fg = "#D97757", gui = "bold" } },
-            -- Sparkle + model right after CLAUDE here too, mirroring the active layout.
-            { function() return "✻" end, cond = in_claude, color = { fg = "#D97757" } },
+            -- Model then sparkle, mirroring the active layout (CLAUDE → model → ✻).
             { function() return require("utils.claude").current_model() end, cond = in_claude },
+            { function() return "✻" end, cond = in_claude, color = { fg = "#D97757" } },
             { "filename", cond = function() return not in_claude() end },
           },
           lualine_x = {

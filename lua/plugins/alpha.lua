@@ -84,29 +84,26 @@ return {
       end
     end
 
-    -- Size the buttons to the longest path so the right-aligned "SPC N"
-    -- shortcut extends past the path instead of overlapping it. alpha's default
-    -- width=50 is too narrow for long entries like ~/dev/.../local/bin/batctrl.
-    -- Width counts display cells (strdisplaywidth), not bytes.
-    local max_w = 0
+    -- Build each button's full label (icon + ~-relative path) up front so the
+    -- shared width can be sized from real label display widths below.
+    local GAP, SHORTCUT_W = 4, 5 -- "SPC 5" = 5 cells; 4 blank cells of slack
+    local labels = {}
     for _, file in ipairs(files) do
       local display = vim.fn.fnamemodify(file, ":~")
-      max_w = math.max(max_w, vim.fn.strdisplaywidth(display))
+      local ext = vim.fn.fnamemodify(file, ":e")
+      local icon = devicons.get_icon(file, ext, { default = true }) or " "
+      table.insert(labels, icon .. "  " .. display)
     end
-    -- +3 for the devicon (1 cell) and its 2 trailing spaces; +8 for the
-    -- right-aligned "SPC N" shortcut (5 cells) plus a gap
-    local btn_width = max_w + 3 + 8
+    -- Size the shared button width from the ACTUAL label display widths, not a
+    -- guessed path-length + icon fudge: a nerd-font icon can be 2 cells and the
+    -- widest LABEL is not always the longest PATH, which let "SPC N" bleed in.
+    local btn_width = require("utils.alpha_layout").button_width(labels, SHORTCUT_W, GAP)
 
     for i, file in ipairs(files) do
-      local display = vim.fn.fnamemodify(file, ":~")
-      local ext = vim.fn.fnamemodify(file, ":e")
-      local icon = devicons.get_icon(file, ext, { default = true }) or " "
-      local label = icon .. "  " .. display
-
       -- fnameescape = handles spaces, #, etc.
       local cmd = "<cmd>e " .. vim.fn.fnameescape(file) .. "<CR>"
 
-      local btn = dashboard.button("SPC " .. i, label, cmd)
+      local btn = dashboard.button("SPC " .. i, labels[i], cmd)
       btn.opts.position = "center"
       btn.opts.width = btn_width
       table.insert(recent.val, btn)

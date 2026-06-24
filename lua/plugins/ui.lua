@@ -190,7 +190,10 @@ return {
           },
           lualine_b = {
             { function() return require("utils.claude").current_model() end, cond = in_claude, color = meta_color },
-            { function() return "✻" end, cond = in_claude, color = { fg = "#D97757" } },
+            -- ✻ gets the #44475a block bg so it matches the CLAUDE/CODE sections
+            -- when the chat bar is open (panel inactive), instead of sitting on the
+            -- lightgray model tier.
+            { function() return "✻" end, cond = in_claude, color = { fg = "#D97757", bg = "#44475a" } },
           },
           lualine_c = {
             { "filename", cond = function() return not in_claude() end },

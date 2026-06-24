@@ -92,10 +92,15 @@ return {
       vim.api.nvim_set_hl(0, "ClaudePath",    { fg = "#A3BE8C" })
       vim.api.nvim_set_hl(0, "ClaudeDim",     { fg = "#6272a4" })
 
-      -- Panel window background — KOS Burn Bar's --kos-bg (#111010), a near-black
-      -- copper-dark surface that visually separates the Claude panel from the
-      -- editor. Applied to the panel window via winhighlight (Normal + friends).
-      vim.api.nvim_set_hl(0, "ClaudeNormal",  { bg = "#111010" })
+      -- Panel window background. Shares the chat bar's gray (CursorLine-derived
+      -- ClaudeBarBg, computed below) so the whole Claude column — output panel,
+      -- bottom-pad rows, and chat bar — reads as ONE flush surface instead of a
+      -- gray bar floating over a near-black panel. (Was the KOS Burn Bar near-black
+      -- #111010, which left a visible seam at the bar.) bar_bg is resolved here so
+      -- ClaudeNormal and ClaudeBarBg can't drift apart.
+      local cl     = vim.api.nvim_get_hl(0, { name = "CursorLine" })
+      local bar_bg = (cl and cl.bg) or 0x44475a
+      vim.api.nvim_set_hl(0, "ClaudeNormal",  { bg = bar_bg })
 
       -- Clay background — diff-add color in the [Claude proposed] scratch buffer.
       -- Reuses the header clay so the diff palette is consistent with the panel.
@@ -118,10 +123,8 @@ return {
       -- surface "flush" with the panel, not a box floating over it. The user
       -- identified that gray as the one "seen behind the orange line at the top
       -- and surrounding the chat bar": Neovim's CursorLine (cursorline=true in
-      -- options.lua). Derive from the live CursorLine bg so it tracks the theme;
-      -- fall back to Dracula's current-line gray (#44475a) if it's unset.
-      local cl = vim.api.nvim_get_hl(0, { name = "CursorLine" })
-      local bar_bg = cl and cl.bg or 0x44475a
+      -- options.lua). bar_bg was resolved up top (shared with ClaudeNormal) from
+      -- the live CursorLine bg so it tracks the theme.
       vim.api.nvim_set_hl(0, "ClaudeBarBg",         { bg = bar_bg })
       -- Border: clay (default) / plan-blue, on the same gray so the outline is
       -- the only thing that pops — the fill blends into the surface.

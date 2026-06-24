@@ -50,6 +50,11 @@ local function ensure_available()
   return false
 end
 
+-- Panel winhighlight: background + end-of-buffer highlight, scoped to this window.
+-- NOTE: winhighlight cannot override Cursor/CursorNC (see :h winhighlight — those
+-- groups are explicitly excluded). Cursor hiding is done via guicursor WinEnter/WinLeave.
+local PANEL_HL_BASE = "Normal:ClaudeNormal,NormalNC:ClaudeNormal,EndOfBuffer:ClaudeNormal"
+
 -- ─── Shared state ─────────────────────────────────────────────────────────────
 --
 -- Exposed as mod.state so claude_diff.lua can read claude_active and share
@@ -1721,8 +1726,12 @@ local function open_panel_window(buf)
   vim.wo[win].winfixwidth = true
 
   -- Panel background = ClaudeNormal (CursorLine-derived gray) so the whole Claude
-  -- column reads as one flush surface with the chat bar. Scoped to this window.
-  vim.wo[win].winhighlight = "Normal:ClaudeNormal,NormalNC:ClaudeNormal,EndOfBuffer:ClaudeNormal"
+  -- column reads as one flush surface with the chat bar.
+  vim.wo[win].winhighlight = PANEL_HL_BASE
+
+  -- Hide end-of-buffer "~" filler lines. The panel is an output surface; the
+  -- tildes below the content add visual noise and imply empty-file semantics.
+  vim.wo[win].fillchars = "eob: "
 
   -- Disable cursorline in the panel. It's a read-only output surface, and the
   -- global cursorline=true otherwise paints a gray strip across whatever row the
@@ -1766,6 +1775,36 @@ local function open_panel_window(buf)
       clamp_scroll()
     end,
   })
+
+  -- Hide the cursor while the panel is focused. guicursor is global so we save on
+  -- WinEnter and restore on WinLeave. The chat-bar float handles itself: opening it
+  -- fires WinLeave (restores cursor), closing it fires WinEnter (hides again).
+  -- winhighlight cannot override Cursor/CursorNC — guicursor is the only per-focus API.
+  local _saved_gc = nil
+  vim.api.nvim_create_autocmd("WinEnter", {
+    group  = grp,
+    buffer = buf,
+    callback = function()
+      if vim.o.guicursor ~= "a:block-ClaudeCursorHidden" then
+        _saved_gc = vim.o.guicursor
+      end
+      vim.o.guicursor = "a:block-ClaudeCursorHidden"
+    end,
+  })
+  vim.api.nvim_create_autocmd("WinLeave", {
+    group  = grp,
+    buffer = buf,
+    callback = function()
+      if _saved_gc then
+        vim.o.guicursor = _saved_gc
+        _saved_gc = nil
+      end
+    end,
+  })
+  -- vsplit creates the window before nvim_win_set_buf, so WinEnter fires with
+  -- the wrong buffer and the buffer= filter skips it. Hide directly.
+  _saved_gc = vim.o.guicursor
+  vim.o.guicursor = "a:block-ClaudeCursorHidden"
 
 
   -- Buffer-local keymaps: must be set after the buffer is associated with a

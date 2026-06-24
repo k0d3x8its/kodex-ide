@@ -80,6 +80,21 @@ return {
               end,
             },
           },
+          -- In the panel, show the model (✻ Sonnet 4.6) immediately right of the
+          -- CLAUDE word so the mode word points straight at what it's running. Every
+          -- other buffer keeps lualine's default B section (branch/diff/diagnostics).
+          lualine_b = {
+            {
+              function() return require("utils.claude").current_model() end,
+              cond = in_claude,
+            },
+            -- File format (the OS glyph,  on Linux) lives on the LEFT now — it
+            -- reads more naturally beside the file's identity than off on the right.
+            "fileformat",
+            { "branch",      cond = function() return not in_claude() end },
+            { "diff",        cond = function() return not in_claude() end },
+            { "diagnostics", cond = function() return not in_claude() end },
+          },
           lualine_c = {
             -- Hide the buffer name in the panel (it rendered as the redundant,
             -- truncated "claude [-]"); show it normally everywhere else.
@@ -100,17 +115,16 @@ return {
               color = { fg = "#ff9e64" },
             },
             "encoding",
-            "fileformat",
             -- Drop the "claude" filetype tag in the panel (redundant with the
             -- CLAUDE mode word); keep it for every other buffer.
             { "filetype", cond = function() return not in_claude() end },
           },
-          -- In the panel, show the Claude Code glyph (✻) + the current model
-          -- (e.g. "✻ Sonnet 4.6") where progress (Top/Bot/%%) normally sits — more
-          -- useful than scroll position. Every other buffer keeps progress.
+          -- Panel: this session's cost ($0.42) sits just left of CODE so the CODE
+          -- arrow points at it. It's the panel's OWN subprocess cost (mod.session_cost),
+          -- not the shared burn-state file. Non-panel buffers keep scroll progress.
           lualine_y = {
             {
-              function() return "✻ " .. require("utils.claude").current_model() end,
+              function() return require("utils.claude").session_cost() end,
               cond = in_claude,
             },
             {
@@ -119,9 +133,10 @@ return {
             },
           },
           -- Far-right "CODE" mirrors the left "CLAUDE", same orange fill; only in
-          -- the panel. location stays for all buffers (default lualine_z content).
+          -- the panel. The panel's own line:col isn't useful, so location shows only
+          -- for non-panel buffers; in the panel CODE caps the cost/rate segment.
           lualine_z = {
-            "location",
+            { "location", cond = function() return not in_claude() end },
             {
               function() return "CODE" end,
               cond      = in_claude,
@@ -140,15 +155,25 @@ return {
           lualine_b = {},
           lualine_c = {
             { function() return "CLAUDE" end, cond = in_claude, color = { fg = "#D97757", gui = "bold" } },
+            -- Model right after CLAUDE here too, mirroring the active layout.
+            { function() return require("utils.claude").current_model() end, cond = in_claude },
             { "filename", cond = function() return not in_claude() end },
           },
           lualine_x = {
-            { function() return "✻ " .. require("utils.claude").current_model() end, cond = in_claude },
-            "location",
+            { "location", cond = function() return not in_claude() end },
           },
-          lualine_y = {},
+          -- Session cost sits right next to CODE so its arrow caps the cost segment,
+          -- mirroring the CLAUDE → model arrow on the left.
+          lualine_y = {
+            { function() return require("utils.claude").session_cost() end, cond = in_claude },
+          },
           lualine_z = {
-            { function() return "CODE" end, cond = in_claude, color = { fg = "#D97757", gui = "bold" } },
+            {
+              function() return "CODE" end,
+              cond      = in_claude,
+              color     = claude_orange,
+              separator = { left = pl_left },   -- arrow pointing back at the cost
+            },
           },
         },
       })

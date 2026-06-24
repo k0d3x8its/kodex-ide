@@ -122,6 +122,19 @@ mod.state = {
   -- Extmark namespace for the shaded queued-message virtual lines. Separate from
   -- hint_ns so the 110ms spinner refresh (which clears hint_ns) doesn't wipe it.
   queue_ns      = nil,
+
+  -- Extmark namespace for the bottom-pad virtual lines that reserve space under
+  -- the chat float so the latest output stays visible above the input bar.
+  pad_ns        = nil,
+
+  -- Height (rows) of the active bottom pad while the chat bar is open, 0 otherwise.
+  -- The over-scroll clamp adds it to its limit so the pad's push-up scroll isn't
+  -- yanked back (the clamp and the pad would otherwise fight).
+  pad_rows      = 0,
+
+  -- Friendly display name of the panel's current model (e.g. "Opus 4.8"), shown
+  -- in the modal statusline. Filled from system/init and the model picker.
+  model_display = "",
 }
 local state = mod.state
 
@@ -599,6 +612,43 @@ local function clear_hint()
   end
 end
 
+-- ─── Bottom pad (keep output above the chat float) ────────────────────────────
+--
+-- The reply float overlays the panel's bottom rows. We anchor `rows` blank virtual
+-- lines to the buffer's last line; `normal! G` then scrolls them into view at the
+-- very bottom (under the float, invisible), lifting the last REAL content line to
+-- just above the bar. Re-applied as the float grows; cleared when the bar closes.
+-- The over-scroll clamp only limits USER scroll, so this programmatic follow isn't
+-- fought.
+local function set_bottom_pad(rows)
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf) and state.pad_ns) then return end
+  vim.api.nvim_buf_clear_namespace(buf, state.pad_ns, 0, -1)
+  -- Record the pad height BEFORE the G-scroll below so the WinScrolled clamp (which
+  -- that scroll triggers) already knows to allow the extra rows.
+  state.pad_rows = (rows and rows >= 1) and rows or 0
+  if not rows or rows < 1 then return end
+  local last = vim.api.nvim_buf_line_count(buf) - 1
+  if last < 0 then last = 0 end
+  local vlines = {}
+  for _ = 1, rows do vlines[#vlines + 1] = { { "", "ClaudeNormal" } } end
+  vim.api.nvim_buf_set_extmark(buf, state.pad_ns, last, 0, { virt_lines = vlines })
+  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)
+      and vim.api.nvim_win_get_buf(state.panel_win) == buf then
+    pcall(vim.api.nvim_win_call, state.panel_win, function()
+      vim.cmd("keepjumps normal! G")
+    end)
+  end
+end
+
+local function clear_bottom_pad()
+  state.pad_rows = 0
+  local buf = state.panel_buf
+  if buf and vim.api.nvim_buf_is_valid(buf) and state.pad_ns then
+    vim.api.nvim_buf_clear_namespace(buf, state.pad_ns, 0, -1)
+  end
+end
+
 -- ─── Queued-message display (type-ahead while Claude works) ───────────────────
 
 -- Render the pending message queue as shaded virtual lines anchored to the
@@ -968,6 +1018,7 @@ local function dispatch(event)
     -- The init event carries the CLI version under `claude_code_version`
     -- (NOT `version`); fall back to `version` only for forward-compatibility.
     local model    = friendly_model(event.model or "")
+    if model ~= "" then state.model_display = model end  -- modal statusline model
     local raw_ver  = event.claude_code_version or event.version or ""
     local ver      = (raw_ver ~= "") and (" v" .. raw_ver) or ""
     local buf   = state.panel_buf
@@ -1116,6 +1167,11 @@ local function ensure_panel_buf()
   vim.bo[buf].bufhidden  = "hide"   -- don't wipe on window close; keep scrollback
   vim.bo[buf].swapfile   = false
   vim.bo[buf].modifiable = false    -- prevent accidental edits; toggled by buf_append
+  -- filetype "claude" is the hook the modal statusline keys off (lua/plugins/ui.lua
+  -- in_claude): when this buffer is focused, lualine shows CLAUDE / CODE instead of
+  -- the plain Neovim mode. The reply float buffer gets the same filetype so the
+  -- modal indicator persists while typing.
+  vim.bo[buf].filetype   = "claude"
   -- foldmethod is window-local, not buffer-local; set it in open_panel_window.
   -- Name the buffer "claude" so bufferline and lualine show something readable
   -- instead of "[No Name]". pcall guards the rare E95 name-collision.
@@ -1124,6 +1180,7 @@ local function ensure_panel_buf()
   state.panel_buf = buf
   state.hint_ns   = vim.api.nvim_create_namespace("claude_hint")
   state.queue_ns  = vim.api.nvim_create_namespace("claude_queue")
+  state.pad_ns    = vim.api.nvim_create_namespace("claude_pad")
   state.folds     = {}
   stdout_buf      = ""
   return buf
@@ -1164,6 +1221,7 @@ local function set_panel_keymaps(buf)
     silent  = true,
     desc    = "Claude: interrupt current turn",
   })
+
 end
 
 -- ─── Persistent bidirectional subprocess (spawn + send) ──────────────────────
@@ -1304,28 +1362,26 @@ end
 
 -- ─── Chat input float (Goal 6.5) ─────────────────────────────────────────────
 
--- Open a custom floating input anchored to the bottom of the Claude panel.
+-- Open the reply input as a rounded floating bar anchored to the bottom of the
+-- panel — the stylish chat bar.
 --
--- Why not vim.ui.input / dressing.nvim?
---   dressing.nvim computes float position internally; raw nvim_open_win params
---   (anchor, row, col) are overwritten after get_config runs. Hand-rolled float
---   is the only way to guarantee bottom-of-panel placement + exact panel width.
+-- Why a float, not a split?
+--   A split adds a second per-window statusline between the panel and the input
+--   (the stray "claude [-]" bar) and looks plain. The float keeps the rounded,
+--   bordered look the user wants. The float carries filetype "claude" too, so its
+--   own (active) lualine bar shows the modal CLAUDE … INSERT … CODE while typing;
+--   the panel behind it falls back to the inactive_sections variant
+--   (lua/plugins/ui.lua) — per-window bars, no shared global statusline.
 --
--- Layout (SW anchor → (row,col) = outer bottom-left corner including border):
---   col        = panel left edge + pad_l  (2-char visible gap on left)
---   width      = panel_w - pad_l - pad_r - 2  (-2 for the two border chars)
---   right gap  = pad_r chars of visible space between right border + screen edge
---
--- Border colour: ClaudeHeader (#D97757 clay) via winhighlight — matches the
--- Claude logo glyph colour so the input feels part of the same design language.
---
--- Inner left padding: buftype=prompt with a 1-space prompt string. The prompt
--- is display-only (not submitted with the text) and positions the cursor one
--- char in from the left border so it doesn't feel cramped.
+-- The burn meters (5h / weekly / context) render INSIDE the box, on their own row
+-- below the input (a virtual line), so the single rounded outline wraps both the
+-- input and the meters. The bar's interior is the CursorLine gray (ClaudeBarBg) so
+-- it reads flush. The newest output is kept visible above the bar by reserving its
+-- footprint as bottom padding (set_bottom_pad); the over-scroll clamp adds that pad
+-- so it doesn't fight the push-up.
 local function open_chat_float(title, callback)
-  -- Stretch the bar across the full panel width: left edge flush with the panel,
-  -- width = panel minus the two border chars. (Earlier insets made it float in
-  -- the middle; the user wants it spanning the whole Claude side.)
+  -- Span the full panel width: left edge flush with the panel, width = panel minus
+  -- the two border chars.
   local panel_w   = panel_width()
   if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
     panel_w = vim.api.nvim_win_get_width(state.panel_win)
@@ -1337,12 +1393,23 @@ local function open_chat_float(title, callback)
   vim.bo[ibuf].buftype   = "prompt"   -- <CR> fires prompt_setcallback; no manual map needed
   vim.bo[ibuf].bufhidden = "wipe"
   vim.bo[ibuf].swapfile  = false
+  -- Same filetype as the panel buffer so the modal statusline keys off it.
+  vim.bo[ibuf].filetype  = "claude"
 
-  -- Surface the active mode in the title so the user always knows whether the
-  -- panel will edit files. Applies to every entry point (reply, ask-selection).
-  local mode_title = title
-  if state.permission_mode == "plan" then
-    mode_title = title .. " - Plan Mode"
+  local label    = title .. (state.permission_mode == "plan" and " - Plan Mode" or "")
+  local meter_ns = vim.api.nvim_create_namespace("claude_bar_meters")
+
+  -- Render the meters as a virtual line attached below the prompt line (line 0).
+  -- Returns 1 if a meter row was drawn, 0 if there's no data. Re-called on resize
+  -- so the meters re-fit the (possibly new) width.
+  local function render_meters()
+    vim.api.nvim_buf_clear_namespace(ibuf, meter_ns, 0, -1)
+    local m = require("utils.claude_burn").chunks(float_w)
+    if not m then return 0 end
+    vim.api.nvim_buf_set_extmark(ibuf, meter_ns, 0, 0, {
+      virt_lines = { m }, virt_lines_above = false,
+    })
+    return 1
   end
 
   local win = vim.api.nvim_open_win(ibuf, true, {
@@ -1351,30 +1418,44 @@ local function open_chat_float(title, callback)
     row       = vim.o.lines - 2,
     col       = float_col,
     width     = float_w,
-    height    = 1,
+    height    = 1,                 -- grown to input rows + meter row below
     border    = "rounded",
     style     = "minimal",
-    title     = " " .. mode_title .. " ",
+    title     = " " .. label .. " ",
     title_pos = "left",
   })
 
-  -- Border + title colour signals the mode at a glance: clay (ClaudeHeader) for
-  -- normal edits, blue (ClaudePlan) when Plan mode is active so the user can see
-  -- the panel won't write files. NormalFloat:Normal keeps the bg theme-consistent.
-  local border_hl = (state.permission_mode == "plan") and "ClaudePlan" or "ClaudeHeader"
-  vim.wo[win].winhighlight =
-    "FloatBorder:" .. border_hl .. ",FloatTitle:" .. border_hl .. ",NormalFloat:Normal"
+  -- Flush surface: interior + border share the CursorLine gray (ClaudeBarBg /
+  -- ClaudeBarBorder) so the rounded box reads as one solid bar against the panel,
+  -- with only the clay (or plan-blue) outline standing out.
+  local border_hl = (state.permission_mode == "plan") and "ClaudeBarBorderPlan" or "ClaudeBarBorder"
+  vim.wo[win].winhighlight = "FloatBorder:" .. border_hl
+    .. ",FloatTitle:" .. border_hl
+    .. ",NormalFloat:ClaudeBarBg"
 
-  -- Soft-wrap long input onto new lines (a growing paragraph) instead of
-  -- scrolling horizontally off-screen. linebreak wraps at word boundaries.
+  -- Soft-wrap long input onto new lines (a growing paragraph) instead of scrolling
+  -- horizontally off-screen. linebreak wraps at word boundaries.
   vim.wo[win].wrap      = true
   vim.wo[win].linebreak = true
 
-  -- Grow the float upward as the wrapped text needs more rows (SW anchor keeps
-  -- the bottom pinned just above the status line, so extra rows extend into the
-  -- panel). Capped so a huge paste doesn't cover the whole panel.
+  -- Size the box to enclose the input rows PLUS the meter row, and reserve that
+  -- footprint as panel bottom padding so the newest output rides just above the
+  -- bar. Called on open, on input grow, and on resize.
   local MAX_INPUT_ROWS = 12
-  local function fit_height()
+  local cur_rows       = 1
+  local function apply_layout()
+    if not vim.api.nvim_win_is_valid(win) then return end
+    local mrows = render_meters()
+    local h     = cur_rows + mrows
+    local c     = vim.api.nvim_win_get_config(win)
+    if c.height ~= h then
+      c.height = h
+      vim.api.nvim_win_set_config(win, c)
+    end
+    set_bottom_pad(h + 2)   -- + top/bottom border
+  end
+
+  local function fit_height_now()
     if not vim.api.nvim_win_is_valid(win) then return end
     local lines = vim.api.nvim_buf_get_lines(ibuf, 0, -1, false)
     local rows  = 0
@@ -1382,15 +1463,47 @@ local function open_chat_float(title, callback)
       rows = rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / float_w))
     end
     rows = math.min(math.max(rows, 1), MAX_INPUT_ROWS)
-    local cfg = vim.api.nvim_win_get_config(win)
-    if cfg.height ~= rows then
-      cfg.height = rows
-      vim.api.nvim_win_set_config(win, cfg)
+    if rows ~= cur_rows then
+      cur_rows = rows
+      apply_layout()
     end
+  end
+
+  local fit_pending = false
+  local function schedule_fit()
+    if fit_pending then return end
+    fit_pending = true
+    vim.defer_fn(function()
+      fit_pending = false
+      fit_height_now()
+    end, 16)
   end
   vim.api.nvim_create_autocmd({ "TextChangedI", "TextChanged", "TextChangedP" }, {
     buffer   = ibuf,
-    callback = fit_height,
+    callback = schedule_fit,
+  })
+
+  -- Keep the bar pinned to the Claude column + bottom when the terminal/window is
+  -- resized (the fixed-width panel's left edge shifts as the editor grows, so a
+  -- float fixed at open-time col drifts out of the column). Recompute col/row/width
+  -- and re-fit the meters to the new width.
+  local resize_grp = vim.api.nvim_create_augroup("ClaudeChatFloat", { clear = true })
+  vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
+    group = resize_grp,
+    callback = function()
+      if not vim.api.nvim_win_is_valid(win) then return true end  -- bar gone → self-remove
+      local pw = panel_width()
+      if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+        pw = vim.api.nvim_win_get_width(state.panel_win)
+      end
+      float_w = math.max(pw - 2, 1)
+      local c = vim.api.nvim_win_get_config(win)
+      c.col   = vim.o.columns - pw
+      c.row   = vim.o.lines - 2
+      c.width = float_w
+      pcall(vim.api.nvim_win_set_config, win, c)
+      apply_layout()   -- re-fit meters to the new width + resize height
+    end,
   })
 
   -- "❯ " prompt arrow (U+276F — not a keyboard char), highlighted terminal-green
@@ -1400,6 +1513,8 @@ local function open_chat_float(title, callback)
   vim.fn.matchadd("ClaudeArrow", "^❯")
 
   local function close()
+    clear_bottom_pad()   -- drop the reserved space so output reflows to the bottom
+    pcall(vim.api.nvim_del_augroup_by_name, "ClaudeChatFloat")
     if vim.api.nvim_win_is_valid(win) then
       vim.api.nvim_win_close(win, true)
     end
@@ -1416,14 +1531,16 @@ local function open_chat_float(title, callback)
   vim.keymap.set("n", "q",     close, { buffer = ibuf, nowait = true, silent = true })
 
   -- Auto-dismiss the bar whenever focus leaves it (clicking the panel/editor, or
-  -- after a submit closes the window). Without this the float can linger if the
-  -- prompt callback doesn't fire. once=true so it self-removes; close() guards an
-  -- already-closed window.
+  -- after a submit closes the window). once=true so it self-removes; close()
+  -- guards an already-closed window.
   vim.api.nvim_create_autocmd({ "WinLeave", "BufLeave" }, {
     buffer   = ibuf,
     once     = true,
     callback = function() close() end,
   })
+
+  -- Draw the meters + size the box + reserve the push-up space, all up front.
+  apply_layout()
 
   vim.cmd("startinsert!")   -- ! = start after existing content (end of prompt)
 end
@@ -1474,6 +1591,51 @@ function mod.interrupt()
   state.working = false
   stop_spinner()
   if not state.diff_pending then clear_hint() end
+end
+
+-- ─── Over-scroll clamp ────────────────────────────────────────────────────────
+
+-- How many blank rows the panel may scroll PAST the last content line. Enough to
+-- read the tail of a response without the conversation sliding off the top of the
+-- window (the user's complaint: free scroll ran content off-screen). In the 5–8
+-- range they asked for.
+local SCROLL_TAIL = 6
+
+-- Re-entrancy guard: winrestview below re-fires WinScrolled. The guard plus the
+-- "only when over" test means the correction settles in one step (after the
+-- restore topline == t_max, so the nested call is a no-op).
+local clamping = false
+
+-- Clamp the panel's topline so the last buffer line can rise at most SCROLL_TAIL
+-- rows above the window bottom. Driven by WinScrolled so it catches EVERY scroll
+-- source — mouse wheel, <C-e>/<C-d>, search jumps — which a key-by-key approach
+-- can't (the wheel especially bypasses normal-mode maps while the float is
+-- focused).
+--   topline T puts line n at screen row (n - T + 1); the limit is when that row
+--   reaches (winh - SCROLL_TAIL), i.e. T <= n - winh + SCROLL_TAIL + 1.
+local function clamp_scroll()
+  if clamping then return end
+  local win = state.panel_win
+  if not (win and vim.api.nvim_win_is_valid(win)) then return end
+  if not (state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf)) then return end
+  if vim.api.nvim_win_get_buf(win) ~= state.panel_buf then return end
+
+  local n     = vim.api.nvim_buf_line_count(state.panel_buf)
+  local winh  = vim.api.nvim_win_get_height(win)
+  -- Add the active pad height so the chat bar's push-up scroll (which reveals the
+  -- pad's blank rows under the float) isn't clamped back — otherwise the clamp and
+  -- the pad fight and the latest output never rises above the bar.
+  local t_max = math.max(1, n - winh + SCROLL_TAIL + 1 + (state.pad_rows or 0))
+
+  clamping = true
+  pcall(vim.api.nvim_win_call, win, function()
+    local v = vim.fn.winsaveview()   -- preserves the cursor; we only rewrite topline
+    if v.topline > t_max then
+      v.topline = t_max
+      vim.fn.winrestview(v)
+    end
+  end)
+  clamping = false
 end
 
 -- ─── Panel window placement ───────────────────────────────────────────────────
@@ -1536,6 +1698,17 @@ local function open_panel_window(buf)
       refit_separators()
     end,
   })
+
+  -- Cap over-scroll so the conversation can't be flung off the top of the window
+  -- (catches mouse wheel + keys + jumps). See clamp_scroll for the math.
+  vim.api.nvim_create_autocmd("WinScrolled", {
+    group = grp,
+    callback = function()
+      if not state.claude_active then return end
+      clamp_scroll()
+    end,
+  })
+
 
   -- Buffer-local keymaps: must be set after the buffer is associated with a
   -- window (some keymaps reference the window for focus checks).
@@ -1671,13 +1844,29 @@ function mod.pick_model()
     -- Reflect immediately in the banner. friendly_model maps the alias to the
     -- full display name ("sonnet" → "Sonnet 4.6"); "default" blanks the line so
     -- system/init fills the real model after the first message.
-    update_banner_model(state.model and friendly_model(state.model) or "")
+    local fm = state.model and friendly_model(state.model) or ""
+    state.model_display = fm   -- modal statusline; "" until system/init re-fills it
+    update_banner_model(fm)
     vim.notify(
       "Claude model → " .. choice ..
       (had_session and "  (new session — context reset)" or ""),
       vim.log.levels.INFO
     )
   end)
+end
+
+--- Friendly display name of the panel's current model (e.g. "Sonnet 4.6") for the
+--- modal statusline. Prefers the picked model, falls back to whatever system/init
+--- last reported, then to a generic "Claude" so the segment is never blank.
+function mod.current_model()
+  if state.model_display and state.model_display ~= "" then return state.model_display end
+  local fm = state.model and friendly_model(state.model) or ""
+  if fm ~= "" then return fm end
+  -- Before the panel's first turn, borrow the model from the burn state file as a
+  -- hint (last interactive session's model); fall back to a generic label.
+  local bm = require("utils.claude_burn").model()
+  if bm ~= "" then return bm end
+  return "Claude"
 end
 
 --- Toggle Plan mode for the panel session (`<leader>cp`).

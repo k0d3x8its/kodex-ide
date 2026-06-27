@@ -144,6 +144,10 @@ mod.state = {
   -- yanked back (the clamp and the pad would otherwise fight).
   pad_rows      = 0,
 
+  -- The user's real (visible) 'guicursor', captured before the panel hides it.
+  -- The chat bar restores this on open so the cursor is visible while typing.
+  real_guicursor = nil,
+
   -- Friendly display name of the panel's current model (e.g. "Opus 4.8"), shown
   -- in the modal statusline. Filled from system/init and the model picker.
   model_display = "",
@@ -288,6 +292,12 @@ end
 --   Without this, the cursor stays at line 1 (where it was when the buffer was
 --   created) and new content scrolls off-screen. Streaming output should auto-
 --   follow to the bottom so the user sees it arrive in real time.
+-- Forward-declared (defined below) so buf_append's auto-follow can, when the chat
+-- bar is open, RE-PLACE the bottom pad at the new last line and lift it above the
+-- bar — instead of scrolling it flush to the window bottom (under the float).
+local anchor_last_line
+local set_bottom_pad
+
 local function buf_append(lines)
   local buf = state.panel_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
@@ -303,9 +313,18 @@ local function buf_append(lines)
   -- Guarded on the displayed buffer so we don't disturb a diff-review retarget.
   if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)
       and vim.api.nvim_win_get_buf(state.panel_win) == buf then
-    pcall(vim.api.nvim_win_call, state.panel_win, function()
-      vim.cmd("keepjumps normal! G")
-    end)
+    -- When the chat bar is open it reserves `pad_rows` at the panel bottom; a plain
+    -- `G` would scroll the newest line flush to the window bottom — UNDER the float.
+    -- Streaming appends lines BELOW the pad's old anchor line, so we must MOVE the
+    -- pad to the new last line (set_bottom_pad re-places it AND re-anchors), not
+    -- just re-anchor — otherwise the pad sits mid-buffer and the lift is lost.
+    if (state.pad_rows or 0) > 0 then
+      set_bottom_pad(state.pad_rows)
+    else
+      pcall(vim.api.nvim_win_call, state.panel_win, function()
+        vim.cmd("keepjumps normal! G")
+      end)
+    end
   end
 end
 
@@ -632,38 +651,55 @@ end
 -- just above the bar. Re-applied as the float grows; cleared when the bar closes.
 -- The over-scroll clamp only limits USER scroll, so this programmatic follow isn't
 -- fought.
--- Pin the panel's view so the last REAL content line sits `reserve` screen rows
--- above the window bottom: `reserve` = the chat bar's reserved rows (lift output
--- above the bar), or 0 to reflow flush to the bottom when the bar closes. A short
--- conversation that can't fill the space just anchors at the top.
+-- Screen rows between the last buffer line's final cell and the window bottom,
+-- under the CURRENT view. Returns nil when the last line is scrolled off-screen
+-- (the user scrolled up to read history). Must run inside nvim_win_call(win).
+-- screenpos() reports the TRUE display row regardless of wrap or collapsed folds —
+-- the property a buffer-line-count formula lacks.
+local function free_below(win, buf)
+  local n        = vim.api.nvim_buf_line_count(buf)
+  local lasttext = vim.api.nvim_buf_get_lines(buf, n - 1, n, false)[1] or ""
+  local sp       = vim.fn.screenpos(win, n, math.max(#lasttext, 1))
+  if sp.row == 0 then return nil end
+  local info = vim.fn.getwininfo(win)[1]
+  return (info.winrow + info.height - 1) - sp.row
+end
+
+-- Pin the panel's view so the last REAL content line sits exactly `reserve` screen
+-- rows above the window bottom — the space the chat bar's pad reserves. With no pad
+-- (reserve 0, bar closed) the last line sits flush at the bottom (reflow).
 --
--- topline is computed directly from buffer + window geometry rather than a
--- relative `G` + <C-e>, so it's IDEMPOTENT. The old relative scroll compounded
--- across re-opens: `G` is a no-op whenever the last line is already on screen
--- (which it is after a close left the view lifted), so each re-open's <C-e>
--- stacked another push-up. (nvim_win_text_height is wrap- and fold-aware.)
-local function anchor_last_line(win, reserve)
+-- Method: `G`+`zb` gets close, then a screen-row measurement (free_below) drives a
+-- single `<C-e>` correction to hit `reserve` precisely. We do NOT compute a topline:
+--   - The old topline walk summed nvim_win_text_height PER LINE, which returns 0 for
+--     lines inside a CLOSED FOLD (a collapsed "thinking" dropdown) — so the walk ran
+--     far past the intended top and the view jumped 10-20 lines.
+--   - `zb` alone is wrap/fold-correct but does not reliably account for the trailing
+--     virtual PAD lines (how many land on-screen depends on the last line's wrap
+--     height), so it under-lifts by a row or two.
+-- Measuring the real rendered gap and nudging with `<C-e>` sidesteps both. It needs
+-- 'smoothscroll' (panel-window-local) so `<C-e>` moves ONE screen row, not a whole
+-- (possibly multi-row) buffer line; scrolloff is forced to 0 so nothing holds the
+-- last line off the bottom. Only ever scrolls UP toward the bar (never <C-y>): a
+-- short conversation that can't fill the window just floats above the bar, which is
+-- correct — forcing it down would hide the top of the chat.
+function anchor_last_line(win, reserve)
   if not (win and vim.api.nvim_win_is_valid(win)) then return end
+  local buf = vim.api.nvim_win_get_buf(win)
   pcall(vim.api.nvim_win_call, win, function()
-    local winh = vim.api.nvim_win_get_height(win)
-    local last = vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(win)) - 1
-    if last < 0 then return end
-    local need = math.max(0, winh - reserve)   -- content rows to show above the bar
-    -- Walk up from the last line, summing each line's on-screen height until the
-    -- tail covers `need` rows; that line becomes topline. Bounded by ~winh steps.
-    local top, acc = last, 0
-    while top > 0 and acc < need do
-      acc = acc + vim.api.nvim_win_text_height(win, { start_row = top, end_row = top }).all
-      if acc >= need then break end
-      top = top - 1
+    if vim.api.nvim_buf_line_count(buf) < 1 then return end
+    local so = vim.wo[win].scrolloff
+    vim.wo[win].scrolloff = 0
+    vim.cmd("keepjumps normal! Gzb")
+    local fb = free_below(win, buf)
+    if fb and fb < reserve then
+      vim.cmd("keepjumps normal! " .. (reserve - fb) .. "\005")  -- <C-e> ×(reserve-fb)
     end
-    local view = vim.fn.winsaveview()
-    view.topline = top + 1   -- text_height rows are 0-indexed; topline is 1-indexed
-    vim.fn.winrestview(view)
+    vim.wo[win].scrolloff = so
   end)
 end
 
-local function set_bottom_pad(rows)
+function set_bottom_pad(rows)
   local buf = state.panel_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf) and state.pad_ns) then return end
   vim.api.nvim_buf_clear_namespace(buf, state.pad_ns, 0, -1)
@@ -699,6 +735,12 @@ local function clear_bottom_pad()
     end
   end
 end
+
+-- Test seams: expose the pad/anchor internals so the headless spec can drive the
+-- exact push-up math (winh/line-count/topline) without an interactive float.
+mod._anchor_last_line = anchor_last_line
+mod._set_bottom_pad   = set_bottom_pad
+mod._clear_bottom_pad = clear_bottom_pad
 
 -- ─── Queued-message display (type-ahead while Claude works) ───────────────────
 
@@ -1528,18 +1570,17 @@ local function open_chat_float(title, callback)
     end
   end
 
-  local fit_pending = false
-  local function schedule_fit()
-    if fit_pending then return end
-    fit_pending = true
-    vim.defer_fn(function()
-      fit_pending = false
-      fit_height_now()
-    end, 16)
-  end
+  -- Fit the height SYNCHRONOUSLY on the text change, NOT on a debounce timer. The
+  -- old 16ms vim.defer_fn left a one-frame window where the buffer had already
+  -- wrapped to a new screen row but the float hadn't grown yet: too short, the
+  -- window scrolled the "❯" prompt line off the top and the wrapped text flashed
+  -- up where the arrow had been. Fitting in the same tick as the keystroke folds
+  -- the resize into that redraw, so there's no intermediate too-short frame.
+  -- Nothing to coalesce: fit_height_now only triggers apply_layout on an actual
+  -- row-count change (a wrap boundary crossing), not on every keystroke.
   vim.api.nvim_create_autocmd({ "TextChangedI", "TextChanged", "TextChangedP" }, {
     buffer   = ibuf,
-    callback = schedule_fit,
+    callback = fit_height_now,
   })
 
   -- Keep the bar pinned to the Claude column + bottom when the terminal/window is
@@ -1571,7 +1612,14 @@ local function open_chat_float(title, callback)
   vim.fn.prompt_setprompt(ibuf, "❯ ")
   vim.fn.matchadd("ClaudeArrow", "^❯")
 
+  -- Show the cursor while the chat bar is open (the panel hides it globally via
+  -- guicursor). Done explicitly here rather than relying on the panel's
+  -- WinLeave→restore, which was unreliable and left the cursor invisible while
+  -- typing. close() re-hides it; focus returns to the read-only panel.
+  vim.o.guicursor = state.real_guicursor or "a:block,a:blinkon0"
+
   local function close()
+    vim.o.guicursor = "a:block-ClaudeCursorHidden"   -- re-hide; focus returns to panel
     clear_bottom_pad()   -- drop the reserved space so output reflows to the bottom
     pcall(vim.api.nvim_del_augroup_by_name, "ClaudeChatFloat")
     if vim.api.nvim_win_is_valid(win) then
@@ -1660,42 +1708,59 @@ end
 -- range they asked for.
 local SCROLL_TAIL = 6
 
--- Re-entrancy guard: winrestview below re-fires WinScrolled. The guard plus the
+-- Re-entrancy guard: the re-anchor below re-fires WinScrolled. The guard plus the
 -- "only when over" test means the correction settles in one step (after the
--- restore topline == t_max, so the nested call is a no-op).
+-- re-anchor the last line sits at its allowed row, so the nested call is a no-op).
 local clamping = false
 
--- Clamp the panel's topline so the last buffer line can rise at most SCROLL_TAIL
--- rows above the window bottom. Driven by WinScrolled so it catches EVERY scroll
--- source — mouse wheel, <C-e>/<C-d>, search jumps — which a key-by-key approach
--- can't (the wheel especially bypasses normal-mode maps while the float is
--- focused).
---   topline T puts line n at screen row (n - T + 1); the limit is when that row
---   reaches (winh - SCROLL_TAIL), i.e. T <= n - winh + SCROLL_TAIL + 1.
+-- Clamp panel over-scroll so the last content line can rise at most SCROLL_TAIL
+-- rows above its resting position (pad_rows above the window bottom). Driven by
+-- WinScrolled so it catches EVERY scroll source — mouse wheel, <C-e>/<C-d>, search
+-- jumps — which a key-by-key approach can't (the wheel especially bypasses
+-- normal-mode maps while the float is focused).
+--
+-- Measured in SCREEN rows via screenpos(), not a topline-vs-line-count formula:
+-- the old formula assumed one screen row per buffer line, so wrapped prose and
+-- collapsed "thinking" folds made its limit wildly wrong — it trapped the view and
+-- the user couldn't scroll down to text that was really there. screenpos() reports
+-- the true display row of the last line regardless of wrap/folds.
 local function clamp_scroll()
   if clamping then return end
   local win = state.panel_win
   if not (win and vim.api.nvim_win_is_valid(win)) then return end
-  if not (state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf)) then return end
-  if vim.api.nvim_win_get_buf(win) ~= state.panel_buf then return end
-
-  local n     = vim.api.nvim_buf_line_count(state.panel_buf)
-  local winh  = vim.api.nvim_win_get_height(win)
-  -- Add the active pad height so the chat bar's push-up scroll (which reveals the
-  -- pad's blank rows under the float) isn't clamped back — otherwise the clamp and
-  -- the pad fight and the latest output never rises above the bar.
-  local t_max = math.max(1, n - winh + SCROLL_TAIL + 1 + (state.pad_rows or 0))
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if vim.api.nvim_win_get_buf(win) ~= buf then return end
 
   clamping = true
   pcall(vim.api.nvim_win_call, win, function()
-    local v = vim.fn.winsaveview()   -- preserves the cursor; we only rewrite topline
-    if v.topline > t_max then
-      v.topline = t_max
-      vim.fn.winrestview(v)
+    local n        = vim.api.nvim_buf_line_count(buf)
+    local lasttext = vim.api.nvim_buf_get_lines(buf, n - 1, n, false)[1] or ""
+    -- Screen row of the last line's final cell under the CURRENT view. row 0 means
+    -- the last line is scrolled off the BOTTOM — i.e. the user scrolled UP to read
+    -- history; that's allowed, so don't clamp.
+    local sp = vim.fn.screenpos(win, n, math.max(#lasttext, 1))
+    if sp.row == 0 then return end
+    local info       = vim.fn.getwininfo(win)[1]
+    local win_bottom = info.winrow + info.height - 1
+    local free_below = win_bottom - sp.row
+    -- The last line legitimately rests pad_rows above the bottom (the chat bar's
+    -- reserved space). Allow SCROLL_TAIL of extra over-scroll for breathing room;
+    -- beyond that the conversation is sliding off the top, so re-anchor it back.
+    local limit = (state.pad_rows or 0) + SCROLL_TAIL
+    if free_below > limit then
+      local so = vim.wo[win].scrolloff
+      vim.wo[win].scrolloff = 0
+      vim.cmd("keepjumps normal! Gzb")
+      vim.wo[win].scrolloff = so
     end
   end)
   clamping = false
 end
+
+-- Test seam: drive the over-scroll clamp directly in the headless spec.
+mod._clamp_scroll = clamp_scroll
+mod._SCROLL_TAIL  = SCROLL_TAIL
 
 -- ─── Panel window placement ───────────────────────────────────────────────────
 
@@ -1746,6 +1811,13 @@ local function open_panel_window(buf)
   vim.wo[win].number         = false
   vim.wo[win].relativenumber = false
 
+  -- smoothscroll: scroll by SCREEN rows, so the chat-bar push-up (anchor_last_line)
+  -- and clamp can lift a partially-wrapped line precisely instead of snapping to
+  -- whole-line boundaries. scrolloff=0: nothing holds the last line off the bottom,
+  -- so `zb` can place it flush (the bar reserves space via the pad, not scrolloff).
+  vim.wo[win].smoothscroll = true
+  vim.wo[win].scrolloff    = 0
+
   -- Enable FileChangedShell interceptor + disable autoread for the session.
   require("utils.claude_diff").on_panel_open()
 
@@ -1784,9 +1856,16 @@ local function open_panel_window(buf)
   })
 
   -- Hide the cursor while the panel is focused. guicursor is global so we save on
-  -- WinEnter and restore on WinLeave. The chat-bar float handles itself: opening it
-  -- fires WinLeave (restores cursor), closing it fires WinEnter (hides again).
-  -- winhighlight cannot override Cursor/CursorNC — guicursor is the only per-focus API.
+  -- WinEnter and restore on WinLeave. winhighlight cannot override Cursor/CursorNC —
+  -- guicursor is the only per-focus API. We also stash the real (visible) guicursor
+  -- in module state so the chat bar can explicitly restore it on open rather than
+  -- depending on the WinLeave→restore race, which left the cursor invisible while
+  -- typing if _saved_gc had already been consumed.
+  local function remember_real_gc()
+    if vim.o.guicursor ~= "a:block-ClaudeCursorHidden" then
+      state.real_guicursor = vim.o.guicursor
+    end
+  end
   local _saved_gc = nil
   vim.api.nvim_create_autocmd("WinEnter", {
     group  = grp,
@@ -1795,6 +1874,7 @@ local function open_panel_window(buf)
       if vim.o.guicursor ~= "a:block-ClaudeCursorHidden" then
         _saved_gc = vim.o.guicursor
       end
+      remember_real_gc()
       vim.o.guicursor = "a:block-ClaudeCursorHidden"
     end,
   })
@@ -1811,6 +1891,7 @@ local function open_panel_window(buf)
   -- vsplit creates the window before nvim_win_set_buf, so WinEnter fires with
   -- the wrong buffer and the buffer= filter skips it. Hide directly.
   _saved_gc = vim.o.guicursor
+  remember_real_gc()
   vim.o.guicursor = "a:block-ClaudeCursorHidden"
 
 

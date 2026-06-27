@@ -151,6 +151,12 @@ mod.state = {
   -- Friendly display name of the panel's current model (e.g. "Opus 4.8"), shown
   -- in the modal statusline. Filled from system/init and the model picker.
   model_display = "",
+
+  -- Unsent text from the "Reply to Claude" chat bar, kept alive across hide/show.
+  -- The bar's prompt buffer is wiped on close, so without this any half-typed
+  -- message vanishes when the bar loses focus. Saved on a non-submit close,
+  -- restored on the next open, and cleared only when the message is actually sent.
+  chat_draft    = "",
 }
 local state = mod.state
 
@@ -1480,7 +1486,14 @@ end
 -- it reads flush. The newest output is kept visible above the bar by reserving its
 -- footprint as bottom padding (set_bottom_pad); the over-scroll clamp adds that pad
 -- so it doesn't fight the push-up.
-local function open_chat_float(title, callback)
+local function open_chat_float(title, callback, opts)
+  opts = opts or {}
+  -- When persist_draft is set, the bar's unsent text survives a hide/show via
+  -- state.chat_draft (see close()/submit below). Only the main "Reply" bar opts in.
+  local persist_draft = opts.persist_draft == true
+  -- Flipped true the instant a real submit fires, so close() knows NOT to re-save
+  -- the (already-sent) text as a draft.
+  local submitted = false
   -- Span the full panel width: left edge flush with the panel, width = panel minus
   -- the two border chars.
   local panel_w   = panel_width()
@@ -1619,6 +1632,12 @@ local function open_chat_float(title, callback)
   vim.o.guicursor = state.real_guicursor or "a:block,a:blinkon0"
 
   local function close()
+    -- Save unsent text BEFORE the buffer is wiped. Skip on a submit close — that
+    -- text is already on its way to Claude, so the draft must clear, not persist.
+    if persist_draft and not submitted and vim.api.nvim_buf_is_valid(ibuf) then
+      local last = vim.api.nvim_buf_get_lines(ibuf, -2, -1, false)[1] or ""
+      state.chat_draft = last
+    end
     vim.o.guicursor = "a:block-ClaudeCursorHidden"   -- re-hide; focus returns to panel
     clear_bottom_pad()   -- drop the reserved space so output reflows to the bottom
     pcall(vim.api.nvim_del_augroup_by_name, "ClaudeChatFloat")
@@ -1628,6 +1647,8 @@ local function open_chat_float(title, callback)
   end
 
   vim.fn.prompt_setcallback(ibuf, function(text)
+    submitted = true
+    if persist_draft then state.chat_draft = "" end   -- sent → drop the saved draft
     close()
     callback(text ~= "" and text or nil)
   end)
@@ -1645,6 +1666,14 @@ local function open_chat_float(title, callback)
     once     = true,
     callback = function() close() end,
   })
+
+  -- Restore any unsent text from a previous hide. Set the input line before
+  -- startinsert! so the cursor lands at its end, and refit the box height in case
+  -- the restored text wraps to multiple rows.
+  if persist_draft and state.chat_draft ~= "" then
+    vim.api.nvim_buf_set_lines(ibuf, 0, -1, false, { state.chat_draft })
+    fit_height_now()
+  end
 
   -- Draw the meters + size the box + reserve the push-up space, all up front.
   apply_layout()
@@ -1674,7 +1703,7 @@ function mod.prompt_input()
   mod._open_chat_float("Reply to Claude", function(text)
     if not text then return end
     submit(text)
-  end)
+  end, { persist_draft = true })
 end
 
 -- ─── Interrupt (Goal 6.6) ─────────────────────────────────────────────────────

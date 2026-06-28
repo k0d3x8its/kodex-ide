@@ -1228,6 +1228,14 @@ local function render_prose(text)
       hl_range(ln, h[1], h[2], h[3])
     end
   end
+
+  -- Trailing blank line so the auto-follow cursor (buf_append's `normal! G`)
+  -- parks here, not on the final content row. The panel is a non-current window
+  -- while Claude streams, and the cursor's line doesn't repaint its decorations
+  -- — a code block's last line would show a flat (unpainted) clay gutter bar
+  -- until an unrelated redraw. Parking the cursor on a blank keeps styled rows
+  -- fully painted.
+  buf_append({ "" })
 end
 
 -- Echo the user's submitted message into the transcript so the conversation

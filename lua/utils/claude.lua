@@ -53,7 +53,9 @@ end
 -- Panel winhighlight: background + end-of-buffer highlight, scoped to this window.
 -- NOTE: winhighlight cannot override Cursor/CursorNC (see :h winhighlight — those
 -- groups are explicitly excluded). Cursor hiding is done via guicursor WinEnter/WinLeave.
-local PANEL_HL_BASE = "Normal:ClaudeNormal,NormalNC:ClaudeNormal,EndOfBuffer:ClaudeNormal"
+-- Folded:ClaudeLabel paints the collapsed "▶ Thinking" foldtext row in the same
+-- bold purple as the expanded header, so the block reads consistently in either state.
+local PANEL_HL_BASE = "Normal:ClaudeNormal,NormalNC:ClaudeNormal,EndOfBuffer:ClaudeNormal,Folded:ClaudeLabel"
 
 -- ─── Shared state ─────────────────────────────────────────────────────────────
 --
@@ -924,21 +926,40 @@ local function render_code_block(lang, body)
     { gutter_b, #head, "ClaudeCodeLang" },             -- bg covers the inset pad too
   }
 
+  -- Content width = panel minus the gutter+inset; code lines wider than this are
+  -- HARD-WRAPPED into chunks here (rather than relying on Vim's soft wrap) so EACH
+  -- screen row carries its own gutter bar + block bg. A soft-wrapped continuation
+  -- row would otherwise show bare (no gutter, no bg) past the block edge.
+  local gutter_dw = vim.fn.strdisplaywidth(CODE_GUTTER)
+  local cw        = math.max(w - gutter_dw, 1)
+
   for i, bl in ipairs(body) do
-    local row = pad_display(CODE_GUTTER .. bl, w)
-    local hls = {
-      { 0, gutter_b, "ClaudeCodeGutter" },
-      { gutter_b, #row, "ClaudeCodeBlock" },          -- bg + neutral fg base, covers inset pad
-    }
-    if syn and syn[i] then                            -- overlay syntax fg spans
-      for _, s in ipairs(syn[i]) do
-        local s0 = #CODE_GUTTER + s[1]
-        local e0 = #CODE_GUTTER + math.min(s[2], #bl)
-        if e0 > s0 then hls[#hls + 1] = { s0, e0, s[3] } end
+    local spans = syn and syn[i] or nil
+    local rest, boff = bl, 0                           -- remaining text, byte offset into bl
+    repeat
+      local chunk = (rest == "") and "" or disp_take(rest, cw)
+      local clen  = #chunk
+      local row   = pad_display(CODE_GUTTER .. chunk, w)
+      local hls   = {
+        { 0, gutter_b, "ClaudeCodeGutter" },
+        { gutter_b, #row, "ClaudeCodeBlock" },         -- bg + neutral fg base, covers inset pad
+      }
+      if spans then                                    -- overlay syntax fg spans, clipped to chunk
+        for _, s in ipairs(spans) do
+          local sb = s[1]
+          local se = math.min(s[2], #bl)
+          local cs = math.max(sb, boff)                -- intersect [sb,se) with this chunk's byte span
+          local ce = math.min(se, boff + clen)
+          if ce > cs then
+            hls[#hls + 1] = { #CODE_GUTTER + (cs - boff), #CODE_GUTTER + (ce - boff), s[3] }
+          end
+        end
       end
-    end
-    out_lines[#out_lines + 1] = row
-    out_hls[#out_hls + 1] = hls
+      out_lines[#out_lines + 1] = row
+      out_hls[#out_hls + 1] = hls
+      rest = rest:sub(clen + 1)
+      boff = boff + clen
+    until rest == ""
   end
   return out_lines, out_hls
 end
@@ -1284,7 +1305,20 @@ local function render_user(text)
   hl_range(first, 0, #USER_ARROW, "ClaudeArrow")
 end
 
--- Render a thinking block as a collapsible manual fold (FINDINGS.md Q3).
+-- Foldtext for a collapsed thinking block. The buffer's first fold line is the
+-- literal "▼ Thinking" header (only shown when expanded); when collapsed Neovim
+-- shows THIS instead — a "▶ Thinking" row with the hidden body line count, so the
+-- arrow flips ▼→▶ to signal the closed state. Used for every panel fold, but only
+-- thinking blocks create folds. Exposed on mod so the window's foldtext expr
+-- (`v:lua.require('utils.claude')._foldtext()`) can reach it.
+function mod._foldtext()
+  local n = vim.v.foldend - vim.v.foldstart           -- body lines (header excluded)
+  return "▶ Thinking  ·  " .. n .. (n == 1 and " line" or " lines")
+end
+
+-- Render a thinking block as a collapsible manual fold (FINDINGS.md Q3),
+-- AUTO-COLLAPSED so extended-thinking doesn't bury the reply. Click the header
+-- (mouse) or `za` to expand; `zR`/`zM` open/close all.
 --
 -- Why manual folds, not marker/indent folds?
 --   foldmethod=marker would pollute the buffer content with fold markers.
@@ -1292,10 +1326,9 @@ end
 --   to depth 1, but prose lines wouldn't fold at all). Manual folds let us
 --   set exact start/end lines programmatically after each block is appended.
 --
--- Why zR immediately after fold creation?
---   Without zR, newly created folds start closed. The spec calls for thinking
---   blocks to be expanded by default so the user can read them; they can toggle
---   individually with `za` or close all with `zM`.
+-- Why no zR after `:fold`?
+--   `:{range}fold` creates the fold ALREADY CLOSED. We deliberately leave it
+--   closed (was previously force-opened with zR) so thinking starts collapsed.
 local function render_thinking(text)
   local buf = state.panel_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
@@ -1322,8 +1355,7 @@ local function render_thinking(text)
   local fold_end   = vim.api.nvim_buf_line_count(buf)
   if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
     vim.api.nvim_win_call(state.panel_win, function()
-      vim.cmd(fold_start .. "," .. fold_end .. "fold")
-      vim.cmd("normal! zR")  -- open all folds: blocks expand by default
+      vim.cmd(fold_start .. "," .. fold_end .. "fold")  -- creates it CLOSED → auto-collapsed
     end)
   end
 end
@@ -1701,6 +1733,23 @@ local function set_panel_keymaps(buf)
     desc    = "Claude: interrupt current turn",
   })
 
+  -- Mouse: clicking a "Thinking" fold toggles it open/closed. <LeftRelease> fires
+  -- AFTER the default <LeftMouse> has positioned the cursor, so the line under the
+  -- cursor is the clicked row — and for a closed fold that row is its start line
+  -- (the literal "▼ Thinking" header), so the same match works in both states.
+  -- Clicks elsewhere (prose, code, thinking body when expanded) fall through.
+  vim.keymap.set("n", "<LeftRelease>", function()
+    local lnum = vim.fn.line(".")
+    local line = vim.api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
+    if line:match("^▼ Thinking") then
+      pcall(vim.cmd, "normal! za")
+    end
+  end, {
+    buffer  = buf,
+    noremap = true,
+    silent  = true,
+    desc    = "Claude: toggle thinking fold on click",
+  })
 end
 
 -- ─── Persistent bidirectional subprocess (spawn + send) ──────────────────────
@@ -2016,7 +2065,7 @@ local function open_chat_float(title, callback, opts)
       local last = vim.api.nvim_buf_get_lines(ibuf, -2, -1, false)[1] or ""
       state.chat_draft = last
     end
-    vim.o.guicursor = "a:block-ClaudeCursorHidden"   -- re-hide; focus returns to panel
+    vim.o.guicursor = "a:ver1-ClaudeCursorHidden"   -- re-hide; focus returns to panel
     clear_bottom_pad()   -- drop the reserved space so output reflows to the bottom
     pcall(vim.api.nvim_del_augroup_by_name, "ClaudeChatFloat")
     if vim.api.nvim_win_is_valid(win) then
@@ -2196,6 +2245,9 @@ local function open_panel_window(buf)
   -- Set it here, after the window is created and associated with the buffer,
   -- so render_thinking's nvim_win_call fold commands work correctly.
   vim.wo[win].foldmethod = "manual"
+  -- Custom foldtext so a collapsed thinking block reads as "▶ Thinking · N lines"
+  -- (see mod._foldtext) instead of Vim's default "+-- N lines:" line.
+  vim.wo[win].foldtext = "v:lua.require('utils.claude')._foldtext()"
 
   -- Pin the panel width so growing the OS/terminal window adds columns to the
   -- editor (the non-fixed window), not the panel. Without this the rightmost
@@ -2208,7 +2260,9 @@ local function open_panel_window(buf)
 
   -- Hide end-of-buffer "~" filler lines. The panel is an output surface; the
   -- tildes below the content add visual noise and imply empty-file semantics.
-  vim.wo[win].fillchars = "eob: "
+  -- eob: blank the ~ end-of-buffer markers; fold: blank the trailing fill dashes
+  -- after the foldtext so a collapsed "▶ Thinking" row reads clean to the edge.
+  vim.wo[win].fillchars = "eob: ,fold: "
 
   -- Disable cursorline in the panel. It's a read-only output surface, and the
   -- global cursorline=true otherwise paints a gray strip across whatever row the
@@ -2272,7 +2326,7 @@ local function open_panel_window(buf)
   -- depending on the WinLeave→restore race, which left the cursor invisible while
   -- typing if _saved_gc had already been consumed.
   local function remember_real_gc()
-    if vim.o.guicursor ~= "a:block-ClaudeCursorHidden" then
+    if vim.o.guicursor ~= "a:ver1-ClaudeCursorHidden" then
       state.real_guicursor = vim.o.guicursor
     end
   end
@@ -2281,11 +2335,11 @@ local function open_panel_window(buf)
     group  = grp,
     buffer = buf,
     callback = function()
-      if vim.o.guicursor ~= "a:block-ClaudeCursorHidden" then
+      if vim.o.guicursor ~= "a:ver1-ClaudeCursorHidden" then
         _saved_gc = vim.o.guicursor
       end
       remember_real_gc()
-      vim.o.guicursor = "a:block-ClaudeCursorHidden"
+      vim.o.guicursor = "a:ver1-ClaudeCursorHidden"
     end,
   })
   vim.api.nvim_create_autocmd("WinLeave", {
@@ -2302,7 +2356,7 @@ local function open_panel_window(buf)
   -- the wrong buffer and the buffer= filter skips it. Hide directly.
   _saved_gc = vim.o.guicursor
   remember_real_gc()
-  vim.o.guicursor = "a:block-ClaudeCursorHidden"
+  vim.o.guicursor = "a:ver1-ClaudeCursorHidden"
 
 
   -- Buffer-local keymaps: must be set after the buffer is associated with a

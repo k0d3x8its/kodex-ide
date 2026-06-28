@@ -145,9 +145,13 @@ return {
       local bar_bg = (cl and cl.bg) or 0x44475a
       vim.api.nvim_set_hl(0, "ClaudeNormal",  { bg = bar_bg })
 
-      -- Invisible cursor: fg+bg both match the panel surface color so the cursor
-      -- block blends away. Applied via Cursor:ClaudeCursorHidden in winhighlight
-      -- when the chat bar is closed; cleared when it opens (see open_chat_float).
+      -- Invisible cursor: a thin vertical bar (guicursor a:ver1-ClaudeCursorHidden)
+      -- coloured to match the panel surface. A 1%-width bar in the bg colour is
+      -- invisible AND — unlike a block — does not repaint the glyph cell, so the
+      -- character under the cursor (e.g. a fold's ▼/▶ arrow) keeps its own colour.
+      -- (blend=100 isn't honoured for the cursor in this terminal; a bg-coloured
+      -- BLOCK hid the cursor but blanked the glyph beneath it.) Applied while the
+      -- panel is focused; cleared to the real cursor when the chat bar opens.
       local hex_bg = string.format("#%06x", bar_bg)
       vim.api.nvim_set_hl(0, "ClaudeCursorHidden", { fg = hex_bg, bg = hex_bg, nocombine = true })
 

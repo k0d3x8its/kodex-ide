@@ -66,6 +66,49 @@ return {
       -- the per-file devicons colours and the green inline paths.
       vim.api.nvim_set_hl(0, "ClaudeDir",      { fg = "#7AA2F7", bold = true })
 
+      -- ── Rich markdown block elements (headings / lists / quotes / code) ────
+      -- Headings — blue (#82AAFF) bold on a dark blue-slate background BAR (the
+      -- renderer pads the line to panel width so the bg fills the row, reading as a
+      -- section banner). Level is shown by the literal #/##/### markers, which the
+      -- renderer KEEPS (per user pref), so the three groups share styling and the
+      -- hash count is the hierarchy cue.
+      vim.api.nvim_set_hl(0, "ClaudeH1", { fg = "#82AAFF", bg = "#2B3145", bold = true })
+      vim.api.nvim_set_hl(0, "ClaudeH2", { fg = "#82AAFF", bg = "#2B3145", bold = true })
+      vim.api.nvim_set_hl(0, "ClaudeH3", { fg = "#82AAFF", bg = "#2B3145", bold = true })
+
+      -- List bullet glyph — clay, so the marker pops while the item text stays
+      -- in the standard ClaudeProse orange. Only the glyph is recoloured.
+      vim.api.nvim_set_hl(0, "ClaudeBullet", { fg = "#D97757", bold = true })
+
+      -- Blockquote — a clay left bar with muted, italic body text so quoted
+      -- passages recede from the main prose without going invisible.
+      vim.api.nvim_set_hl(0, "ClaudeQuoteBar", { fg = "#D97757" })
+      vim.api.nvim_set_hl(0, "ClaudeQuote",    { fg = "#9AA0B5", italic = true })
+
+      -- Fenced code block — a recessed panel (Dracula's darker bg #21222C,
+      -- below the CursorLine gray the panel uses) with neutral light text, a
+      -- clay left gutter bar, and a dim italic language label on the fence row.
+      vim.api.nvim_set_hl(0, "ClaudeCodeBlock",  { fg = "#F8F8F2", bg = "#21222C" })
+      vim.api.nvim_set_hl(0, "ClaudeCodeGutter", { fg = "#D97757", bg = "#21222C" })
+      vim.api.nvim_set_hl(0, "ClaudeCodeLang",   { fg = "#6272A4", bg = "#21222C", italic = true })
+
+      -- Code-block SYNTAX colours (Dracula-family fg on the SAME #21222C panel bg
+      -- baked in, so a token never loses the block background). The treesitter
+      -- highlighter (utils/claude.lua code_ts_hls) maps captures onto these, so we
+      -- don't depend on the colorscheme's @capture links resolving on a non-code
+      -- buffer. Unmapped captures fall through to ClaudeCodeBlock (neutral).
+      local cbg = "#21222C"
+      vim.api.nvim_set_hl(0, "ClaudeCodeKeyword", { fg = "#FF79C6", bg = cbg })             -- keywords/conditionals
+      vim.api.nvim_set_hl(0, "ClaudeCodeString",  { fg = "#F1FA8C", bg = cbg })             -- strings/chars
+      vim.api.nvim_set_hl(0, "ClaudeCodeComment", { fg = "#6272A4", bg = cbg, italic = true }) -- comments
+      vim.api.nvim_set_hl(0, "ClaudeCodeFunc",    { fg = "#50FA7B", bg = cbg })             -- functions/methods
+      vim.api.nvim_set_hl(0, "ClaudeCodeNumber",  { fg = "#BD93F9", bg = cbg })             -- numbers/booleans
+      vim.api.nvim_set_hl(0, "ClaudeCodeType",    { fg = "#8BE9FD", bg = cbg })             -- types
+      vim.api.nvim_set_hl(0, "ClaudeCodeConst",   { fg = "#BD93F9", bg = cbg })             -- constants
+      vim.api.nvim_set_hl(0, "ClaudeCodeOper",    { fg = "#FF79C6", bg = cbg })             -- operators
+      vim.api.nvim_set_hl(0, "ClaudeCodePunc",    { fg = "#A6ACCD", bg = cbg })             -- punctuation
+      vim.api.nvim_set_hl(0, "ClaudeCodeVar",     { fg = "#F8F8F2", bg = cbg })             -- variables/fields
+
       -- Plan mode accent — blue. Recolours the input bar border/title when the
       -- panel is in --permission-mode plan, signalling no edits will be applied.
       vim.api.nvim_set_hl(0, "ClaudePlan",     { fg = "#61AFEF", bold = true })

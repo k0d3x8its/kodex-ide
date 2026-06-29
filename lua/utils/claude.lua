@@ -267,12 +267,18 @@ local TOOL_VERB = {
 -- Priority: file_path > path > pattern > query > command (truncated to 70 chars).
 -- Falls back to "" when none present, so callers can skip the target display.
 local function tool_target(input)
-  return input.file_path
+  local t = input.file_path
     or input.path
     or input.pattern
     or input.query
     or (input.command and tostring(input.command):sub(1, 70))
     or ""
+  -- This value renders as ONE line (the "⚙ Verb: target" entry). A multi-line
+  -- command/query (e.g. a Bash heredoc, or a `find … \n …`) keeps its newline
+  -- through the :sub() truncation, and nvim_buf_set_lines REJECTS any item with an
+  -- embedded newline → render_tool crashes the whole dispatch (hit on a Bash tool
+  -- whose command spanned lines). Collapse all vertical whitespace to spaces here.
+  return (t:gsub("[\r\n\t]+", " "))
 end
 
 -- ─── Buffer append helper ─────────────────────────────────────────────────────
@@ -2260,24 +2266,30 @@ local function clamp_scroll()
 
   clamping = true
   pcall(vim.api.nvim_win_call, win, function()
-    local n        = vim.api.nvim_buf_line_count(buf)
-    local lasttext = vim.api.nvim_buf_get_lines(buf, n - 1, n, false)[1] or ""
-    -- Screen row of the last line's final cell under the CURRENT view. row 0 means
-    -- the last line is scrolled off the BOTTOM — i.e. the user scrolled UP to read
-    -- history; that's allowed, so don't clamp.
-    local sp = vim.fn.screenpos(win, n, math.max(#lasttext, 1))
-    if sp.row == 0 then return end
-    local info       = vim.fn.getwininfo(win)[1]
-    local win_bottom = info.winrow + info.height - 1
-    local free_below = win_bottom - sp.row
+    -- Screen rows between the last content line and the window bottom. nil means
+    -- the last line is scrolled off the BOTTOM — the user scrolled UP to read
+    -- history; that's allowed, so don't clamp. (Same measurement anchor_last_line
+    -- uses, hence the shared helper.)
+    local gap = free_below(win, buf)
+    if not gap then return end
     -- The last line legitimately rests pad_rows above the bottom (the chat bar's
     -- reserved space). Allow SCROLL_TAIL of extra over-scroll for breathing room;
     -- beyond that the conversation is sliding off the top, so re-anchor it back.
     local limit = (state.pad_rows or 0) + SCROLL_TAIL
-    if free_below > limit then
+    if gap > limit then
+      -- Re-anchor to the limit BOUNDARY, not flush to the bottom. The old `Gzb`
+      -- snapped the gap to 0, so every over-scroll tick jumped the full `limit`
+      -- back — that big jump read as violent jitter. Pinning to exactly `limit`
+      -- (Gzb, then an <C-e> nudge — the same method as anchor_last_line) makes the
+      -- correction only the overshoot delta, so the view holds at the boundary
+      -- instead of bouncing between 0 and limit.
       local so = vim.wo[win].scrolloff
       vim.wo[win].scrolloff = 0
       vim.cmd("keepjumps normal! Gzb")
+      local fb = free_below(win, buf)
+      if fb and fb < limit then
+        vim.cmd("keepjumps normal! " .. (limit - fb) .. "\005")  -- <C-e> ×(limit-fb)
+      end
       vim.wo[win].scrolloff = so
     end
   end)
@@ -2287,6 +2299,37 @@ end
 -- Test seam: drive the over-scroll clamp directly in the headless spec.
 mod._clamp_scroll = clamp_scroll
 mod._SCROLL_TAIL  = SCROLL_TAIL
+
+-- Mouse-wheel-down pre-empt. The WinScrolled clamp corrects AFTER a scroll lands;
+-- discrete keyboard scrolls (G, <C-e>) settle in one correction, but the mouse wheel
+-- streams events continuously, so the clamp fights every tick → the bounce the user
+-- only saw with the mouse. Here we scroll only the room left below the limit and
+-- SWALLOW once at it, so the over-scroll never happens and there's nothing to undo.
+-- Scroll-up (<ScrollWheelUp>) stays native so reading history is unrestricted.
+local WHEEL_STEP = 3   -- rows per wheel notch (matches the default 'mousescroll' ver)
+local function panel_wheel_down()
+  local win = state.panel_win
+  if not (win and vim.api.nvim_win_is_valid(win)) then return end
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if vim.api.nvim_win_get_buf(win) ~= buf then return end
+  pcall(vim.api.nvim_win_call, win, function()
+    local step  = WHEEL_STEP
+    local gap   = free_below(win, buf)
+    -- gap nil = last line is below the viewport (scrolled up in history): tons of
+    -- room, scroll the full notch. Otherwise cap the step to the rows left so we
+    -- land exactly on the limit and never overshoot (overshoot is what bounced).
+    if gap then
+      local room = ((state.pad_rows or 0) + SCROLL_TAIL) - gap
+      if room <= 0 then return end          -- already at the limit → swallow the notch
+      if room < step then step = room end
+    end
+    local so = vim.wo[win].scrolloff
+    vim.wo[win].scrolloff = 0
+    vim.cmd("keepjumps normal! " .. step .. "\005")  -- step × <C-e>
+    vim.wo[win].scrolloff = so
+  end)
+end
 
 -- ─── Panel window placement ───────────────────────────────────────────────────
 
@@ -2376,8 +2419,10 @@ local function open_panel_window(buf)
     end,
   })
 
-  -- Cap over-scroll so the conversation can't be flung off the top of the window
-  -- (catches mouse wheel + keys + jumps). See clamp_scroll for the math.
+  -- Cap over-scroll so the conversation can't be flung off the top of the window.
+  -- The mouse wheel is pre-empted below (prevents the over-scroll outright); this
+  -- WinScrolled clamp is the backstop for everything else — G, search jumps, page
+  -- keys — that the wheel map can't intercept. See clamp_scroll for the math.
   vim.api.nvim_create_autocmd("WinScrolled", {
     group = grp,
     callback = function()
@@ -2385,6 +2430,14 @@ local function open_panel_window(buf)
       clamp_scroll()
     end,
   })
+
+  -- Mouse-wheel-down pre-empt (see panel_wheel_down): scroll only the room left to
+  -- the limit so the continuous wheel stream can't out-run the after-the-fact clamp
+  -- and bounce. Buffer-local so it only governs the panel; wheel-up stays native.
+  if state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf) then
+    vim.keymap.set("n", "<ScrollWheelDown>", panel_wheel_down,
+      { buffer = state.panel_buf, silent = true })
+  end
 
   -- Hide the cursor while the panel is focused. guicursor is global so we save on
   -- WinEnter and restore on WinLeave. winhighlight cannot override Cursor/CursorNC —

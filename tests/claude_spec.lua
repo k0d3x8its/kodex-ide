@@ -387,12 +387,11 @@ H.check("T15 queued message sent after turn", last_sent_text() == "queued msg",
   tostring(last_sent_text()))
 H.check("T15 working re-armed for the drained turn", claude.state.working == true)
 
--- ── T16: can_use_tool permission round-trip (--permission-prompt-tool stdio) ──
--- The CLI asks permission via a control_request{subtype:"can_use_tool"} on
--- stdout; dispatch must reply with a control_response{behavior:"allow",...} on
--- stdin (chansend), echoing request.input as updatedInput and the SAME
--- request_id. Edits auto-allow (they stay vimdiff); non-edits auto-allow for now
--- (step-4 card UI pending) but still must complete the round-trip.
+-- ── T16: can_use_tool gate — cards for non-edits, auto-allow for edits ────────
+-- The CLI asks permission via control_request{subtype:"can_use_tool"} on stdout.
+-- Non-edit tools render an interactive card and WAIT (no control_response until
+-- the user chooses). Edit tools auto-allow immediately (they stay vimdiff). The
+-- user's choice (T17) sends the control_response on stdin.
 
 -- Decode the most recent chansend payload as a control_response (or nil).
 local function last_control_response()
@@ -404,8 +403,10 @@ local function last_control_response()
 end
 
 claude.state.job_id = 99
+claude.state.working = true   -- a turn is in flight when a tool asks permission
 
--- Non-edit tool: WebFetch needs permission.
+-- Non-edit tool with no rule suggestions → card with [Allow once] [Reject].
+local sends_b = #chansend_calls
 feed({
   type       = "control_request",
   request_id = "req-web-1",
@@ -415,21 +416,19 @@ feed({
     input     = { url = "https://example.com" },
   },
 })
-local r1 = last_control_response()
-H.check("T16 non-edit can_use_tool gets a control_response",
-  r1 ~= nil, tostring(r1 and "ok"))
-H.check("T16 response echoes the request_id",
-  r1 and r1.response and r1.response.request_id == "req-web-1",
-  vim.inspect(r1))
-H.check("T16 response allows the tool",
-  r1 and r1.response and r1.response.response
-    and r1.response.response.behavior == "allow", vim.inspect(r1))
-H.check("T16 response echoes input as updatedInput",
-  r1 and r1.response.response.updatedInput
-    and r1.response.response.updatedInput.url == "https://example.com",
-  vim.inspect(r1))
+H.check("T16 non-edit tool shows a card (no auto control_response)",
+  #chansend_calls == sends_b, "sends delta=" .. (#chansend_calls - sends_b))
+H.check("T16 card state armed (state.perm set)",
+  claude.state.perm ~= nil and claude.state.perm.request_id == "req-web-1",
+  vim.inspect(claude.state.perm))
+H.check("T16 no rules → 2 options (Allow once, Reject)",
+  claude.state.perm and #claude.state.perm.options == 2
+    and claude.state.perm.options[1].kind == "once"
+    and claude.state.perm.options[2].kind == "deny",
+  vim.inspect(claude.state.perm and claude.state.perm.options))
 
--- Edit tool: auto-allowed so the FileChangedShell+vimdiff flow owns it.
+-- Edit tool: auto-allowed so the FileChangedShell+vimdiff flow owns it. Must NOT
+-- disturb the pending card (cards are one-at-a-time; edits never queue one).
 feed({
   type       = "control_request",
   request_id = "req-edit-1",
@@ -443,5 +442,63 @@ local r2 = last_control_response()
 H.check("T16 edit tool auto-allowed (kept for vimdiff)",
   r2 and r2.response.request_id == "req-edit-1"
     and r2.response.response.behavior == "allow", vim.inspect(r2))
+
+-- ── T17: card resolution — Allow once / Allow always (persists) / Reject ──────
+
+-- Allow once → control_response allow, echoes request_id + input, NO persist.
+claude._resolve_permission("once")
+local r3 = last_control_response()
+H.check("T17 allow-once sends allow with echoed request_id + input",
+  r3 and r3.response.request_id == "req-web-1"
+    and r3.response.response.behavior == "allow"
+    and r3.response.response.updatedInput.url == "https://example.com",
+  vim.inspect(r3))
+H.check("T17 allow-once does NOT persist a rule (no updatedPermissions)",
+  r3 and r3.response.response.updatedPermissions == nil, vim.inspect(r3))
+H.check("T17 card cleared after resolve (state.perm nil)",
+  claude.state.perm == nil, vim.inspect(claude.state.perm))
+
+-- Tool WITH rule suggestions → card offers Allow always; choosing it persists.
+local suggestions = { {
+  type = "addRules", destination = "localSettings", behavior = "allow",
+  rules = { { toolName = "Bash", ruleContent = "ls:*" } },
+} }
+feed({
+  type       = "control_request",
+  request_id = "req-bash-1",
+  request    = {
+    subtype                = "can_use_tool",
+    tool_name              = "Bash",
+    input                  = { command = "ls" },
+    permission_suggestions = suggestions,
+  },
+})
+H.check("T17 rules present → 3 options incl. Allow always",
+  claude.state.perm and #claude.state.perm.options == 3
+    and claude.state.perm.options[2].kind == "always",
+  vim.inspect(claude.state.perm and claude.state.perm.options))
+claude._resolve_permission("always")
+local r4 = last_control_response()
+H.check("T17 allow-always persists the rule (updatedPermissions = suggestions)",
+  r4 and r4.response.response.behavior == "allow"
+    and type(r4.response.response.updatedPermissions) == "table"
+    and r4.response.response.updatedPermissions[1].rules[1].ruleContent == "ls:*",
+  vim.inspect(r4))
+
+-- Reject → control_response deny.
+feed({
+  type       = "control_request",
+  request_id = "req-bash-2",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "Bash",
+    input     = { command = "rm -rf /" },
+  },
+})
+claude._resolve_permission("deny")
+local r5 = last_control_response()
+H.check("T17 reject sends deny",
+  r5 and r5.response.request_id == "req-bash-2"
+    and r5.response.response.behavior == "deny", vim.inspect(r5))
 
 H.summary("claude")

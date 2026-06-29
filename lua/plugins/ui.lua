@@ -152,6 +152,18 @@ return {
               cond  = in_claude,
               color = meta_color,
             },
+            -- CAVEMAN badge between the cost and CODE — present only while the
+            -- caveman plugin is enabled, so the user can see at a glance that the
+            -- panel's replies are caveman-compressed. Same bg as the cost block
+            -- (meta_color), Claude clay #D97757 text, so it reads as part of the
+            -- cost section rather than a new tier.
+            {
+              function() return "CAVEMAN" end,
+              cond  = function()
+                return in_claude() and require("utils.claude").caveman_active()
+              end,
+              color = { bg = meta_color.bg, fg = "#D97757", gui = "bold" },
+            },
             {
               "progress",
               cond = function() return not in_claude() end,
@@ -211,6 +223,15 @@ return {
           -- mirroring the CLAUDE → model arrow on the left.
           lualine_y = {
             { function() return require("utils.claude").session_cost() end, cond = in_claude, color = meta_color },
+            -- Same CAVEMAN badge as the active layout, so the chat-bar-open state
+            -- shows it identically.
+            {
+              function() return "CAVEMAN" end,
+              cond  = function()
+                return in_claude() and require("utils.claude").caveman_active()
+              end,
+              color = { bg = meta_color.bg, fg = "#D97757", gui = "bold" },
+            },
           },
           lualine_z = {
             {

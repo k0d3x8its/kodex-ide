@@ -190,8 +190,11 @@ H.check("T4 stdout callback captured",          captured_stdout_cb ~= nil)
 local a4 = last_argv()
 H.check("T4 spawn uses stream-json input mode",
   argv_contains(a4, "--input-format") and argv_contains(a4, "stream-json"), table.concat(a4, " "))
-H.check("T4 spawn carries --print + acceptEdits",
-  argv_contains(a4, "--print") and argv_contains(a4, "acceptEdits"), table.concat(a4, " "))
+H.check("T4 spawn carries --print + permission-mode default",
+  argv_contains(a4, "--print") and argv_contains(a4, "default"), table.concat(a4, " "))
+H.check("T4 spawn carries --permission-prompt-tool stdio (permission gate)",
+  argv_contains(a4, "--permission-prompt-tool") and argv_contains(a4, "stdio"),
+  table.concat(a4, " "))
 H.check("T4 spawn has NO positional message / session flags",
   not argv_contains(a4, "hello claude")
   and not argv_contains(a4, "--session-id")
@@ -383,5 +386,62 @@ H.check("T15 queue drained on turn end", #claude.state.queue == 0,
 H.check("T15 queued message sent after turn", last_sent_text() == "queued msg",
   tostring(last_sent_text()))
 H.check("T15 working re-armed for the drained turn", claude.state.working == true)
+
+-- ── T16: can_use_tool permission round-trip (--permission-prompt-tool stdio) ──
+-- The CLI asks permission via a control_request{subtype:"can_use_tool"} on
+-- stdout; dispatch must reply with a control_response{behavior:"allow",...} on
+-- stdin (chansend), echoing request.input as updatedInput and the SAME
+-- request_id. Edits auto-allow (they stay vimdiff); non-edits auto-allow for now
+-- (step-4 card UI pending) but still must complete the round-trip.
+
+-- Decode the most recent chansend payload as a control_response (or nil).
+local function last_control_response()
+  local last = chansend_calls[#chansend_calls]
+  if not last then return nil end
+  local ok, ev = pcall(vim.json.decode, last.data)
+  if not ok or type(ev) ~= "table" or ev.type ~= "control_response" then return nil end
+  return ev
+end
+
+claude.state.job_id = 99
+
+-- Non-edit tool: WebFetch needs permission.
+feed({
+  type       = "control_request",
+  request_id = "req-web-1",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "WebFetch",
+    input     = { url = "https://example.com" },
+  },
+})
+local r1 = last_control_response()
+H.check("T16 non-edit can_use_tool gets a control_response",
+  r1 ~= nil, tostring(r1 and "ok"))
+H.check("T16 response echoes the request_id",
+  r1 and r1.response and r1.response.request_id == "req-web-1",
+  vim.inspect(r1))
+H.check("T16 response allows the tool",
+  r1 and r1.response and r1.response.response
+    and r1.response.response.behavior == "allow", vim.inspect(r1))
+H.check("T16 response echoes input as updatedInput",
+  r1 and r1.response.response.updatedInput
+    and r1.response.response.updatedInput.url == "https://example.com",
+  vim.inspect(r1))
+
+-- Edit tool: auto-allowed so the FileChangedShell+vimdiff flow owns it.
+feed({
+  type       = "control_request",
+  request_id = "req-edit-1",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "Edit",
+    input     = { file_path = "/tmp/x.lua" },
+  },
+})
+local r2 = last_control_response()
+H.check("T16 edit tool auto-allowed (kept for vimdiff)",
+  r2 and r2.response.request_id == "req-edit-1"
+    and r2.response.response.behavior == "allow", vim.inspect(r2))
 
 H.summary("claude")

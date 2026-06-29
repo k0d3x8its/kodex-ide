@@ -176,9 +176,24 @@ local function open_diff(path)
     vim.api.nvim_set_current_win(win)
   end
   vim.cmd("diffthis")
+  local orig_win = vim.api.nvim_get_current_win()
   vim.cmd("rightbelow vsplit")
   vim.api.nvim_win_set_buf(0, scratch)
   vim.cmd("diffthis")
+
+  -- Wrap long lines INSIDE each diff column (BUG: proposed/original content ran
+  -- off the right edge past the user's view). diffthis leaves the global `wrap`
+  -- value, which is off in this config — force it on per-window. `linebreak`
+  -- breaks at word boundaries; `breakindent` keeps wrapped rows visually nested
+  -- under their source line so the diff stays readable. Tradeoff: wrapped rows
+  -- can nudge left/right column alignment apart on very long lines — acceptable
+  -- vs. content the user can't see at all.
+  local scratch_win = vim.api.nvim_get_current_win()
+  for _, w in ipairs({ orig_win, scratch_win }) do
+    vim.wo[w].wrap        = true
+    vim.wo[w].linebreak   = true
+    vim.wo[w].breakindent = true
+  end
 
   -- MG 7.2: winbar on the scratch window so the user always knows what to do
   -- without reading a notify that may have scrolled away.
@@ -199,11 +214,10 @@ local function open_diff(path)
   -- a follow-up message while a file change is still unreviewed on disk.
   claude.on_diff_open()
 
-  vim.notify(
-    "Claude proposed changes — `do` accept hunk (from original window; :w after)"
-      .. "  |  <leader>ca accept all  |  <leader>cx reject all",
-    vim.log.levels.INFO
-  )
+  -- No vim.notify here (BUG line 96): the float renders top-of-screen and covers
+  -- the first hunk of the proposed change, exactly where the user needs to look.
+  -- The scratch winbar above already carries the same accept/reject hint and
+  -- stays pinned to the diff window, so the notify was redundant + obstructive.
   log("diff-open:" .. path)
 end
 

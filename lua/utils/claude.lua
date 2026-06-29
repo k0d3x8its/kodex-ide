@@ -124,9 +124,12 @@ mod.state = {
   -- spawn-time flag, so the running session can't switch mid-flight).
   model         = nil,
 
-  -- Permission mode passed to --permission-mode on (re)spawn. "acceptEdits" by
-  -- default; <leader>cp toggles it to "plan" (and back), respawning the process.
-  permission_mode = "acceptEdits",
+  -- Permission mode passed to --permission-mode on (re)spawn. "default" pairs
+  -- with the hidden --permission-prompt-tool stdio flag (build_args) so the CLI
+  -- routes tool-permission decisions to us via can_use_tool control_requests
+  -- instead of auto-applying (acceptEdits) or auto-denying. <leader>cp toggles
+  -- to "plan" (and back to "default"), respawning the process.
+  permission_mode = "default",
 
   -- Messages the user typed while a turn was in flight, FIFO. Shown as shaded
   -- virtual lines at the panel bottom; drained one-by-one as each turn ends
@@ -1510,6 +1513,39 @@ end
 -- (Mirrors ingest.py's line-by-line iteration over proc.stdout.)
 local stdout_buf = ""
 
+-- Reply to a can_use_tool control_request over stdin (the permission gate).
+-- `decision` is "allow" or "deny". The SDK contract requires us to echo the
+-- request's `input` back as `updatedInput` on allow (the CLI re-validates against
+-- it); on an "allow always" we additionally pass `updatedPermissions` (the
+-- request's permission_suggestions) so the rule persists to localSettings and the
+-- tool won't prompt again. Mirrors mod.interrupt's control_response wire shape.
+-- `o.input` is the decoded request.input table; an empty table must encode as a
+-- JSON object ({}), not an array ([]) — hence the empty_dict guard.
+-- Full wire shapes: .work/FINDINGS.md § Q-PERM. Reused by the step-4 card UI.
+local function send_permission_response(request_id, decision, o)
+  if not state.job_id then return end
+  o = o or {}
+  local response
+  if decision == "deny" then
+    response = { behavior = "deny", message = o.message or "User rejected" }
+  else
+    local input = o.input
+    if type(input) ~= "table" or next(input) == nil then input = vim.empty_dict() end
+    response = { behavior = "allow", updatedInput = input }
+    if o.permissions then response.updatedPermissions = o.permissions end
+  end
+  local msg = vim.json.encode({
+    type     = "control_response",
+    response = { subtype = "success", request_id = request_id, response = response },
+  })
+  pcall(vim.fn.chansend, state.job_id, msg .. "\n")
+end
+mod._send_permission_response = send_permission_response
+
+-- Tools whose permission we auto-allow: edits stay vimdiff (the existing
+-- FileChangedShell+vimdiff flow owns them), so gating them here would double-gate.
+local EDIT_TOOLS = { Edit = true, Write = true, MultiEdit = true, NotebookEdit = true }
+
 -- Dispatch one fully parsed stream-json event object.
 local function dispatch(event)
   local ev_type = event.type or ""
@@ -1589,6 +1625,28 @@ local function dispatch(event)
       clear_hint()
       -- Turn finished: send the next type-ahead message if one is queued.
       mod._maybe_send_next()
+    end
+
+  elseif ev_type == "control_request" and (event.request or {}).subtype == "can_use_tool" then
+    -- The CLI is asking permission for a tool that isn't allowlisted (enabled by
+    -- the --permission-prompt-tool stdio flag). tool_name/input/permission_
+    -- suggestions live under `request`; the request_id we must echo is top-level.
+    local req  = event.request or {}
+    local tool = req.tool_name or ""
+    if EDIT_TOOLS[tool] then
+      -- Edits stay vimdiff — auto-allow so the FileChangedShell+vimdiff flow owns
+      -- them. (Without this they'd double-gate: card here AND vimdiff after.)
+      send_permission_response(event.request_id, "allow", { input = req.input })
+    else
+      -- STEP 4 (inline permission card UI) replaces this branch. For now we
+      -- auto-allow non-edit tools and surface which one fired, to live-prove the
+      -- can_use_tool round-trip (inbound parse + outbound control_response) end
+      -- to end before building the interactive card.
+      vim.notify(
+        "Claude permission auto-allowed (card UI pending): " .. (req.display_name or tool),
+        vim.log.levels.INFO
+      )
+      send_permission_response(event.request_id, "allow", { input = req.input })
     end
   end
 end
@@ -1783,7 +1841,16 @@ local function build_args()
     "--input-format",    "stream-json",
     "--output-format",   "stream-json",
     "--verbose",
-    "--permission-mode", state.permission_mode or "acceptEdits",
+    "--permission-mode", state.permission_mode or "default",
+    -- Hidden flag (not in --help, but accepted): the literal string "stdio". The
+    -- SDK sets this internally when a canUseTool callback is registered. It makes
+    -- the CLI emit can_use_tool control_requests over stdout for any tool not
+    -- already allowlisted, which we answer over stdin (dispatch + can_use_tool
+    -- branch). Without it the CLI silently auto-denies un-allowlisted tools.
+    -- Must persist across model/plan respawns (plan-mode only varies
+    -- --permission-mode, never drops this flag) — full protocol in
+    -- .work/FINDINGS.md § Q-PERM.
+    "--permission-prompt-tool", "stdio",
   }
   -- --model accepts an alias (opus/sonnet/haiku) or a full id. nil = CLI default.
   if state.model and state.model ~= "" then
@@ -2530,7 +2597,7 @@ end
 -- Plan mode is the --permission-mode plan flag (read-only planning; no edits).
 -- Like the model, it's spawn-time, so toggling respawns; context resets.
 function mod.toggle_plan()
-  state.permission_mode = (state.permission_mode == "plan") and "acceptEdits" or "plan"
+  state.permission_mode = (state.permission_mode == "plan") and "default" or "plan"
   local on = state.permission_mode == "plan"
   local had_session = state.job_id ~= nil
   stop_process()

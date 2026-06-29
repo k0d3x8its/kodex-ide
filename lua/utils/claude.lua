@@ -172,6 +172,19 @@ mod.state = {
   -- message vanishes when the bar loses focus. Saved on a non-submit close,
   -- restored on the next open, and cleared only when the message is actually sent.
   chat_draft    = "",
+
+  -- Live handle + closer for the open "Reply to Claude" chat bar, or nil when no
+  -- bar is open. Tracked so the permission card can dismiss the bar before it
+  -- opens: both floats anchor SW at the same panel column, so a coexisting bar
+  -- overlaps the card and fights it for focus/draw order (the bug where the card
+  -- never became interactable and auto-rejected). chat_close is the bar's own
+  -- close() (saves the draft); set on open, cleared on close.
+  chat_win      = nil,
+  chat_buf      = nil,
+  chat_close    = nil,
+  -- True while a permission card is up that dismissed an open chat bar, so
+  -- resolve_permission knows to reopen the bar (draft restored) afterwards.
+  perm_reopen_bar = false,
 }
 local state = mod.state
 
@@ -1643,8 +1656,31 @@ local function resolve_permission(kind)
   end
 
   if state.working then start_spinner() else clear_hint() end
+
+  -- Reopen the chat bar we dismissed to show the card, so the user lands back in
+  -- the input (draft restored) and can keep the conversation going. Scheduled so
+  -- the card's window is fully torn down first. state.perm is already nil here, so
+  -- prompt_input() won't bail on the permission guard.
+  if state.perm_reopen_bar then
+    state.perm_reopen_bar = false
+    vim.schedule(function() mod.prompt_input() end)
+  end
 end
 mod._resolve_permission = resolve_permission
+
+-- Find path-like tokens in a PLAIN card line (the desc / Patterns rows are not
+-- markdown, so parse_inline never touches them). Any run containing a "/" is a
+-- path: trailing-slash → directory (ClaudeDir blue + folder feel), else a file
+-- path (ClaudePath green) — matching how the transcript colours paths everywhere
+-- else. Returns { {byte0, byte_end, group}, … }.
+local function perm_path_ranges(line)
+  local out = {}
+  for s, tok in line:gmatch("()([~%w%._%-/]*/[~%w%._%-/]*)") do
+    local b0 = s - 1
+    out[#out + 1] = { b0, b0 + #tok, (tok:sub(-1) == "/") and "ClaudeDir" or "ClaudePath" }
+  end
+  return out
+end
 
 -- Build + open the focused, bordered permission float and bind its keymaps. The
 -- buffer is dedicated and wiped on close, so the keymaps need no teardown.
@@ -1677,6 +1713,17 @@ local function open_permission_float(p)
   local float_w   = math.max(panel_w - 2, 1)
   local float_col = vim.o.columns - panel_w
 
+  -- Height must count WRAPPED display rows, not logical lines: with wrap on, a long
+  -- description (e.g. a Skill blurb) spans several screen rows, so a height of
+  -- #lines leaves the window too short and scrolls the button row off the bottom
+  -- (the "I can't see what I'm choosing" bug). Sum ceil(width/float_w) per line, and
+  -- cap so the card never grows taller than the editor minus a couple of rows.
+  local disp_rows = 0
+  for _, l in ipairs(lines) do
+    disp_rows = disp_rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / float_w))
+  end
+  local float_h = math.min(disp_rows, math.max(vim.o.lines - 4, 1))
+
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].swapfile  = false
@@ -1689,7 +1736,7 @@ local function open_permission_float(p)
     row       = vim.o.lines - 2,
     col       = float_col,
     width     = float_w,
-    height    = #lines,
+    height    = float_h,
     border    = "rounded",
     style     = "minimal",
     title     = " ⚠ Permission required ",
@@ -1701,11 +1748,19 @@ local function open_permission_float(p)
   -- ClaudeBarBg so the box reads flush, only the outline pops.
   vim.wo[win].winhighlight =
     "FloatBorder:ClaudePermBorder,FloatTitle:ClaudePermBorder,NormalFloat:ClaudeBarBg"
-  vim.wo[win].wrap       = true
-  vim.wo[win].cursorline = false
+  vim.wo[win].wrap        = true
+  vim.wo[win].linebreak   = true   -- wrap at word boundaries, not mid-word
+  vim.wo[win].breakindent = true   -- align wrapped continuation under the line's indent
+  vim.wo[win].cursorline  = false
 
   for _, h in ipairs(body_hl) do
+    -- Base group over the whole line, then layer path/dir colours on top so the
+    -- directories + file paths in the desc/Patterns rows pop (later add_highlight
+    -- wins on the overlapping cells).
     vim.api.nvim_buf_add_highlight(buf, -1, h[2], h[1], 0, -1)
+    for _, r in ipairs(perm_path_ranges(lines[h[1] + 1] or "")) do
+      vim.api.nvim_buf_add_highlight(buf, -1, r[3], h[1], r[1], r[2])
+    end
   end
   vim.bo[buf].modifiable = false
 
@@ -1770,6 +1825,17 @@ local function show_permission_card(event)
 
   stop_spinner()
   clear_hint()   -- drop any stale "Working…" hint so nothing peeks behind the float
+
+  -- Dismiss any open chat bar BEFORE opening the card. The bar anchors SW at the
+  -- same panel column as the card, so leaving it open overlaps the card and steals
+  -- focus/draw order — the card then can't be driven and falls through to a reject.
+  -- Closing via the bar's own close() saves the draft; we reopen it on resolve.
+  state.perm_reopen_bar = false
+  if state.chat_win and vim.api.nvim_win_is_valid(state.chat_win) then
+    state.perm_reopen_bar = true
+    if state.chat_close then pcall(state.chat_close) end
+  end
+
   state.perm = p
   open_permission_float(p)
   render_perm_choice_row()
@@ -2241,7 +2307,11 @@ local function open_chat_float(title, callback, opts)
   -- Same filetype as the panel buffer so the modal statusline keys off it.
   vim.bo[ibuf].filetype  = "claude"
 
-  local label    = title .. (state.permission_mode == "plan" and " - Plan Mode" or "")
+  -- Surface the active permission mode in the bar's title: "Plan Mode" when
+  -- planning (read-only gate), "Build Mode" for the default (edits apply). Mirrors
+  -- the border color (ClaudeBarBorderPlan vs ClaudeBarBorder) below.
+  local mode_label = (state.permission_mode == "plan") and " - Plan Mode" or " - Build Mode"
+  local label      = title .. mode_label
   local meter_ns = vim.api.nvim_create_namespace("claude_bar_meters")
 
   -- Render the meters as a virtual line attached below the LAST input line.
@@ -2381,7 +2451,15 @@ local function open_chat_float(title, callback, opts)
     if vim.api.nvim_win_is_valid(win) then
       vim.api.nvim_win_close(win, true)
     end
+    -- Drop the live-bar handles so the permission card won't try to close a dead
+    -- window. Guard against a stale closure clobbering a newer bar's handle.
+    if state.chat_win == win then
+      state.chat_win, state.chat_buf, state.chat_close = nil, nil, nil
+    end
   end
+  -- Publish the live handles so show_permission_card can dismiss this bar before
+  -- opening the card (see state.chat_win docs).
+  state.chat_win, state.chat_buf, state.chat_close = win, ibuf, close
 
   vim.fn.prompt_setcallback(ibuf, function(text)
     submitted = true

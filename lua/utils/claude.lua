@@ -185,6 +185,22 @@ mod.state = {
   -- True while a permission card is up that dismissed an open chat bar, so
   -- resolve_permission knows to reopen the bar (draft restored) afterwards.
   perm_reopen_bar = false,
+
+  -- Active AskUserQuestion card, or nil. Set while a can_use_tool request for the
+  -- AskUserQuestion tool is awaiting the user's choices. Rides the SAME gate as
+  -- permissions but is a VERTICAL selector that STEPS through the N questions
+  -- (.work/FINDINGS.md § Q-ASK). Holds request_id, the echo-back input, the
+  -- questions list, the current question index (qi), the highlighted option
+  -- (choice), per-question multiSelect toggles (sel), and the accumulated answers
+  -- map (question text → label, or array of labels for multiSelect).
+  qask          = nil,
+
+  -- Extmark namespace for the question card's option-row highlights.
+  qask_ns       = nil,
+
+  -- True while a question card is up that dismissed an open chat bar, so the card
+  -- knows to reopen it (draft restored) after the questions are answered/cancelled.
+  qask_reopen_bar = false,
 }
 local state = mod.state
 
@@ -1841,6 +1857,410 @@ local function show_permission_card(event)
   render_perm_choice_row()
 end
 
+-- ─── Question card (AskUserQuestion) ──────────────────────────────────────────
+-- Claude's AskUserQuestion tool arrives on the SAME can_use_tool gate as a
+-- permission (no new flag — see .work/FINDINGS.md § Q-ASK), but is NOT an
+-- allow/reject decision: it carries up to 4 questions, each with its own option
+-- list, and the answer rides back in updatedInput.answers (a map keyed by each
+-- question's TEXT, value = chosen label, or an array of labels for multiSelect).
+--
+-- The card is a VERTICAL selector over the N questions in one float. Unlike a
+-- step-through wizard it lets you move FREELY between questions (Tab/⇥ + ←/→) WITHOUT
+-- answering first — each question keeps its own highlight + recorded pick, and the
+-- card only submits (one control_response with the full answers map) once EVERY
+-- question has a pick. Per question the option list is the model's options PLUS two
+-- synthetic affordances mirroring the Claude Code TUI: "Type something" (free-text
+-- answer) and "Chat about this" (bail → dismiss → reopen the chat bar). Keys:
+--   ↑/↓ j/k  move highlight within the question
+--   ⇥ / →    next question · ⇤ / ← prev question (no answer required)
+--   <Space>  toggle a multiSelect option
+--   <CR>     select the highlighted option (records pick; advances to the next
+--            UNanswered question, or submits when all are answered). On the
+--            "Type something" row it opens an input; on "Chat about this" it cancels.
+--   <Esc>/q  cancel (allow with NO answers → the CLI emits "Question dismissed").
+-- Reuses the permission card's geometry + chat-bar dismiss/reopen plumbing.
+
+local Q_CUSTOM = "Type something"
+local Q_CHAT   = "Chat about this"
+
+-- The display option list for a question: model options first, then the two
+-- synthetic affordances. Each entry: { kind = "model"|"custom"|"chat",
+-- index (model options only), label, desc }.
+local function question_display_options(question)
+  local d = {}
+  for i, opt in ipairs(question.options or {}) do
+    d[#d + 1] = { kind = "model", index = i, label = opt.label or "", desc = opt.description or "" }
+  end
+  d[#d + 1] = { kind = "custom", label = Q_CUSTOM, desc = "Write a custom answer" }
+  d[#d + 1] = { kind = "chat",   label = Q_CHAT,   desc = "Skip these and discuss in chat" }
+  return d
+end
+
+-- Highlighted display-option index for the current question (persisted per
+-- question so navigating away + back keeps the cursor where you left it).
+local function q_choice(q) return q.choice[q.qi] or 1 end
+
+-- Rebuild the card buffer for the current question (q.qi) in place: question text,
+-- the vertical option list (❯ marks the highlighted option; single-select shows a
+-- ● on the recorded pick, multiSelect a [x]/[ ] checkbox; the recorded custom text
+-- shows inline), a dimmed description under each option, and a nav hint. Recomputes
+-- the float height (wrapped rows) and repaints highlights. Called on every state
+-- change (move/toggle/nav/pick).
+local function render_question_card()
+  local q = state.qask
+  if not (q and q.buf and vim.api.nvim_buf_is_valid(q.buf)
+          and q.win and vim.api.nvim_win_is_valid(q.win)) then return end
+  local question = q.questions[q.qi] or {}
+  local dopts    = question_display_options(question)
+  local ci       = q_choice(q)
+  local sel      = q.sel[q.qi] or {}
+  local pick     = q.picks[q.qi]
+  state.qask_ns  = state.qask_ns or vim.api.nvim_create_namespace("ClaudeQaskRow")
+
+  local lines, hl = {}, {}
+  lines[#lines + 1] = "  " .. (question.question or "")
+  hl[#hl + 1] = { #lines - 1, "ClaudeProse" }
+  lines[#lines + 1] = ""                                   -- spacer
+
+  for i, d in ipairs(dopts) do
+    local marker = (i == ci) and "❯ " or "  "
+    local mark   = "  "
+    if d.kind == "model" and question.multiSelect then
+      mark = sel[d.index] and "[x] " or "[ ] "
+    elseif d.kind == "model" then
+      mark = (pick and pick.kind == "option" and pick.index == d.index) and "● " or "  "
+    end
+    local label = d.label
+    if d.kind == "custom" and pick and pick.kind == "custom" then
+      label = label .. ": " .. pick.text
+    end
+    lines[#lines + 1] = "  " .. marker .. mark .. label
+    local grp = (i == ci) and "ClaudeQuestion"
+      or ((d.kind == "model") and "ClaudeProse" or "ClaudeDim")
+    hl[#hl + 1] = { #lines - 1, grp }
+    if d.desc ~= "" then
+      lines[#lines + 1] = "        " .. d.desc
+      hl[#hl + 1] = { #lines - 1, "ClaudeDim" }
+    end
+  end
+
+  lines[#lines + 1] = ""                                   -- spacer
+  local nav = (#q.questions > 1) and " · ⇥ question" or ""
+  lines[#lines + 1] = question.multiSelect
+    and ("  ↑/↓ move · space toggle" .. nav .. " · ⏎ select · esc cancel")
+    or  ("  ↑/↓ move" .. nav .. " · ⏎ select · esc cancel")
+  hl[#hl + 1] = { #lines - 1, "ClaudeDim" }
+
+  -- Geometry: full panel-column width, bottom-left of the column (same math as the
+  -- permission/chat floats). Width is fixed at open; height tracks wrapped rows so
+  -- a question that grows/shrinks the option list never clips the hint.
+  local panel_w = panel_width()
+  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+    panel_w = vim.api.nvim_win_get_width(state.panel_win)
+  end
+  local float_w = math.max(panel_w - 2, 1)
+  local disp_rows = 0
+  for _, l in ipairs(lines) do
+    disp_rows = disp_rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / float_w))
+  end
+  local float_h = math.min(disp_rows, math.max(vim.o.lines - 4, 1))
+
+  vim.bo[q.buf].modifiable = true
+  vim.api.nvim_buf_set_lines(q.buf, 0, -1, false, lines)
+  vim.bo[q.buf].modifiable = false
+
+  -- SW anchor keeps the bottom edge pinned; only the top moves as height changes.
+  pcall(vim.api.nvim_win_set_height, q.win, float_h)
+  local title = (#q.questions > 1)
+    and (" ❓ Question " .. q.qi .. " of " .. #q.questions .. " ")
+    or  " ❓ Question "
+  pcall(vim.api.nvim_win_set_config, q.win, { title = title, title_pos = "left" })
+
+  vim.api.nvim_buf_clear_namespace(q.buf, state.qask_ns, 0, -1)
+  for _, h in ipairs(hl) do
+    vim.api.nvim_buf_add_highlight(q.buf, state.qask_ns, h[2], h[1], 0, -1)
+  end
+end
+
+-- Move the highlighted display option for the current question (wraps).
+local function move_question_choice(delta)
+  local q = state.qask
+  if not q then return end
+  local n = #question_display_options(q.questions[q.qi])
+  if n == 0 then return end
+  q.choice[q.qi] = (q_choice(q) - 1 + delta) % n + 1
+  render_question_card()
+end
+mod._move_question_choice = move_question_choice
+
+-- Jump to the next/prev question WITHOUT requiring an answer (clamped at the ends).
+local function goto_question(delta)
+  local q = state.qask
+  if not q then return end
+  local n = #q.questions
+  q.qi = math.min(math.max(q.qi + delta, 1), n)
+  render_question_card()
+end
+local function next_question() goto_question(1) end
+local function prev_question() goto_question(-1) end
+mod._next_question = next_question
+mod._prev_question = prev_question
+
+-- Toggle the highlighted MODEL option in a multiSelect question's selection set.
+-- (No-op on the synthetic Type/Chat rows, or on single-select questions.)
+local function toggle_question_choice()
+  local q = state.qask
+  if not (q and q.questions[q.qi].multiSelect) then return end
+  local d = question_display_options(q.questions[q.qi])[q_choice(q)]
+  if not (d and d.kind == "model") then return end
+  q.sel[q.qi] = q.sel[q.qi] or {}
+  q.sel[q.qi][d.index] = not q.sel[q.qi][d.index] or nil
+  render_question_card()
+end
+mod._toggle_question_choice = toggle_question_choice
+
+-- Tear the card down (the answer/cancel response is sent by the caller first),
+-- drop a one-line transcript receipt, resume the spinner if the turn is still in
+-- flight, and reopen any chat bar we dismissed to show the card.
+local function close_question_card(receipt, receipt_hl)
+  local q = state.qask
+  if not q then return end
+  state.qask = nil                                   -- before close → WinClosed no-ops
+  if q.win and vim.api.nvim_win_is_valid(q.win) then
+    pcall(vim.api.nvim_win_close, q.win, true)
+  end
+  if receipt and state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf) then
+    local recl = vim.api.nvim_buf_line_count(state.panel_buf)
+    buf_append({ receipt })
+    hl_lines(recl, recl, receipt_hl or "ClaudeQuestion")
+  end
+  if state.working then start_spinner() else clear_hint() end
+  if state.qask_reopen_bar then
+    state.qask_reopen_bar = false
+    vim.schedule(function() mod.prompt_input() end)
+  end
+end
+
+-- A question counts as answered once it has a recorded pick (single-select option
+-- or custom text), or — for multiSelect — once the user has confirmed it with <CR>
+-- (picks[i] = { kind = "multi" }; the actual labels live in sel[i]).
+local function question_answered(q, i)
+  return q.picks[i] ~= nil
+end
+
+-- Build the answers map from every question's recorded pick and submit ONE
+-- control_response: allow with updatedInput.answers (the § Q-ASK wire shape; reuses
+-- send_permission_response's allow path, which sends updatedInput verbatim).
+local function submit_question_answers()
+  local q = state.qask
+  if not q then return end
+  local answers = {}
+  for i, question in ipairs(q.questions) do
+    local key = question.question
+    if question.multiSelect then
+      local labels, sel = {}, q.sel[i] or {}
+      for oi, opt in ipairs(question.options or {}) do
+        if sel[oi] then labels[#labels + 1] = opt.label end
+      end
+      answers[key] = labels
+    else
+      local p = q.picks[i]
+      if p and p.kind == "custom" then
+        answers[key] = p.text
+      elseif p and p.kind == "option" then
+        answers[key] = p.label
+      end
+    end
+  end
+  local merged = vim.deepcopy(q.input or {})
+  merged.answers = answers
+  send_permission_response(q.request_id, "allow", { input = merged })
+  local n = #q.questions
+  close_question_card(
+    "✓ Answered " .. n .. (n == 1 and " question" or " questions"), "ClaudeQuestion")
+end
+
+-- After recording a pick: submit if EVERY question is now answered, else advance to
+-- the next still-unanswered question (wrapping from the current one) so the user is
+-- always moved toward completion.
+local function advance_or_submit()
+  local q = state.qask
+  if not q then return end
+  local n = #q.questions
+  for i = 1, n do
+    if not question_answered(q, i) then
+      -- Walk forward from the current question to the next unanswered one.
+      for step = 1, n do
+        local cand = (q.qi - 1 + step) % n + 1
+        if not question_answered(q, cand) then
+          q.qi = cand
+          render_question_card()
+          return
+        end
+      end
+    end
+  end
+  submit_question_answers()
+end
+
+-- Cancel the whole card: allow WITH NO answers (the clean dismiss — the CLI emits
+-- a "Question dismissed, no answer" tool_result and the model continues/re-asks).
+local function cancel_question()
+  local q = state.qask
+  if not q then return end
+  send_permission_response(q.request_id, "allow", { input = q.input })
+  close_question_card("✗ Questions dismissed", "ClaudeDim")
+end
+mod._cancel_question = cancel_question
+
+-- Record a free-text custom answer for the current question, then advance/submit.
+-- nil text = the input was cancelled → leave the card untouched.
+local function set_question_custom(text)
+  local q = state.qask
+  if not q or text == nil then return end
+  q.picks[q.qi] = { kind = "custom", text = text }
+  advance_or_submit()
+end
+mod._set_question_custom = set_question_custom
+
+-- Open a small input for the "Type something" affordance. Empty/cancelled input
+-- just repaints the card (no pick recorded). Uses vim.ui.input so the panel's own
+-- chat-float infra isn't entangled with the card lifecycle.
+local function prompt_question_custom()
+  if not state.qask then return end
+  vim.ui.input({ prompt = "Custom answer: " }, function(text)
+    if not state.qask then return end                -- card gone while typing
+    if text == nil or text == "" then render_question_card() return end
+    set_question_custom(text)
+  end)
+end
+
+-- Act on the highlighted option: "Chat about this" cancels, "Type something" opens
+-- the input, a model option records the pick (single-select) or confirms the
+-- multiSelect set, then advances toward completion / submits.
+local function select_question_choice()
+  local q = state.qask
+  if not q then return end
+  local question = q.questions[q.qi]
+  local d = question_display_options(question)[q_choice(q)]
+  if not d then return end
+  if d.kind == "chat" then
+    cancel_question()
+    return
+  elseif d.kind == "custom" then
+    prompt_question_custom()
+    return
+  end
+  -- model option
+  if question.multiSelect then
+    q.picks[q.qi] = { kind = "multi" }               -- confirmed; labels live in sel
+  else
+    q.picks[q.qi] = { kind = "option", index = d.index, label = d.label }
+  end
+  advance_or_submit()
+end
+mod._select_question_choice = select_question_choice
+
+-- Build + open the focused, bordered question float (clay border, like the chat
+-- bar, since this is a normal interaction, not a warning) and bind its keymaps.
+-- render_question_card fills the body + sizes the height for the first question.
+local function open_question_float(q)
+  local panel_w = panel_width()
+  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+    panel_w = vim.api.nvim_win_get_width(state.panel_win)
+  end
+  local float_w   = math.max(panel_w - 2, 1)
+  local float_col = vim.o.columns - panel_w
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile  = false
+  q.buf = buf
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative  = "editor",
+    anchor    = "SW",
+    row       = vim.o.lines - 2,
+    col       = float_col,
+    width     = float_w,
+    height    = 1,                                   -- render_question_card resizes
+    border    = "rounded",
+    style     = "minimal",
+    title     = " ❓ Question ",
+    title_pos = "left",
+    zindex    = 60,
+  })
+  q.win = win
+  vim.wo[win].winhighlight =
+    "FloatBorder:ClaudeBarBorder,FloatTitle:ClaudeBarBorder,NormalFloat:ClaudeBarBg"
+  vim.wo[win].wrap        = true
+  vim.wo[win].linebreak   = true
+  vim.wo[win].breakindent = true
+  vim.wo[win].cursorline  = false
+
+  local function map(k, fn)
+    vim.keymap.set("n", k, fn, { buffer = buf, nowait = true, silent = true })
+  end
+  map("<Up>",      function() move_question_choice(-1) end)
+  map("k",         function() move_question_choice(-1) end)
+  map("<Down>",    function() move_question_choice(1) end)
+  map("j",         function() move_question_choice(1) end)
+  map("<Tab>",     next_question)
+  map("<Right>",   next_question)
+  map("<S-Tab>",   prev_question)
+  map("<Left>",    prev_question)
+  map("<Space>",   toggle_question_choice)
+  map("<CR>",      select_question_choice)
+  map("<Esc>",     cancel_question)
+  map("q",         cancel_question)
+
+  -- Float vanished by some path OTHER than our teardown (which nils state.qask
+  -- first) → cancel so the CLI isn't left blocked on the turn.
+  vim.api.nvim_create_autocmd("WinClosed", {
+    pattern = tostring(win),
+    once    = true,
+    callback = function()
+      if state.qask and state.qask.win == win then cancel_question() end
+    end,
+  })
+end
+
+-- Arm a question card from an inbound AskUserQuestion can_use_tool control_request.
+-- Pauses the spinner (Claude is blocked on us) and dismisses any open chat bar
+-- (same SW-column collision as the permission card), reopened on close.
+local function show_question_card(event)
+  local req = event.request or {}
+  local input = req.input or {}
+  local q = {
+    request_id = event.request_id,
+    input      = input,
+    questions  = input.questions or {},
+    qi         = 1,
+    choice     = {},     -- choice[i] = highlighted display-option index per question
+    sel        = {},     -- sel[i]    = { [modelOptIndex] = true } per multiSelect question
+    picks      = {},     -- picks[i]  = recorded answer per question (see question_answered)
+  }
+  if #q.questions == 0 then
+    -- Nothing to ask — allow with no answers so the turn isn't left blocked.
+    send_permission_response(event.request_id, "allow", { input = input })
+    return
+  end
+
+  stop_spinner()
+  clear_hint()
+
+  state.qask_reopen_bar = false
+  if state.chat_win and vim.api.nvim_win_is_valid(state.chat_win) then
+    state.qask_reopen_bar = true
+    if state.chat_close then pcall(state.chat_close) end
+  end
+
+  state.qask = q
+  open_question_float(q)
+  render_question_card()
+end
+mod._show_question_card = show_question_card
+
 -- Dispatch one fully parsed stream-json event object.
 local function dispatch(event)
   local ev_type = event.type or ""
@@ -1932,6 +2352,12 @@ local function dispatch(event)
       -- Edits stay vimdiff — auto-allow so the FileChangedShell+vimdiff flow owns
       -- them. (Without this they'd double-gate: card here AND vimdiff after.)
       send_permission_response(event.request_id, "allow", { input = req.input })
+    elseif tool == "AskUserQuestion" then
+      -- Structured multiple-choice questions ride the same gate but are NOT an
+      -- allow/reject decision — render the vertical question selector instead of
+      -- the permission card (.work/FINDINGS.md § Q-ASK). MUST come before the
+      -- generic non-edit branch, which would mis-route it to show_permission_card.
+      show_question_card(event)
     else
       -- Non-edit tool: render the interactive permission card and wait for the
       -- user's Allow once / Allow always / Reject choice (resolve_permission
@@ -2968,6 +3394,38 @@ end
 --- spawned in this Neovim, not the shared burn-state file's last writer.
 function mod.session_cost()
   return string.format("$%.2f", state.session_cost or 0)
+end
+
+-- Whitelist of caveman intensity/independent modes that count as "enabled". Mirrors
+-- the case statement in the caveman plugin's caveman-statusline.sh so we render a
+-- badge for exactly the same set the plugin considers active. "off" is absent: the
+-- activate hook DELETES the flag file in off mode, so absence already means off.
+local CAVEMAN_MODES = {
+  lite = true, full = true, ultra = true,
+  ["wenyan-lite"] = true, wenyan = true,
+  ["wenyan-full"] = true, ["wenyan-ultra"] = true,
+  commit = true, review = true, compress = true,
+}
+
+--- True when the user's caveman plugin is currently enabled, for the statusline
+--- "CAVEMAN" badge. Reads the plugin's flag file (~/.claude/.caveman-active, or
+--- $CLAUDE_CONFIG_DIR/.caveman-active) the same hardened way the plugin's own
+--- statusline does: a missing file means off (the activate hook unlinks it then),
+--- symlinks are refused (a local attacker could point it at a secret), and the
+--- content is capped + validated against the mode whitelist before we trust it.
+function mod.caveman_active()
+  local dir  = vim.env.CLAUDE_CONFIG_DIR
+  if not dir or dir == "" then dir = vim.fn.expand("~/.claude") end
+  local flag = dir .. "/.caveman-active"
+  -- lstat (NOT stat) so a symlink is seen as a symlink, not followed; reject it.
+  local st = vim.loop.fs_lstat(flag)
+  if not st or st.type ~= "file" then return false end
+  local fd = vim.loop.fs_open(flag, "r", 438)
+  if not fd then return false end
+  local data = vim.loop.fs_read(fd, 64, 0) or ""
+  vim.loop.fs_close(fd)
+  local mode = data:gsub("[\r\n]", ""):lower():match("^%s*(.-)%s*$")
+  return CAVEMAN_MODES[mode] == true
 end
 
 --- Toggle Plan mode for the panel session (`<leader>cp`).

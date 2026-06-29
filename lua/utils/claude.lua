@@ -112,6 +112,16 @@ mod.state = {
   -- we must not send a follow-up message while the previous edit is unreviewed.
   diff_pending  = false,
 
+  -- Active permission card, or nil. Set while a non-edit can_use_tool request is
+  -- awaiting the user's Allow once / Allow always / Reject choice; blocks input
+  -- and owns the hint until resolved. Holds request_id, tool, input, suggestions,
+  -- the rendered choice-row index, the option list, and the current selection.
+  perm          = nil,
+
+  -- Extmark namespace for the permission card's choice-row highlights, so a
+  -- left/right re-select can clear + repaint just that row without leaking marks.
+  perm_ns       = nil,
+
   -- Extmark namespace for the virtual-text "Reply to Claude…" hint at bottom of
   -- panel. Cleared and re-set on every state transition.
   hint_ns       = nil,
@@ -1216,6 +1226,7 @@ local function start_spinner()
   render_queue()
   state.spin_timer = vim.fn.timer_start(110, function()
     if not state.working then stop_spinner(); return end
+    if state.perm then return end   -- a permission card owns the hint; don't clobber
     spin_i = spin_i % #SPINNER + 1
     set_hint(SPINNER[spin_i] .. " Working…  <Esc> to interrupt", "ClaudeInput")
     -- Re-anchor the queue to the (now lower) last line as output streams in.
@@ -1552,6 +1563,218 @@ mod._send_permission_response = send_permission_response
 -- FileChangedShell+vimdiff flow owns them), so gating them here would double-gate.
 local EDIT_TOOLS = { Edit = true, Write = true, MultiEdit = true, NotebookEdit = true }
 
+-- ─── Permission card (step 4) ─────────────────────────────────────────────────
+-- Interactive bordered FLOAT for a non-edit can_use_tool request (Bash, WebFetch,
+-- out-of-cwd file access, …) the CLI can't auto-resolve. Opens a rounded box in
+-- the panel column titled "⚠ Permission required" (inline on the top border, like
+-- the chat bar) but styled distinctly (ClaudePermBorder amber), FOCUSED so the
+-- keyboard drives it immediately: ←/→ or h/l move, <CR>/number confirm, <Esc>/q
+-- reject. On resolve it replies (send_permission_response), closes the float, and
+-- drops a one-line receipt into the transcript so the scrollback records the
+-- decision. One card at a time (the CLI blocks the turn awaiting our
+-- control_response). Edits never reach here (auto-allowed → vimdiff). Mirrors
+-- OpenCode's card; full protocol in .work/FINDINGS.md § Q-PERM.
+
+-- Repaint the float's button row (p.row, 0-indexed last content line) in place:
+-- the active option pops (ClaudeQuestion), the rest dim (ClaudeDim). Called on
+-- open and on every left/right move.
+local function render_perm_choice_row()
+  local p = state.perm
+  if not (p and p.buf and vim.api.nvim_buf_is_valid(p.buf)) then return end
+  state.perm_ns = state.perm_ns or vim.api.nvim_create_namespace("ClaudePermRow")
+  local segs, line = {}, "  "
+  for i, opt in ipairs(p.options) do
+    if i > 1 then line = line .. "    " end
+    local label = ((i == p.choice) and "❯ " or "  ") .. opt.label
+    local b0 = #line
+    line = line .. label
+    segs[#segs + 1] = { b0 = b0, b1 = #line, active = (i == p.choice) }
+  end
+  vim.bo[p.buf].modifiable = true
+  vim.api.nvim_buf_set_lines(p.buf, p.row, p.row + 1, false, { line })
+  vim.bo[p.buf].modifiable = false
+  vim.api.nvim_buf_clear_namespace(p.buf, state.perm_ns, p.row, p.row + 1)
+  for _, s in ipairs(segs) do
+    vim.api.nvim_buf_add_highlight(p.buf, state.perm_ns,
+      s.active and "ClaudeQuestion" or "ClaudeDim", p.row, s.b0, s.b1)
+  end
+end
+
+-- Move the selection left/right (wraps).
+local function move_perm_choice(delta)
+  local p = state.perm
+  if not p then return end
+  p.choice = (p.choice - 1 + delta) % #p.options + 1
+  render_perm_choice_row()
+end
+mod._move_perm_choice = move_perm_choice
+
+-- Send the chosen decision, close the float, append a transcript receipt, and
+-- resume the spinner if the turn is still in flight (an allow lets Claude
+-- continue; a deny only denies this tool — the turn may proceed; the eventual
+-- `result` event flips working off + clears the hint).
+local function resolve_permission(kind)
+  local p = state.perm
+  if not p then return end
+  if kind == "deny" then
+    send_permission_response(p.request_id, "deny", { message = "User rejected" })
+  elseif kind == "always" then
+    send_permission_response(p.request_id, "allow",
+      { input = p.input, permissions = p.suggestions })
+  else
+    send_permission_response(p.request_id, "allow", { input = p.input })
+  end
+
+  -- Clear state BEFORE closing so the float's WinClosed guard no-ops (it only
+  -- fires a fallback deny when the window vanishes with state.perm still set).
+  state.perm = nil
+  if p.win and vim.api.nvim_win_is_valid(p.win) then
+    pcall(vim.api.nvim_win_close, p.win, true)
+  end
+
+  -- One-line receipt in the transcript so the scrollback shows what was decided.
+  local mark = (kind == "deny") and "✗" or "✓"
+  local verb = ({ once = "Allowed once", always = "Allowed always",
+                  deny = "Rejected" })[kind] or "Allowed"
+  if state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf) then
+    local recl = vim.api.nvim_buf_line_count(state.panel_buf)
+    buf_append({ mark .. " " .. p.display .. " — " .. verb })
+    hl_lines(recl, recl, kind == "deny" and "ClaudeDim" or "ClaudeQuestion")
+  end
+
+  if state.working then start_spinner() else clear_hint() end
+end
+mod._resolve_permission = resolve_permission
+
+-- Build + open the focused, bordered permission float and bind its keymaps. The
+-- buffer is dedicated and wiped on close, so the keymaps need no teardown.
+local function open_permission_float(p)
+  -- Body lines (display / desc / patterns), a spacer, the button-row placeholder,
+  -- and a dim nav-hint line that wraps inside the box (no overflowing eol hint).
+  local lines, body_hl = {}, {}
+  lines[#lines + 1] = "  " .. p.display
+  body_hl[#body_hl + 1] = { #lines - 1, "ClaudeProse" }
+  if p.desc ~= "" and p.desc ~= p.display then
+    lines[#lines + 1] = "  " .. p.desc
+    body_hl[#body_hl + 1] = { #lines - 1, "ClaudeProse" }
+  end
+  if p.rules and #p.rules > 0 then
+    lines[#lines + 1] = "  Patterns: " .. table.concat(p.rules, ", ")
+    body_hl[#body_hl + 1] = { #lines - 1, "ClaudeDim" }
+  end
+  lines[#lines + 1] = ""                                  -- spacer
+  lines[#lines + 1] = ""                                  -- button-row placeholder
+  p.row = #lines - 1                                      -- 0-indexed button row
+  lines[#lines + 1] = "  ←/→ select · ⏎ confirm · esc reject"
+  body_hl[#body_hl + 1] = { #lines - 1, "ClaudeDim" }
+
+  -- Geometry: full panel-column width minus borders, bottom-left of the column
+  -- (same column math as the chat float).
+  local panel_w = panel_width()
+  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+    panel_w = vim.api.nvim_win_get_width(state.panel_win)
+  end
+  local float_w   = math.max(panel_w - 2, 1)
+  local float_col = vim.o.columns - panel_w
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile  = false
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  p.buf = buf
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative  = "editor",
+    anchor    = "SW",
+    row       = vim.o.lines - 2,
+    col       = float_col,
+    width     = float_w,
+    height    = #lines,
+    border    = "rounded",
+    style     = "minimal",
+    title     = " ⚠ Permission required ",
+    title_pos = "left",
+    zindex    = 60,
+  })
+  p.win = win
+  -- Amber outline so the card is clearly NOT the clay chat bar; interior shares
+  -- ClaudeBarBg so the box reads flush, only the outline pops.
+  vim.wo[win].winhighlight =
+    "FloatBorder:ClaudePermBorder,FloatTitle:ClaudePermBorder,NormalFloat:ClaudeBarBg"
+  vim.wo[win].wrap       = true
+  vim.wo[win].cursorline = false
+
+  for _, h in ipairs(body_hl) do
+    vim.api.nvim_buf_add_highlight(buf, -1, h[2], h[1], 0, -1)
+  end
+  vim.bo[buf].modifiable = false
+
+  local function map(k, fn)
+    vim.keymap.set("n", k, fn, { buffer = buf, nowait = true, silent = true })
+  end
+  map("<Left>",  function() move_perm_choice(-1) end)
+  map("h",       function() move_perm_choice(-1) end)
+  map("<Right>", function() move_perm_choice(1) end)
+  map("l",       function() move_perm_choice(1) end)
+  map("<CR>", function()
+    local q = state.perm
+    if q then resolve_permission(q.options[q.choice].kind) end
+  end)
+  map("<Esc>", function() resolve_permission("deny") end)
+  map("q",     function() resolve_permission("deny") end)
+  for i = 1, 3 do
+    map(tostring(i), function()
+      local q = state.perm
+      if q and q.options[i] then q.choice = i; resolve_permission(q.options[i].kind) end
+    end)
+  end
+
+  -- If the float vanishes by any path OTHER than resolve_permission (which nils
+  -- state.perm first), fall back to a reject so the CLI isn't left waiting.
+  vim.api.nvim_create_autocmd("WinClosed", {
+    pattern = tostring(win),
+    once    = true,
+    callback = function()
+      if state.perm and state.perm.win == win then resolve_permission("deny") end
+    end,
+  })
+end
+
+-- Render a permission card from an inbound can_use_tool control_request and arm
+-- the lock. Pauses the spinner (Claude is genuinely blocked on us, so a spinner
+-- would lie); resolve_permission restarts it.
+local function show_permission_card(event)
+  local req = event.request or {}
+  local p = {
+    request_id  = event.request_id,
+    tool        = req.tool_name or "",
+    display     = req.display_name or req.tool_name or "tool",
+    desc        = req.description or "",
+    input       = req.input,
+    suggestions = req.permission_suggestions,
+    choice      = 1,
+  }
+  -- Collect rule strings (suggestions[].rules[].ruleContent) for the Patterns
+  -- line and to decide whether "Allow always" is offered — only when the CLI gave
+  -- us rules to persist.
+  local rules = {}
+  for _, sug in ipairs(p.suggestions or {}) do
+    for _, r in ipairs(sug.rules or {}) do
+      if r.ruleContent then rules[#rules + 1] = r.ruleContent end
+    end
+  end
+  p.rules   = rules
+  p.options = { { label = "Allow once", kind = "once" } }
+  if #rules > 0 then p.options[#p.options + 1] = { label = "Allow always", kind = "always" } end
+  p.options[#p.options + 1] = { label = "Reject", kind = "deny" }
+
+  stop_spinner()
+  clear_hint()   -- drop any stale "Working…" hint so nothing peeks behind the float
+  state.perm = p
+  open_permission_float(p)
+  render_perm_choice_row()
+end
+
 -- Dispatch one fully parsed stream-json event object.
 local function dispatch(event)
   local ev_type = event.type or ""
@@ -1644,15 +1867,10 @@ local function dispatch(event)
       -- them. (Without this they'd double-gate: card here AND vimdiff after.)
       send_permission_response(event.request_id, "allow", { input = req.input })
     else
-      -- STEP 4 (inline permission card UI) replaces this branch. For now we
-      -- auto-allow non-edit tools and surface which one fired, to live-prove the
-      -- can_use_tool round-trip (inbound parse + outbound control_response) end
-      -- to end before building the interactive card.
-      vim.notify(
-        "Claude permission auto-allowed (card UI pending): " .. (req.display_name or tool),
-        vim.log.levels.INFO
-      )
-      send_permission_response(event.request_id, "allow", { input = req.input })
+      -- Non-edit tool: render the interactive permission card and wait for the
+      -- user's Allow once / Allow always / Reject choice (resolve_permission
+      -- sends the control_response). The CLI blocks the turn until we answer.
+      show_permission_card(event)
     end
   end
 end
@@ -1778,7 +1996,7 @@ local function set_panel_keymaps(buf)
   local function open_input()
     mod.prompt_input()
   end
-  for _, key in ipairs({ "i", "a", "o", "<CR>" }) do
+  for _, key in ipairs({ "i", "a", "o" }) do
     vim.keymap.set("n", key, open_input, {
       buffer  = buf,
       noremap = true,
@@ -1786,10 +2004,29 @@ local function set_panel_keymaps(buf)
       desc    = "Claude: open reply float",
     })
   end
-  -- <Esc> in normal mode = interrupt the current turn (control_request) while
-  -- keeping the session alive. Matches the Claude Code TUI's Esc behaviour.
+  -- <CR> confirms the active permission choice when a card is up; otherwise it
+  -- opens the reply float (same as i/a/o).
+  vim.keymap.set("n", "<CR>", function()
+    if state.perm then
+      resolve_permission(state.perm.options[state.perm.choice].kind)
+    else
+      open_input()
+    end
+  end, {
+    buffer  = buf,
+    noremap = true,
+    silent  = true,
+    desc    = "Claude: reply / confirm permission",
+  })
+  -- <Esc> rejects the pending permission when a card is up; otherwise it
+  -- interrupts the current turn (control_request) while keeping the session
+  -- alive. Matches the Claude Code TUI's Esc behaviour.
   vim.keymap.set("n", "<Esc>", function()
-    mod.interrupt()
+    if state.perm then
+      resolve_permission("deny")
+    else
+      mod.interrupt()
+    end
   end, {
     buffer  = buf,
     noremap = true,
@@ -2196,6 +2433,11 @@ function mod.prompt_input()
   -- Block new input when a diff is pending: accepting/rejecting the edit must
   -- happen before the conversation can continue, so we don't create a race
   -- between a follow-up message and the pending file change on disk.
+  if state.perm then
+    vim.notify("⚠ Permission required — ←/→ select, <CR> confirm, <Esc> reject",
+      vim.log.levels.WARN)
+    return
+  end
   if state.diff_pending then
     vim.notify("⚠ Awaiting review — accept or reject first", vim.log.levels.WARN)
     return
@@ -2577,6 +2819,10 @@ function mod.reset()
   state.working       = false
   state.system_ready  = false
   state.diff_pending  = false
+  if state.perm and state.perm.win and vim.api.nvim_win_is_valid(state.perm.win) then
+    pcall(vim.api.nvim_win_close, state.perm.win, true)
+  end
+  state.perm          = nil
   state.claude_active = false
   stdout_buf          = ""
 

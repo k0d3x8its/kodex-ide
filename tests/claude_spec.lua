@@ -501,4 +501,213 @@ H.check("T17 reject sends deny",
   r5 and r5.response.request_id == "req-bash-2"
     and r5.response.response.behavior == "deny", vim.inspect(r5))
 
+-- ── T18: AskUserQuestion card — vertical selector, answers map round-trip ─────
+-- AskUserQuestion rides the SAME can_use_tool gate but is NOT allow/reject: it
+-- carries up to 4 questions and the pick rides back in updatedInput.answers (keyed
+-- by question TEXT). The card steps through the N questions, then sends ONE
+-- control_response. (.work/FINDINGS.md § Q-ASK)
+
+claude.state.working = true
+
+-- Single question → card armed, no auto control_response, NOT routed to a perm card.
+local sends_q = #chansend_calls
+feed({
+  type       = "control_request",
+  request_id = "req-ask-1",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "AskUserQuestion",
+    input     = { questions = { {
+      question    = "Indent style?",
+      header      = "Indent",
+      multiSelect = false,
+      options     = { { label = "Tabs", description = "hard tabs" },
+                      { label = "Spaces", description = "soft" } },
+    } } },
+  },
+})
+H.check("T18 question tool shows a card (no auto control_response)",
+  #chansend_calls == sends_q, "sends delta=" .. (#chansend_calls - sends_q))
+H.check("T18 card armed (state.qask set, perm untouched)",
+  claude.state.qask ~= nil and claude.state.qask.request_id == "req-ask-1"
+    and claude.state.perm == nil, vim.inspect(claude.state.qask))
+H.check("T18 one question, index starts at 1",
+  claude.state.qask and #claude.state.qask.questions == 1
+    and claude.state.qask.qi == 1, vim.inspect(claude.state.qask and claude.state.qask.qi))
+
+-- Move down to option 2 (Spaces), select → allow with answers keyed by text.
+claude._move_question_choice(1)
+claude._select_question_choice()
+local rq = last_control_response()
+H.check("T18 select sends allow echoing request_id",
+  rq and rq.response.request_id == "req-ask-1"
+    and rq.response.response.behavior == "allow", vim.inspect(rq))
+H.check("T18 answers map keyed by question TEXT, value = chosen label",
+  rq and rq.response.response.updatedInput
+    and rq.response.response.updatedInput.answers
+    and rq.response.response.updatedInput.answers["Indent style?"] == "Spaces",
+  vim.inspect(rq and rq.response.response.updatedInput))
+H.check("T18 card cleared after submit (state.qask nil)",
+  claude.state.qask == nil, vim.inspect(claude.state.qask))
+
+-- Multi-question: ALL arrive in one request; first select advances (no response),
+-- last select submits ONE response with every answer.
+feed({
+  type       = "control_request",
+  request_id = "req-ask-2",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "AskUserQuestion",
+    input     = { questions = {
+      { question = "A?", header = "A", multiSelect = false,
+        options = { { label = "X" }, { label = "Y" } } },
+      { question = "B?", header = "B", multiSelect = false,
+        options = { { label = "P" }, { label = "Q" } } },
+    } },
+  },
+})
+local sends_multi = #chansend_calls
+claude._select_question_choice()          -- answer Q1 = X (default choice 1)
+H.check("T18 first of two questions does NOT submit yet",
+  #chansend_calls == sends_multi and claude.state.qask ~= nil
+    and claude.state.qask.qi == 2, "qi=" .. tostring(claude.state.qask and claude.state.qask.qi))
+claude._move_question_choice(1)           -- Q2 choice → Q
+claude._select_question_choice()          -- submit
+local rq2 = last_control_response()
+H.check("T18 multi-question submits ONE response with all answers",
+  rq2 and rq2.response.request_id == "req-ask-2"
+    and rq2.response.response.updatedInput.answers["A?"] == "X"
+    and rq2.response.response.updatedInput.answers["B?"] == "Q",
+  vim.inspect(rq2 and rq2.response.response.updatedInput))
+
+-- multiSelect → answer value is an ARRAY of labels.
+feed({
+  type       = "control_request",
+  request_id = "req-ask-3",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "AskUserQuestion",
+    input     = { questions = { {
+      question = "Colors?", header = "Color", multiSelect = true,
+      options  = { { label = "Red" }, { label = "Green" }, { label = "Blue" } },
+    } } },
+  },
+})
+claude._toggle_question_choice()          -- Red on (choice 1)
+claude._move_question_choice(1)           -- → Green
+claude._move_question_choice(1)           -- → Blue
+claude._toggle_question_choice()          -- Blue on
+claude._select_question_choice()
+local rq3 = last_control_response()
+local arr = rq3 and rq3.response.response.updatedInput.answers
+            and rq3.response.response.updatedInput.answers["Colors?"]
+H.check("T18 multiSelect answer is an array of chosen labels",
+  type(arr) == "table" and arr[1] == "Red" and arr[2] == "Blue" and #arr == 2,
+  vim.inspect(arr))
+
+-- Cancel → allow with NO answers key (the clean dismiss).
+feed({
+  type       = "control_request",
+  request_id = "req-ask-4",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "AskUserQuestion",
+    input     = { questions = { {
+      question = "Proceed?", header = "Go", multiSelect = false,
+      options  = { { label = "Yes" }, { label = "No" } },
+    } } },
+  },
+})
+claude._cancel_question()
+local rq4 = last_control_response()
+H.check("T18 cancel sends allow with NO answers key",
+  rq4 and rq4.response.request_id == "req-ask-4"
+    and rq4.response.response.behavior == "allow"
+    and rq4.response.response.updatedInput.answers == nil, vim.inspect(rq4))
+
+-- ── T19: question-card parity — free nav, Type something, Chat about this ─────
+
+-- Free navigation between questions WITHOUT answering (Tab/⇥ + arrows). Two
+-- questions arrive together; moving forward/back must not submit.
+feed({
+  type       = "control_request",
+  request_id = "req-ask-5",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "AskUserQuestion",
+    input     = { questions = {
+      { question = "One?", header = "1", multiSelect = false,
+        options = { { label = "a" }, { label = "b" } } },
+      { question = "Two?", header = "2", multiSelect = false,
+        options = { { label = "c" }, { label = "d" } } },
+    } },
+  },
+})
+local sends_nav = #chansend_calls
+claude._next_question()
+H.check("T19 next-question moves without answering (no submit)",
+  #chansend_calls == sends_nav and claude.state.qask
+    and claude.state.qask.qi == 2, "qi=" .. tostring(claude.state.qask and claude.state.qask.qi))
+claude._next_question()
+H.check("T19 next-question clamps at the last question",
+  claude.state.qask and claude.state.qask.qi == 2, "qi=" .. tostring(claude.state.qask and claude.state.qask.qi))
+claude._prev_question()
+H.check("T19 prev-question moves back without answering",
+  #chansend_calls == sends_nav and claude.state.qask
+    and claude.state.qask.qi == 1, "qi=" .. tostring(claude.state.qask and claude.state.qask.qi))
+claude._cancel_question()   -- tidy up the open card before the next case
+
+-- "Chat about this" (always the last synthetic option) cancels the whole card:
+-- allow with NO answers. Question has 2 model options → chat is display index 4.
+feed({
+  type       = "control_request",
+  request_id = "req-ask-6",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "AskUserQuestion",
+    input     = { questions = { {
+      question = "Bail?", header = "B", multiSelect = false,
+      options  = { { label = "stay" }, { label = "go" } },
+    } } },
+  },
+})
+claude._move_question_choice(1)   -- 2 (go)
+claude._move_question_choice(1)   -- 3 (Type something)
+claude._move_question_choice(1)   -- 4 (Chat about this)
+claude._select_question_choice()
+local rq6 = last_control_response()
+H.check("T19 'Chat about this' cancels (allow, no answers)",
+  rq6 and rq6.response.request_id == "req-ask-6"
+    and rq6.response.response.behavior == "allow"
+    and rq6.response.response.updatedInput.answers == nil
+    and claude.state.qask == nil, vim.inspect(rq6))
+
+-- "Type something" opens an input; the typed text becomes the answer value
+-- (raw string, label-match bypassed). Stub vim.ui.input to feed text synchronously.
+local saved_ui_input = vim.ui.input
+vim.ui.input = function(_, cb) cb("frobnicate the widget") end
+feed({
+  type       = "control_request",
+  request_id = "req-ask-7",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "AskUserQuestion",
+    input     = { questions = { {
+      question = "Freeform?", header = "F", multiSelect = false,
+      options  = { { label = "x" }, { label = "y" } },
+    } } },
+  },
+})
+claude._move_question_choice(1)   -- 2 (y)
+claude._move_question_choice(1)   -- 3 (Type something)
+claude._select_question_choice()  -- opens input → stub returns text → records + submits
+vim.ui.input = saved_ui_input
+local rq7 = last_control_response()
+H.check("T19 'Type something' sends the typed text as the answer value",
+  rq7 and rq7.response.request_id == "req-ask-7"
+    and rq7.response.response.updatedInput.answers
+    and rq7.response.response.updatedInput.answers["Freeform?"] == "frobnicate the widget"
+    and claude.state.qask == nil,
+  vim.inspect(rq7 and rq7.response.response.updatedInput))
+
 H.summary("claude")

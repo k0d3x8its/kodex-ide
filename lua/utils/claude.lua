@@ -1573,6 +1573,11 @@ local function send_permission_response(request_id, decision, o)
   o = o or {}
   local response
   if decision == "deny" then
+    -- The deny reason rides in `message` for BOTH the permission-card "Reject" and
+    -- AskUserQuestion's "Chat about this". The TUI bundle's question component sets an
+    -- internal `feedback` prop, but the wire serializer maps it straight to `message`
+    -- (`{behavior:"deny",message:$.feedback??"User denied permission"}`) — there is NO
+    -- `feedback` field on the wire; sending one is silently dropped. § Q-ASK addendum.
     response = { behavior = "deny", message = o.message or "User rejected" }
   else
     local input = o.input
@@ -1876,7 +1881,8 @@ end
 --   <Space>  toggle a multiSelect option
 --   <CR>     select the highlighted option (records pick; advances to the next
 --            UNanswered question, or submits when all are answered). On the
---            "Type something" row it opens an input; on "Chat about this" it cancels.
+--            "Type something" row it opens an input; "Chat about this" denies with
+--            feedback so the model opens a clarification dialogue.
 --   <Esc>/q  cancel (allow with NO answers → the CLI emits "Question dismissed").
 -- Reuses the permission card's geometry + chat-bar dismiss/reopen plumbing.
 
@@ -2113,6 +2119,52 @@ local function cancel_question()
 end
 mod._cancel_question = cancel_question
 
+-- Per-question "Questions asked:" summary that rides in the "Chat about this"
+-- feedback (the bundle's t_m): each question text on its own line, followed by the
+-- recorded answer (joined labels for multiSelect, the picked/custom value otherwise)
+-- or "(No answer provided)" when the user hit Chat before answering it.
+local function question_summary(q)
+  local parts = {}
+  for i, question in ipairs(q.questions) do
+    parts[#parts + 1] = '- "' .. (question.question or "") .. '"'
+    local ans
+    if question.multiSelect then
+      local labels, sel = {}, q.sel[i] or {}
+      for oi, opt in ipairs(question.options or {}) do
+        if sel[oi] then labels[#labels + 1] = opt.label end
+      end
+      if #labels > 0 then ans = table.concat(labels, ", ") end
+    else
+      local p = q.picks[i]
+      if p and p.kind == "custom" then ans = p.text
+      elseif p and p.kind == "option" then ans = p.label end
+    end
+    parts[#parts + 1] = ans and ("  Answer: " .. ans) or "  (No answer provided)"
+  end
+  return table.concat(parts, "\n")
+end
+
+-- "Chat about this": NOT a dismiss. The TUI sends a `behavior:"deny"` whose `message`
+-- carries the canned clarify text (verbatim from the bundle's e_m `feedback`, which
+-- serializes to `message` on the wire) + the question summary, so the model opens a
+-- clarification dialogue instead of silently moving on. Reusing cancel_question's
+-- allow-no-answers (the first bug) was a dismiss; sending it as `feedback` (the second
+-- bug) was dropped → bare deny → model saw "permission denied". § Q-ASK addendum.
+local function respond_to_claude_question()
+  local q = state.qask
+  if not q then return end
+  local message = "The user wants to clarify these questions. This means they may "
+    .. "have additional information, context or questions for you. Take their "
+    .. "response into account and then reformulate the questions if appropriate. "
+    .. "Start by asking them what they would like to clarify. Questions asked: "
+    .. question_summary(q)
+  send_permission_response(q.request_id, "deny", { message = message })
+  -- close_question_card reopens the dismissed chat bar (draft restored) so the user
+  -- can immediately type their clarification once the model asks.
+  close_question_card("💬 Chat about this", "ClaudeQuestion")
+end
+mod._respond_to_claude_question = respond_to_claude_question
+
 -- Record a free-text custom answer for the current question, then advance/submit.
 -- nil text = the input was cancelled → leave the card untouched.
 local function set_question_custom(text)
@@ -2135,9 +2187,9 @@ local function prompt_question_custom()
   end)
 end
 
--- Act on the highlighted option: "Chat about this" cancels, "Type something" opens
--- the input, a model option records the pick (single-select) or confirms the
--- multiSelect set, then advances toward completion / submits.
+-- Act on the highlighted option: "Chat about this" denies with feedback (clarify
+-- dialogue), "Type something" opens the input, a model option records the pick
+-- (single-select) or confirms the multiSelect set, then advances / submits.
 local function select_question_choice()
   local q = state.qask
   if not q then return end
@@ -2145,7 +2197,7 @@ local function select_question_choice()
   local d = question_display_options(question)[q_choice(q)]
   if not d then return end
   if d.kind == "chat" then
-    cancel_question()
+    respond_to_claude_question()
     return
   elseif d.kind == "custom" then
     prompt_question_custom()

@@ -1713,17 +1713,41 @@ local function perm_path_ranges(line)
   return out
 end
 
+-- The concrete command / parameters the tool will run, so the user can verify
+-- EXACTLY what executes before allowing (the display + description summarise intent
+-- but hide the real command, e.g. "Display directory tree" never showed the
+-- `tree -L 3 …` that runs). Unlike tool_target (truncated to one transcript line),
+-- the card wraps + spans rows, so show the full value split on newlines
+-- (nvim_buf_set_lines rejects embedded \n). Picks the most meaningful input field.
+local function perm_input_lines(input)
+  if type(input) ~= "table" then return {} end
+  local val = input.command or input.url or input.query or input.pattern
+    or input.file_path or input.path
+  if not val or val == "" then return {} end
+  local out = {}
+  for ln in (tostring(val) .. "\n"):gmatch("([^\n]*)\n") do
+    out[#out + 1] = ln
+  end
+  return out
+end
+
 -- Build + open the focused, bordered permission float and bind its keymaps. The
 -- buffer is dedicated and wiped on close, so the keymaps need no teardown.
 local function open_permission_float(p)
-  -- Body lines (display / desc / patterns), a spacer, the button-row placeholder,
-  -- and a dim nav-hint line that wraps inside the box (no overflowing eol hint).
+  -- Body lines (display / desc / command / patterns), a spacer, the button-row
+  -- placeholder, and a dim nav-hint line that wraps inside the box.
   local lines, body_hl = {}, {}
   lines[#lines + 1] = "  " .. p.display
   body_hl[#body_hl + 1] = { #lines - 1, "ClaudeProse" }
   if p.desc ~= "" and p.desc ~= p.display then
     lines[#lines + 1] = "  " .. p.desc
     body_hl[#body_hl + 1] = { #lines - 1, "ClaudeProse" }
+  end
+  -- The actual command/parameters, rendered as a code block (▎ gutter + cyan) so
+  -- the user sees what will run, not just a paraphrase of it.
+  for _, cl in ipairs(perm_input_lines(p.input)) do
+    lines[#lines + 1] = "  ▎ " .. cl
+    body_hl[#body_hl + 1] = { #lines - 1, "ClaudeCode" }
   end
   if p.rules and #p.rules > 0 then
     lines[#lines + 1] = "  Patterns: " .. table.concat(p.rules, ", ")
@@ -1951,8 +1975,12 @@ local function render_question_card()
       label = label .. ": " .. pick.text
     end
     lines[#lines + 1] = "  " .. marker .. mark .. label
+    -- Highlighted row pops burnt-orange; model options read prose-orange; the two
+    -- synthetic affordances (Type something / Chat about this) get ClaudeLabel
+    -- purple so they're visibly distinct from the gray (ClaudeDim) descriptions
+    -- they used to share a colour with.
     local grp = (i == ci) and "ClaudeQuestion"
-      or ((d.kind == "model") and "ClaudeProse" or "ClaudeDim")
+      or ((d.kind == "model") and "ClaudeProse" or "ClaudeLabel")
     hl[#hl + 1] = { #lines - 1, grp }
     if d.desc ~= "" then
       lines[#lines + 1] = "        " .. d.desc
@@ -2194,16 +2222,80 @@ local function set_question_custom(text)
 end
 mod._set_question_custom = set_question_custom
 
--- Open a small input for the "Type something" affordance. Empty/cancelled input
--- just repaints the card (no pick recorded). Uses vim.ui.input so the panel's own
--- chat-float infra isn't entangled with the card lifecycle.
+-- Open a small input for the "Type something" affordance. A dedicated, FOCUSED
+-- float in the panel column (NOT vim.ui.input): dressing routes vim.ui.input to a
+-- cursor-relative float that opened behind the question card (the card holds focus
+-- + a higher draw position), so the user's typing landed in an invisible window.
+-- This float anchors SW at the panel column with a zindex ABOVE the card (70 > 60),
+-- focused + in insert mode, so what's typed is always visible. <CR> commits the
+-- answer, <Esc> cancels back to the card. Empty/cancelled input just repaints.
 local function prompt_question_custom()
   if not state.qask then return end
-  vim.ui.input({ prompt = "Custom answer: " }, function(text)
+  local panel_w = panel_width()
+  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+    panel_w = vim.api.nvim_win_get_width(state.panel_win)
+  end
+  local float_w   = math.max(panel_w - 2, 1)
+  local float_col = vim.o.columns - panel_w
+
+  -- A prompt buffer (not a plain scratch) so it carries the same green "❯" arrow as
+  -- the chat bar: prompt_setprompt draws the arrow, matchadd colours it terminal-
+  -- green (ClaudeArrow), and <CR> fires prompt_setcallback with the typed text.
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile  = false
+  vim.bo[buf].buftype   = "prompt"
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative  = "editor",
+    anchor    = "SW",
+    row       = vim.o.lines - 2,
+    col       = float_col,
+    width     = float_w,
+    height    = 1,
+    border    = "rounded",
+    style     = "minimal",
+    title     = " ✎ Type your answer ",
+    title_pos = "left",
+    zindex    = 70,
+  })
+  vim.wo[win].winhighlight =
+    "FloatBorder:ClaudeBarBorder,FloatTitle:ClaudeBarBorder,NormalFloat:ClaudeBarBg"
+  vim.wo[win].wrap = false
+
+  -- Green "❯ " prompt arrow, matching the chat bar (window-local match, set while
+  -- this float is the current window).
+  vim.fn.prompt_setprompt(buf, "❯ ")
+  vim.fn.matchadd("ClaudeArrow", "^❯")
+  -- Show the cursor while typing (the panel hides it globally via guicursor).
+  vim.o.guicursor = state.real_guicursor or "a:block,a:blinkon0"
+
+  -- Close the input, then either record the typed text (commit + advance/submit)
+  -- or fall back to the card untouched. Refocus the card so navigation continues.
+  -- Guarded so the prompt callback + an <Esc>/WinLeave can't both fire it.
+  local done = false
+  local function finish(text)
+    if done then return end
+    done = true
+    vim.o.guicursor = "a:ver1-ClaudeCursorHidden"    -- re-hide; focus returns to panel
+    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
     if not state.qask then return end                -- card gone while typing
-    if text == nil or text == "" then render_question_card() return end
-    set_question_custom(text)
-  end)
+    if state.qask.win and vim.api.nvim_win_is_valid(state.qask.win) then
+      pcall(vim.api.nvim_set_current_win, state.qask.win)
+    end
+    -- Closing the prompt float leaves the editor in insert mode; the card's
+    -- keymaps are normal-mode, so without this the arrows are dead until the user
+    -- drops out of insert manually.
+    vim.cmd("stopinsert")
+    if text and text ~= "" then set_question_custom(text)
+    else render_question_card() end
+  end
+
+  vim.fn.prompt_setcallback(buf, function(text) finish(text) end)
+  local opts = { buffer = buf, nowait = true, silent = true }
+  vim.keymap.set("i", "<Esc>", function() finish(nil) end, opts)
+  vim.keymap.set("n", "<Esc>", function() finish(nil) end, opts)
+  vim.cmd("startinsert!")
 end
 
 -- Act on the highlighted option: "Chat about this" denies with feedback (clarify

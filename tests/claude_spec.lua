@@ -657,8 +657,12 @@ H.check("T19 prev-question moves back without answering",
     and claude.state.qask.qi == 1, "qi=" .. tostring(claude.state.qask and claude.state.qask.qi))
 claude._cancel_question()   -- tidy up the open card before the next case
 
--- "Chat about this" (always the last synthetic option) cancels the whole card:
--- allow with NO answers. Question has 2 model options → chat is display index 4.
+-- "Chat about this" (always the last synthetic option) is NOT a dismiss: it denies
+-- with a `message` carrying the canned clarify text + the per-question summary (the
+-- bundle's `feedback` serializes to `message` on the wire), so the model opens a
+-- clarification dialogue. Question has 2 model options → chat is display index 4. No
+-- pick was recorded (highlight moves don't answer), so the summary reports
+-- "(No answer provided)".
 feed({
   type       = "control_request",
   request_id = "req-ask-6",
@@ -676,11 +680,17 @@ claude._move_question_choice(1)   -- 3 (Type something)
 claude._move_question_choice(1)   -- 4 (Chat about this)
 claude._select_question_choice()
 local rq6 = last_control_response()
-H.check("T19 'Chat about this' cancels (allow, no answers)",
+local fb6 = rq6 and rq6.response.response.message
+H.check("T19 'Chat about this' denies (NOT a dismiss), no answers/updatedInput",
   rq6 and rq6.response.request_id == "req-ask-6"
-    and rq6.response.response.behavior == "allow"
-    and rq6.response.response.updatedInput.answers == nil
+    and rq6.response.response.behavior == "deny"
+    and rq6.response.response.updatedInput == nil
     and claude.state.qask == nil, vim.inspect(rq6))
+H.check("T19 'Chat about this' deny message carries the canned clarify text + summary",
+  type(fb6) == "string"
+    and fb6:find("wants to clarify these questions", 1, true)
+    and fb6:find("Questions asked:", 1, true)
+    and fb6:find('"Bail?"', 1, true), vim.inspect(fb6))
 
 -- "Type something" opens an input; the typed text becomes the answer value
 -- (raw string, label-match bypassed). Stub vim.ui.input to feed text synchronously.

@@ -312,6 +312,16 @@ local TOOL_VERB = {
   NotebookEdit = "Editing",
 }
 
+-- Per-verb highlight overrides for the "⚙ <verb>" tool lines. Without these every
+-- verb paints ClaudeTool (the same purple as the thinking blocks + fold headers),
+-- so a Read and a Bash are indistinguishable at a glance. Reading (passive
+-- inspect) → teal, Running (active execute) → amber; any verb not listed falls
+-- back to ClaudeTool. Keyed by the resolved VERB, so Read + NotebookRead share it.
+local TOOL_HL = {
+  Reading = "ClaudeToolRead",
+  Running = "ClaudeToolRun",
+}
+
 -- Extract the most meaningful target string from a tool_use input dict.
 -- Priority: file_path > path > pattern > query > command (truncated to 70 chars).
 -- Falls back to "" when none present, so callers can skip the target display.
@@ -1106,9 +1116,33 @@ local function set_hint(text, hl)
   vim.api.nvim_buf_clear_namespace(buf, state.hint_ns, 0, -1)
   local last = vim.api.nvim_buf_line_count(buf) - 1
   if last < 0 then last = 0 end
+  hl = hl or "ClaudeInput"
+  -- eol virtual text does NOT soft-wrap — a long hint just runs off the right
+  -- edge. So hard-wrap to the live panel width and spill the overflow into
+  -- virt_lines stacked below. Explicit "\n" in `text` forces a break too (the
+  -- spinner's "<Esc> to interrupt" footer rides on its own line). When the panel
+  -- is the only window it's wide, so the hint stretches across that real estate.
+  local w = math.max(panel_width() - 1, 20)
+  local segments = {}
+  for _, para in ipairs(vim.split(text, "\n", { plain = true })) do
+    for _, wl in ipairs(wrap_text(para, w)) do
+      segments[#segments + 1] = wl
+    end
+  end
+  if #segments == 0 then return end
+  -- First segment sits at the end of the last buffer line; the rest become
+  -- virtual lines so the whole hint stacks vertically inside the window.
+  local virt_lines
+  if #segments > 1 then
+    virt_lines = {}
+    for i = 2, #segments do
+      virt_lines[i - 1] = { { segments[i], hl } }
+    end
+  end
   vim.api.nvim_buf_set_extmark(buf, state.hint_ns, last, 0, {
-    virt_text     = { { text, hl or "ClaudeInput" } },
+    virt_text     = { { segments[1], hl } },
     virt_text_pos = "eol",
+    virt_lines    = virt_lines,
   })
 end
 
@@ -1274,8 +1308,9 @@ end
 -- Flavour words for the generic model-generation phase (the boring "Working…"),
 -- mirroring the official TUI's rotating verb. Gerund form for the live spinner;
 -- FLAVOR_DONE is the past-tense set for the "✻ Churned for 4m 31s" final line.
--- Index-aligned so a turn's live word and its done word can rhyme, but the live
--- rotation and the done pick are independent randoms — alignment isn't required.
+-- Index-aligned: the turn picks one index (state.flavor_idx); the live spinner
+-- shows FLAVOR[idx] and the done line shows FLAVOR_DONE[idx], so the close is the
+-- past tense of the open ("Proofing…" → "✻ Proofed for 4m"). Keep both in sync.
 local FLAVOR = {
   "Accomplishing", "Actioning", "Actualizing", "Baking", "Befuddling", "Boggling",
   "Boondoggling", "Booping", "Brewing", "Calculating", "Cerebrating", "Channelling",
@@ -1338,7 +1373,10 @@ local function spinner_label()
   elseif state.tool_run then
     parts[#parts + 1] = state.tool_run.label    -- e.g. "Running: tree -L 1"
   end
-  return string.format("%s %s… [%s]  <Esc> to interrupt", frame, word, table.concat(parts, " · "))
+  -- "\n" puts the interrupt hint on its OWN line (set_hint splits on newlines):
+  -- the status word can be long and eol virtual text never soft-wraps, so keeping
+  -- "<Esc> to interrupt" inline pushed it off the right edge of a narrow panel.
+  return string.format("%s %s… [%s]\n<Esc> to interrupt", frame, word, table.concat(parts, " · "))
 end
 
 local function stop_spinner()
@@ -1549,7 +1587,7 @@ local function render_tool(name, input)
   local line   = "  ⚙ " .. verb .. (target ~= "" and (": " .. target) or "")
   local first  = vim.api.nvim_buf_line_count(state.panel_buf)
   buf_append({ line })
-  hl_lines(first, first, "ClaudeTool")
+  hl_lines(first, first, TOOL_HL[verb] or "ClaudeTool")
   buf_append({ "" })   -- spinner gets its own line below
 
   -- Mark the tool as RUNNING so the spinner shows live "Running: tree … 5.2s"
@@ -1574,7 +1612,11 @@ end
 local function render_result(_text)
   local buf = state.panel_buf
   if not (state.turn_t0 and buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  local word = FLAVOR_DONE[math.random(#FLAVOR_DONE)]
+  -- Past-tense form of the SAME word the spinner showed this turn (index-aligned
+  -- with FLAVOR), so the close echoes the open. Falls back to a random done word
+  -- if the turn somehow had no flavour index.
+  local word = (state.flavor_idx and FLAVOR_DONE[state.flavor_idx])
+    or FLAVOR_DONE[math.random(#FLAVOR_DONE)]
   local line = "  ✻ " .. word .. " for " .. fmt_think_dur(vim.loop.now() - state.turn_t0)
   local l    = vim.api.nvim_buf_line_count(buf)
   buf_append({ line })
@@ -1888,8 +1930,19 @@ local function open_permission_float(p)
     lines[#lines + 1] = "  " .. p.desc
     body_hl[#body_hl + 1] = { #lines - 1, "ClaudeProse" }
   end
+  -- Button row + nav hint go ABOVE the command, not below it. The float height is
+  -- capped (see geometry) so a long command can't fill the screen; keeping the
+  -- choices at the top means they stay visible while the command scrolls in the
+  -- region beneath them, instead of being pushed off the bottom edge.
+  lines[#lines + 1] = ""                                  -- spacer
+  lines[#lines + 1] = ""                                  -- button-row placeholder
+  p.row = #lines - 1                                      -- 0-indexed button row
+  lines[#lines + 1] = "  ←/→ select · ⏎ confirm · esc reject · j/k scroll"
+  body_hl[#body_hl + 1] = { #lines - 1, "ClaudeDim" }
+  lines[#lines + 1] = ""                                  -- spacer
   -- The actual command/parameters, rendered as a code block (▎ gutter + cyan) so
-  -- the user sees what will run, not just a paraphrase of it.
+  -- the user sees what will run, not just a paraphrase of it. Rendered LAST so it
+  -- is the scrollable tail of the float.
   for _, cl in ipairs(perm_input_lines(p.input)) do
     lines[#lines + 1] = "  ▎ " .. cl
     body_hl[#body_hl + 1] = { #lines - 1, "ClaudeCode" }
@@ -1898,31 +1951,32 @@ local function open_permission_float(p)
     lines[#lines + 1] = "  Patterns: " .. table.concat(p.rules, ", ")
     body_hl[#body_hl + 1] = { #lines - 1, "ClaudeDim" }
   end
-  lines[#lines + 1] = ""                                  -- spacer
-  lines[#lines + 1] = ""                                  -- button-row placeholder
-  p.row = #lines - 1                                      -- 0-indexed button row
-  lines[#lines + 1] = "  ←/→ select · ⏎ confirm · esc reject"
-  body_hl[#body_hl + 1] = { #lines - 1, "ClaudeDim" }
 
-  -- Geometry: full panel-column width minus borders, bottom-left of the column
-  -- (same column math as the chat float).
-  local panel_w = panel_width()
+  -- Geometry: full panel-column width minus borders, bottom-left of the column.
+  local panel_w   = panel_width()
+  local float_col = vim.o.columns - panel_w     -- fallback: assume rightmost column
   if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
     panel_w = vim.api.nvim_win_get_width(state.panel_win)
+    -- Anchor to the panel's REAL screen column, not (columns - panel_w). That math
+    -- only lands right when the panel is the rightmost window; with a split beside
+    -- it (or the panel on the left), it drifts the float into the neighbour. The
+    -- window's actual position keeps the card glued to the panel regardless of
+    -- layout or terminal width.
+    float_col = vim.api.nvim_win_get_position(state.panel_win)[2]
   end
-  local float_w   = math.max(panel_w - 2, 1)
-  local float_col = vim.o.columns - panel_w
+  local float_w = math.max(panel_w - 2, 1)
 
   -- Height must count WRAPPED display rows, not logical lines: with wrap on, a long
-  -- description (e.g. a Skill blurb) spans several screen rows, so a height of
-  -- #lines leaves the window too short and scrolls the button row off the bottom
-  -- (the "I can't see what I'm choosing" bug). Sum ceil(width/float_w) per line, and
-  -- cap so the card never grows taller than the editor minus a couple of rows.
+  -- description (e.g. a Skill blurb) spans several screen rows. Sum ceil(width/float_w)
+  -- per line, then cap at HALF the editor height: a giant command must not swallow
+  -- the screen — the chat above stays visible and the command scrolls (j/k) inside
+  -- the float. Buttons sit at the top (see line order) so they stay visible while
+  -- scrolling, killing the old "I can't see what I'm choosing" bug.
   local disp_rows = 0
   for _, l in ipairs(lines) do
     disp_rows = disp_rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / float_w))
   end
-  local float_h = math.min(disp_rows, math.max(vim.o.lines - 4, 1))
+  local float_h = math.min(disp_rows, math.max(math.floor(vim.o.lines / 2), 3))
 
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].bufhidden = "wipe"
@@ -3024,8 +3078,11 @@ local function dispatch_send(text)
   state.think_tokens = 0
   state.tool_run     = nil
   -- One flavour word per REQUEST, fixed for the whole turn (like the official
-  -- TUI) — picked here, NOT rotated mid-turn while thinking/working.
-  state.flavor_word  = FLAVOR[math.random(#FLAVOR)]
+  -- TUI) — picked here, NOT rotated mid-turn while thinking/working. Store the
+  -- INDEX (not just the word) so render_result's done line can reuse it and the
+  -- past-tense "✻ Proofed for 4m" rhymes with the live "Proofing…" the user saw.
+  state.flavor_idx   = math.random(#FLAVOR)
+  state.flavor_word  = FLAVOR[state.flavor_idx]
   start_spinner()
   -- One stream-json `user` message per turn, newline-terminated. The process
   -- reads it from stdin, streams events back, and waits for the next message.

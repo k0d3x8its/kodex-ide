@@ -534,6 +534,9 @@ H.check("T18 card armed (state.qask set, perm untouched)",
 H.check("T18 one question, index starts at 1",
   claude.state.qask and #claude.state.qask.questions == 1
     and claude.state.qask.qi == 1, vim.inspect(claude.state.qask and claude.state.qask.qi))
+-- Card reserves bottom padding so existing output is pushed ABOVE it (not covered).
+H.check("T18 card reserves bottom pad (pushes output up)",
+  claude.state.pad_rows >= 1, "pad_rows=" .. tostring(claude.state.pad_rows))
 
 -- Move down to option 2 (Spaces), select → allow with answers keyed by text.
 claude._move_question_choice(1)
@@ -549,6 +552,19 @@ H.check("T18 answers map keyed by question TEXT, value = chosen label",
   vim.inspect(rq and rq.response.response.updatedInput))
 H.check("T18 card cleared after submit (state.qask nil)",
   claude.state.qask == nil, vim.inspect(claude.state.qask))
+H.check("T18 bottom pad released after submit",
+  claude.state.pad_rows == 0, "pad_rows=" .. tostring(claude.state.pad_rows))
+
+-- reanchor_pad is the fold-toggle hook that re-pins the last line above a reserved
+-- pad when a thinking fold's height change moves it (the real lift needs a live
+-- screen, so only the no-pad no-op contract is headless-verifiable here).
+H.check("T18 _reanchor_pad exported", type(claude._reanchor_pad) == "function",
+  type(claude._reanchor_pad))
+claude.state.pad_rows = 0
+local ok_re = pcall(claude._reanchor_pad)
+H.check("T18 _reanchor_pad no-ops with no pad reserved",
+  ok_re and claude.state.pad_rows == 0,
+  "ok=" .. tostring(ok_re) .. " pad_rows=" .. tostring(claude.state.pad_rows))
 
 -- Multi-question: ALL arrive in one request; first select advances (no response),
 -- last select submits ONE response with every answer.

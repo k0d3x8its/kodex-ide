@@ -1202,11 +1202,21 @@ local function clear_bottom_pad()
   end
 end
 
+-- Re-pin the last content line to its resting position when a pad is reserved.
+-- Toggling a thinking fold inserts/removes display rows ABOVE the last line while
+-- the topline holds, so the line slides relative to the window bottom — on EXPAND
+-- it drops below its anchor and hides UNDER the question card / chat bar. Re-running
+-- set_bottom_pad re-anchors it to `pad_rows` above the bottom. No-op with no pad.
+local function reanchor_pad()
+  if (state.pad_rows or 0) > 0 then set_bottom_pad(state.pad_rows) end
+end
+
 -- Test seams: expose the pad/anchor internals so the headless spec can drive the
 -- exact push-up math (winh/line-count/topline) without an interactive float.
 mod._anchor_last_line = anchor_last_line
 mod._set_bottom_pad   = set_bottom_pad
 mod._clear_bottom_pad = clear_bottom_pad
+mod._reanchor_pad     = reanchor_pad
 
 -- ─── Queued-message display (type-ahead while Claude works) ───────────────────
 
@@ -1977,6 +1987,12 @@ local function render_question_card()
 
   -- SW anchor keeps the bottom edge pinned; only the top moves as height changes.
   pcall(vim.api.nvim_win_set_height, q.win, float_h)
+  -- Reserve the card's footprint as bottom padding so existing Claude output is
+  -- pushed ABOVE the card instead of being covered by it (same contract the chat
+  -- float uses). float_h interior + 2 rounded-border rows + 1 blank separator.
+  -- Re-set on every render so the pad tracks the card growing/shrinking as the
+  -- user steps between questions with different option counts.
+  set_bottom_pad(float_h + 3)
   local title = (#q.questions > 1)
     and (" ❓ Question " .. q.qi .. " of " .. #q.questions .. " ")
     or  " ❓ Question "
@@ -2035,6 +2051,9 @@ local function close_question_card(receipt, receipt_hl)
   if q.win and vim.api.nvim_win_is_valid(q.win) then
     pcall(vim.api.nvim_win_close, q.win, true)
   end
+  -- Drop the footprint pad the card reserved. If a dismissed chat bar is about to
+  -- reopen (qask_reopen_bar) it re-sets its own pad on open, so this clear is safe.
+  clear_bottom_pad()
   if receipt and state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf) then
     local recl = vim.api.nvim_buf_line_count(state.panel_buf)
     buf_append({ receipt })
@@ -2588,12 +2607,28 @@ local function set_panel_keymaps(buf)
     local line = vim.api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
     if line:match("^▼ Thinking") then
       pcall(vim.cmd, "normal! za")
+      -- A pad (question card / chat bar) may be reserved; expanding the fold pushes
+      -- the last line down under it. Re-anchor so existing output stays above.
+      reanchor_pad()
     end
   end, {
     buffer  = buf,
     noremap = true,
     silent  = true,
     desc    = "Claude: toggle thinking fold on click",
+  })
+
+  -- Keyboard fold toggle: same re-anchor as the mouse path. `normal! za` uses the
+  -- non-remapped default toggle (no recursion); reanchor_pad lifts the last line
+  -- back above any reserved pad when the fold's height change moved it.
+  vim.keymap.set("n", "za", function()
+    pcall(vim.cmd, "normal! za")
+    reanchor_pad()
+  end, {
+    buffer  = buf,
+    noremap = true,
+    silent  = true,
+    desc    = "Claude: toggle fold + re-anchor pad",
   })
 end
 
@@ -3070,23 +3105,28 @@ local function clamp_scroll()
     -- uses, hence the shared helper.)
     local gap = free_below(win, buf)
     if not gap then return end
-    -- The last line legitimately rests pad_rows above the bottom (the chat bar's
-    -- reserved space). Allow SCROLL_TAIL of extra over-scroll for breathing room;
-    -- beyond that the conversation is sliding off the top, so re-anchor it back.
-    local limit = (state.pad_rows or 0) + SCROLL_TAIL
-    if gap > limit then
-      -- Re-anchor to the limit BOUNDARY, not flush to the bottom. The old `Gzb`
-      -- snapped the gap to 0, so every over-scroll tick jumped the full `limit`
-      -- back — that big jump read as violent jitter. Pinning to exactly `limit`
-      -- (Gzb, then an <C-e> nudge — the same method as anchor_last_line) makes the
-      -- correction only the overshoot delta, so the view holds at the boundary
-      -- instead of bouncing between 0 and limit.
+    -- The last line legitimately rests in the band [floor, limit] above the bottom:
+    -- `floor` = pad_rows (the chat bar / question card's reserved space) is the
+    -- closest it may sit; `limit` adds SCROLL_TAIL of over-scroll breathing room.
+    -- gap > limit → sliding off the top (re-anchor down to limit). gap < floor →
+    -- the last line dropped UNDER the reserved pad — happens when a thinking fold
+    -- EXPANDS above it, inserting display rows while the topline holds — so lift it
+    -- back up to floor or the newest output hides behind the card. Inside the band:
+    -- leave it. Both corrections pin to a target via Gzb + an <C-e> nudge (the same
+    -- method as anchor_last_line); pinning to the exact boundary makes the
+    -- correction only the overshoot delta, so the view holds instead of bouncing.
+    local floor  = (state.pad_rows or 0)
+    local limit  = floor + SCROLL_TAIL
+    local target
+    if gap > limit then target = limit
+    elseif gap < floor then target = floor end
+    if target then
       local so = vim.wo[win].scrolloff
       vim.wo[win].scrolloff = 0
       vim.cmd("keepjumps normal! Gzb")
       local fb = free_below(win, buf)
-      if fb and fb < limit then
-        vim.cmd("keepjumps normal! " .. (limit - fb) .. "\005")  -- <C-e> ×(limit-fb)
+      if fb and fb < target then
+        vim.cmd("keepjumps normal! " .. (target - fb) .. "\005")  -- <C-e> ×(target-fb)
       end
       vim.wo[win].scrolloff = so
     end

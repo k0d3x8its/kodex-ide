@@ -53,7 +53,7 @@ end
 -- Panel winhighlight: background + end-of-buffer highlight, scoped to this window.
 -- NOTE: winhighlight cannot override Cursor/CursorNC (see :h winhighlight — those
 -- groups are explicitly excluded). Cursor hiding is done via guicursor WinEnter/WinLeave.
--- Folded:ClaudeLabel paints the collapsed "▶ Thinking" foldtext row in the same
+-- Folded:ClaudeLabel paints the collapsed "▶ Thought" foldtext row in the same
 -- bold purple as the expanded header, so the block reads consistently in either state.
 local PANEL_HL_BASE = "Normal:ClaudeNormal,NormalNC:ClaudeNormal,EndOfBuffer:ClaudeNormal,Folded:ClaudeLabel"
 
@@ -222,6 +222,16 @@ end
 -- Panel width in columns, recomputed on every open so the panel tracks
 -- terminal resizes rather than freezing at the width set at creation.
 local function panel_width()
+  -- Prefer the panel window's ACTUAL inner width once it exists. The percentage
+  -- (columns × width_pct) is only the open-time target; after place_vertical the
+  -- real window can be wider, and every padded surface (code blocks, separators,
+  -- cards) must fill to that real edge — not stop short at the stale percentage.
+  -- number/foldcolumn/signcolumn are forced off in open_panel_window, so the
+  -- window width equals the text width (no gutter to subtract).
+  local win = state.panel_win
+  if win and vim.api.nvim_win_is_valid(win) then
+    return vim.api.nvim_win_get_width(win)
+  end
   return math.floor(vim.o.columns * opts.width_pct)
 end
 
@@ -1251,23 +1261,109 @@ end
 local SPINNER = { "⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷" }
 local spin_i  = 1
 
+-- Human-readable duration: sub-minute reads "3.2s", longer "1m 04s". Used by the
+-- live spinner (turn elapsed), the thinking fold ("Thought · 3.2s"), and the
+-- "✻ Churned for …" done line. Defined here (above spinner_label) so the spinner
+-- timer can reach it — a later definition resolves to a nil global and errors.
+local function fmt_think_dur(ms)
+  local s = ms / 1000
+  if s < 60 then return string.format("%.1fs", s) end
+  return string.format("%dm %02ds", math.floor(s / 60), math.floor(s % 60))
+end
+
+-- Flavour words for the generic model-generation phase (the boring "Working…"),
+-- mirroring the official TUI's rotating verb. Gerund form for the live spinner;
+-- FLAVOR_DONE is the past-tense set for the "✻ Churned for 4m 31s" final line.
+-- Index-aligned so a turn's live word and its done word can rhyme, but the live
+-- rotation and the done pick are independent randoms — alignment isn't required.
+local FLAVOR = {
+  "Accomplishing", "Actioning", "Actualizing", "Baking", "Befuddling", "Boggling",
+  "Boondoggling", "Booping", "Brewing", "Calculating", "Cerebrating", "Channelling",
+  "Churning", "Clauding", "Coalescing", "Cogitating", "Combobulating", "Computing",
+  "Concocting", "Conjuring", "Considering", "Cooking", "Crafting", "Creating",
+  "Crunching", "Deliberating", "Determining", "Discombobulating", "Doing", "Doodling",
+  "Effecting", "Elucidating", "Enchanting", "Envisioning", "Finagling", "Forging",
+  "Forming", "Frolicking", "Galloping", "Generating", "Germinating", "Hatching",
+  "Herding", "Honking", "Hustling", "Hyperspacing", "Ideating", "Imagining",
+  "Incubating", "Inferring", "Jazzing", "Jiving", "Levitating", "Manifesting",
+  "Marinating", "Meandering", "Moseying", "Mulling", "Musing", "Mustering",
+  "Noodling", "Percolating", "Perusing", "Philosophising", "Pondering", "Pontificating",
+  "Processing", "Proofing", "Puttering", "Puzzling", "Reticulating", "Riffing",
+  "Ruminating", "Scheming", "Schlepping", "Shucking", "Simmering", "Smooshing",
+  "Spelunking", "Stewing", "Sussing", "Synthesizing", "Tinkering", "Transmuting",
+  "Twiddling", "Vibing", "Whirring", "Wibbling", "Wizarding", "Working", "Wrangling",
+}
+local FLAVOR_DONE = {
+  "Accomplished", "Actioned", "Actualized", "Baked", "Befuddled", "Boggled",
+  "Boondoggled", "Booped", "Brewed", "Calculated", "Cerebrated", "Channelled",
+  "Churned", "Clauded", "Coalesced", "Cogitated", "Combobulated", "Computed",
+  "Concocted", "Conjured", "Considered", "Cooked", "Crafted", "Created",
+  "Crunched", "Deliberated", "Determined", "Discombobulated", "Done", "Doodled",
+  "Effected", "Elucidated", "Enchanted", "Envisioned", "Finagled", "Forged",
+  "Formed", "Frolicked", "Galloped", "Generated", "Germinated", "Hatched",
+  "Herded", "Honked", "Hustled", "Hyperspaced", "Ideated", "Imagined",
+  "Incubated", "Inferred", "Jazzed", "Jived", "Levitated", "Manifested",
+  "Marinated", "Meandered", "Moseyed", "Mulled", "Mused", "Mustered",
+  "Noodled", "Percolated", "Perused", "Philosophised", "Pondered", "Pontificated",
+  "Processed", "Proofed", "Puttered", "Puzzled", "Reticulated", "Riffed",
+  "Ruminated", "Schemed", "Schlepped", "Shucked", "Simmered", "Smooshed",
+  "Spelunked", "Stewed", "Sussed", "Synthesized", "Tinkered", "Transmuted",
+  "Twiddled", "Vibed", "Whirred", "Wibbled", "Wizarded", "Worked", "Wrangled",
+}
+
+-- The spinner hint text — phase-aware so the user always sees WHAT Claude is
+-- doing, not a generic "Working…". The 110ms tick re-renders it, so the seconds
+-- climb in place. Priority (most specific first):
+--   * tool running  → "Running: tree …  5.2s"  (the gap between a tool_use and
+--     its tool_result: tool execution + Pre/PostToolUse hooks)
+--   * thinking       → "Thinking… 2.3s · 111 tok"  (live time + estimated tokens)
+--   * otherwise      → "Working…"  (model round-trip / "requesting")
+local function spinner_label()
+  local frame = SPINNER[spin_i]
+  -- One cumulative turn timer shown on EVERY phase (like the official TUI's
+  -- "42s"), so no phase — including the post-tool model round-trip — ever looks
+  -- frozen. turn_t0 is set once at dispatch and never re-baselined.
+  -- The per-request flavour word stays the PRIMARY verb the whole turn (set once
+  -- at dispatch); the phase (thinking / running a tool) goes in brackets to the
+  -- SIDE — "Proofing… [42s · ↓ 632 tokens · thinking]" (the official TUI uses
+  -- parens; we use []). The flavour word never gets taken over by "Thinking"/"Working".
+  local word    = state.flavor_word or "Working"
+  local elapsed = state.turn_t0 and fmt_think_dur(vim.loop.now() - state.turn_t0) or "0s"
+  local parts   = { elapsed }
+  if state.think_start then
+    if type(state.think_tokens) == "number" and state.think_tokens > 0 then
+      parts[#parts + 1] = string.format("↓ %d tokens", state.think_tokens)
+    end
+    parts[#parts + 1] = "thinking"
+  elseif state.tool_run then
+    parts[#parts + 1] = state.tool_run.label    -- e.g. "Running: tree -L 1"
+  end
+  return string.format("%s %s… [%s]  <Esc> to interrupt", frame, word, table.concat(parts, " · "))
+end
+
 local function stop_spinner()
   if state.spin_timer then
     vim.fn.timer_stop(state.spin_timer)
     state.spin_timer = nil
   end
+  -- Drop the live phase indicators so a "Thinking…"/"Running…" label can't outlive
+  -- the spinner (turn end / interrupt / reset all route through here). Safe because
+  -- start_spinner's own stop_spinner call only fires between turns, never mid-phase.
+  state.think_start = nil
+  state.think_idx   = nil
+  state.tool_run    = nil
 end
 
 local function start_spinner()
   stop_spinner()
   spin_i = 1
-  set_hint(SPINNER[spin_i] .. " Working…  <Esc> to interrupt", "ClaudeInput")
+  set_hint(spinner_label(), "ClaudeInput")
   render_queue()
   state.spin_timer = vim.fn.timer_start(110, function()
     if not state.working then stop_spinner(); return end
     if state.perm then return end   -- a permission card owns the hint; don't clobber
     spin_i = spin_i % #SPINNER + 1
-    set_hint(SPINNER[spin_i] .. " Working…  <Esc> to interrupt", "ClaudeInput")
+    set_hint(spinner_label(), "ClaudeInput")
     -- Re-anchor the queue to the (now lower) last line as output streams in.
     render_queue()
   end, { ["repeat"] = -1 })
@@ -1365,14 +1461,21 @@ local function render_user(text)
 end
 
 -- Foldtext for a collapsed thinking block. The buffer's first fold line is the
--- literal "▼ Thinking" header (only shown when expanded); when collapsed Neovim
--- shows THIS instead — a "▶ Thinking" row with the hidden body line count, so the
+-- literal "▼ Thought" header (only shown when expanded); when collapsed Neovim
+-- shows THIS instead — a "▶ Thought · <time>" row, so the
 -- arrow flips ▼→▶ to signal the closed state. Used for every panel fold, but only
 -- thinking blocks create folds. Exposed on mod so the window's foldtext expr
 -- (`v:lua.require('utils.claude')._foldtext()`) can reach it.
 function mod._foldtext()
+  -- A finished thinking block reads "▶ Thought · <time>"; the duration is keyed
+  -- by the fold's 1-indexed start line (== vim.v.foldstart). Fall back to the
+  -- body line count if no duration was recorded (e.g. a fold from older state).
+  local dur = state.folds and state.folds[vim.v.foldstart]
+  if dur then
+    return "▶ Thought  ·  " .. dur
+  end
   local n = vim.v.foldend - vim.v.foldstart           -- body lines (header excluded)
-  return "▶ Thinking  ·  " .. n .. (n == 1 and " line" or " lines")
+  return "▶ Thought  ·  " .. n .. (n == 1 and " line" or " lines")
 end
 
 -- Render a thinking block as a collapsible manual fold (FINDINGS.md Q3),
@@ -1392,9 +1495,11 @@ local function render_thinking(text)
   local buf = state.panel_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
 
-  -- fold header line
+  -- fold header line. The block only ever arrives COMPLETE (no streaming deltas),
+  -- so it's already "Thought", not in-progress "Thinking" — past tense from the
+  -- start. Shown only when the fold is expanded; collapsed shows mod._foldtext.
   local header_idx = vim.api.nvim_buf_line_count(buf)  -- 0-indexed insertion point
-  buf_append({ "▼ Thinking" })
+  buf_append({ "▼ Thought" })
   hl_lines(header_idx, header_idx, "ClaudeLabel")
 
   -- body: indent two spaces so it reads as a sub-block under the header
@@ -1417,6 +1522,19 @@ local function render_thinking(text)
       vim.cmd(fold_start .. "," .. fold_end .. "fold")  -- creates it CLOSED → auto-collapsed
     end)
   end
+
+  -- Stamp the fold with how long the model thought, so the collapsed foldtext
+  -- reads "Thought · 3.2s". Prefer the TRUE streamed duration (content_block
+  -- start→stop, captured in state.think_dur); fall back to the activity-gap
+  -- heuristic if partial messages didn't fire for this block.
+  local dur = state.think_dur
+  state.think_dur = nil
+  if not dur and state.activity_t0 then
+    dur = vim.loop.now() - state.activity_t0
+  end
+  if dur then
+    state.folds[fold_start] = fmt_think_dur(dur)
+  end
 end
 
 -- Render a tool_use block as a single-line "⚙ Verb: target" entry.
@@ -1433,15 +1551,35 @@ local function render_tool(name, input)
   buf_append({ line })
   hl_lines(first, first, "ClaudeTool")
   buf_append({ "" })   -- spinner gets its own line below
+
+  -- Mark the tool as RUNNING so the spinner shows live "Running: tree … 5.2s"
+  -- during the otherwise-blank gap until its tool_result arrives (the `user`
+  -- event clears this). "Wrote" reads wrong while in flight → present-tense it.
+  -- Short target so the live label fits one row.
+  local run_verb = (name == "Write") and "Writing" or verb
+  local short    = (vim.fn.strdisplaywidth(target) > 40)
+    and (vim.fn.strcharpart(target, 0, 39) .. "…") or target
+  state.tool_run = {
+    label = run_verb .. (short ~= "" and (": " .. short) or ""),
+    t0    = vim.loop.now(),
+  }
 end
 
--- Render the result event that closes a turn. The turn separator is drawn at
--- the TOP of the NEXT turn (by render_user), not here — so a response never
--- ends with a trailing divider. The result event's text duplicates the
--- assistant prose already rendered and may contain embedded newlines (which
--- nvim_buf_set_lines forbids in a single line — the old crash), so we render
--- nothing for it. Kept as a named no-op for the dispatch turn-close semantics.
-local function render_result(_text) end
+-- Render the result event that closes a turn. The result text itself duplicates
+-- the assistant prose already rendered (and may carry embedded newlines that
+-- nvim_buf_set_lines forbids), so it's NOT rendered. Instead we drop the official
+-- TUI's done line: "✻ Churned for 4m 31s" — a past-tense flavour word + total
+-- turn time, ClaudeDim so it reads as a footnote. The turn separator is drawn at
+-- the TOP of the NEXT turn (by render_user), so the response never ends on a rule.
+local function render_result(_text)
+  local buf = state.panel_buf
+  if not (state.turn_t0 and buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  local word = FLAVOR_DONE[math.random(#FLAVOR_DONE)]
+  local line = "  ✻ " .. word .. " for " .. fmt_think_dur(vim.loop.now() - state.turn_t0)
+  local l    = vim.api.nvim_buf_line_count(buf)
+  buf_append({ line })
+  hl_lines(l, l, "ClaudeDim")
+end
 
 -- Logo glyphs — must match ingest.py _show_banner (lines 580–582) exactly.
 -- Each block element is a 3-byte UTF-8 char; the byte lengths are hardcoded
@@ -1686,7 +1824,14 @@ local function resolve_permission(kind)
     hl_lines(recl, recl, kind == "deny" and "ClaudeDim" or "ClaudeQuestion")
   end
 
-  if state.working then start_spinner() else clear_hint() end
+  -- A blank line below the receipt so the resumed spinner anchors to its OWN line
+  -- (set_hint pins EOL virt_text to the last buffer line) instead of trailing the
+  -- "✓ Allowed …" receipt text on the same row. Re-baseline the thinking timer so
+  -- the user's decision time doesn't count toward the next block's "Thought · …".
+  if state.working then
+    state.activity_t0 = vim.loop.now()
+    buf_append({ "" }); start_spinner()
+  else clear_hint() end
 
   -- Reopen the chat bar we dismissed to show the card, so the user lands back in
   -- the input (draft restored) and can keep the conversation going. Scheduled so
@@ -2087,7 +2232,13 @@ local function close_question_card(receipt, receipt_hl)
     buf_append({ receipt })
     hl_lines(recl, recl, receipt_hl or "ClaudeQuestion")
   end
-  if state.working then start_spinner() else clear_hint() end
+  -- Blank line so the resumed spinner gets its own row, not the receipt's EOL
+  -- (same reason as resolve_permission — set_hint anchors to the last line).
+  -- Re-baseline the thinking timer past the user's answer time.
+  if state.working then
+    state.activity_t0 = vim.loop.now()
+    buf_append({ "" }); start_spinner()
+  else clear_hint() end
   if state.qask_reopen_bar then
     state.qask_reopen_bar = false
     vim.schedule(function() mod.prompt_input() end)
@@ -2467,6 +2618,42 @@ local function dispatch(event)
     state.system_ready = true
     -- working hint already set by send(); don't clobber it
 
+  elseif ev_type == "system" and event.subtype == "thinking_tokens" then
+    -- Live estimated-token count while the model thinks; the spinner appends it to
+    -- the "Thinking… Xs" label (e.g. "· 111 tok"). Type-guarded like session_cost.
+    if type(event.estimated_tokens) == "number" then
+      state.think_tokens = event.estimated_tokens
+    end
+
+  elseif ev_type == "stream_event" then
+    -- Incremental SSE (from --include-partial-messages). We act ONLY on the
+    -- thinking block's lifecycle to drive the live "Thinking… Xs" counter and to
+    -- measure the TRUE thinking duration (start→stop), which the fold then shows.
+    -- All other partial events (text/tool deltas) are ignored — the aggregated
+    -- `assistant` event below still does the real rendering.
+    local se = event.event or {}
+    local st = se.type or ""
+    if st == "content_block_start" and (se.content_block or {}).type == "thinking" then
+      state.think_start  = vim.loop.now()
+      state.think_idx    = se.index          -- which block index is the thinking one
+      state.think_tokens = 0                 -- reset the per-block live token count
+    elseif st == "content_block_stop" and state.think_start
+        and se.index == state.think_idx then
+      -- Thinking finished: freeze the duration for render_thinking to stamp on the
+      -- fold, and drop think_start so the spinner reverts to "Working…".
+      state.think_dur   = vim.loop.now() - state.think_start
+      state.think_start = nil
+      state.think_idx   = nil
+    end
+
+  elseif ev_type == "user" then
+    -- A user event arriving FROM the CLI carries tool_result content: the most
+    -- recent tool finished (execution + Pre/PostToolUse hooks done). Clear the
+    -- "Running…" indicator so the spinner reverts to "Working…" for the model
+    -- round-trip that follows. (Our own outgoing turns are written to stdin, never
+    -- echoed back through dispatch, so a user event here is always a tool_result.)
+    state.tool_run = nil
+
   elseif ev_type == "assistant" then
     -- assistant events carry a message with a content array. Each block is one
     -- of: text (prose), thinking (extended thinking), or tool_use.
@@ -2481,6 +2668,10 @@ local function dispatch(event)
         render_tool(block.name or "", block.input or {})
       end
       -- tool_result body rendering is deferred to v2 (TODOS.md backlog)
+
+      -- Re-baseline after every block so a thinking block that follows other
+      -- content times only the gap since the prior block, not the whole turn.
+      state.activity_t0 = vim.loop.now()
     end
 
   elseif ev_type == "result" then
@@ -2689,15 +2880,15 @@ local function set_panel_keymaps(buf)
     desc    = "Claude: interrupt current turn",
   })
 
-  -- Mouse: clicking a "Thinking" fold toggles it open/closed. <LeftRelease> fires
+  -- Mouse: clicking a "Thought" fold toggles it open/closed. <LeftRelease> fires
   -- AFTER the default <LeftMouse> has positioned the cursor, so the line under the
   -- cursor is the clicked row — and for a closed fold that row is its start line
-  -- (the literal "▼ Thinking" header), so the same match works in both states.
+  -- (the literal "▼ Thought" header), so the same match works in both states.
   -- Clicks elsewhere (prose, code, thinking body when expanded) fall through.
   vim.keymap.set("n", "<LeftRelease>", function()
     local lnum = vim.fn.line(".")
     local line = vim.api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
-    if line:match("^▼ Thinking") then
+    if line:match("^▼ Thought") then
       pcall(vim.cmd, "normal! za")
       -- A pad (question card / chat bar) may be reserved; expanding the fold pushes
       -- the last line down under it. Re-anchor so existing output stays above.
@@ -2755,6 +2946,11 @@ local function build_args()
     "--input-format",    "stream-json",
     "--output-format",   "stream-json",
     "--verbose",
+    -- Emit incremental stream_event records (Anthropic SSE: content_block_start/
+    -- delta/stop) ON TOP OF the aggregated assistant message. We use only the
+    -- thinking block's start/stop to drive a live "Thinking… 2.3s" counter; the
+    -- final assistant event still does the actual rendering, so this is additive.
+    "--include-partial-messages",
     "--permission-mode", state.permission_mode or "default",
     -- Hidden flag (not in --help, but accepted): the literal string "stdio". The
     -- SDK sets this internally when a canUseTool callback is registered. It makes
@@ -2822,6 +3018,14 @@ local function dispatch_send(text)
   end
   state.system_ready = false
   state.working      = true
+  state.turn_t0      = vim.loop.now()   -- cumulative turn timer (every spinner phase + churn line)
+  state.activity_t0  = vim.loop.now()   -- baseline for the first thinking block's timer
+  state.think_dur    = nil              -- no stale duration from a prior turn
+  state.think_tokens = 0
+  state.tool_run     = nil
+  -- One flavour word per REQUEST, fixed for the whole turn (like the official
+  -- TUI) — picked here, NOT rotated mid-turn while thinking/working.
+  state.flavor_word  = FLAVOR[math.random(#FLAVOR)]
   start_spinner()
   -- One stream-json `user` message per turn, newline-terminated. The process
   -- reads it from stdin, streams events back, and waits for the next message.
@@ -3159,11 +3363,11 @@ end
 
 -- ─── Over-scroll clamp ────────────────────────────────────────────────────────
 
--- How many blank rows the panel may scroll PAST the last content line. Enough to
--- read the tail of a response without the conversation sliding off the top of the
--- window (the user's complaint: free scroll ran content off-screen). In the 5–8
--- range they asked for.
-local SCROLL_TAIL = 6
+-- How many blank rows the panel may scroll PAST the last content line. Set to 1:
+-- the view stops one line past the last content row — no dead over-scroll band
+-- below the conversation. Scrolling UP to read history is unaffected (free_below
+-- returns nil when the last line is off the bottom, so the clamp doesn't fire).
+local SCROLL_TAIL = 1
 
 -- Re-entrancy guard: the re-anchor below re-fires WinScrolled. The guard plus the
 -- "only when over" test means the correction settles in one step (after the
@@ -3285,7 +3489,7 @@ local function open_panel_window(buf)
   -- Set it here, after the window is created and associated with the buffer,
   -- so render_thinking's nvim_win_call fold commands work correctly.
   vim.wo[win].foldmethod = "manual"
-  -- Custom foldtext so a collapsed thinking block reads as "▶ Thinking · N lines"
+  -- Custom foldtext so a collapsed thinking block reads as "▶ Thought · <time>"
   -- (see mod._foldtext) instead of Vim's default "+-- N lines:" line.
   vim.wo[win].foldtext = "v:lua.require('utils.claude')._foldtext()"
 
@@ -3301,7 +3505,7 @@ local function open_panel_window(buf)
   -- Hide end-of-buffer "~" filler lines. The panel is an output surface; the
   -- tildes below the content add visual noise and imply empty-file semantics.
   -- eob: blank the ~ end-of-buffer markers; fold: blank the trailing fill dashes
-  -- after the foldtext so a collapsed "▶ Thinking" row reads clean to the edge.
+  -- after the foldtext so a collapsed "▶ Thought" row reads clean to the edge.
   vim.wo[win].fillchars = "eob: ,fold: "
 
   -- Disable cursorline in the panel. It's a read-only output surface, and the
@@ -3314,6 +3518,12 @@ local function open_panel_window(buf)
   -- editable file. Disable both absolute and relative numbers in this window.
   vim.wo[win].number         = false
   vim.wo[win].relativenumber = false
+  -- No gutters: panel_width() uses nvim_win_get_width as the text width, so any
+  -- reserved fold/sign column would make padded surfaces (code blocks, cards)
+  -- overshoot by the gutter width and soft-wrap. Thinking folds are toggled via
+  -- the clickable foldtext row + `za`, not the foldcolumn markers, so 0 is safe.
+  vim.wo[win].foldcolumn = "0"
+  vim.wo[win].signcolumn = "no"
 
   -- smoothscroll: scroll by SCREEN rows, so the chat-bar push-up (anchor_last_line)
   -- and clamp can lift a partially-wrapped line precisely instead of snapping to

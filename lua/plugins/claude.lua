@@ -46,6 +46,12 @@ return {
       vim.api.nvim_set_hl(0, "ClaudeThink",   { fg = "#C084FC" })
       vim.api.nvim_set_hl(0, "ClaudeLabel",   { fg = "#C084FC", bold = true })
       vim.api.nvim_set_hl(0, "ClaudeTool",    { fg = "#C084FC" })
+      -- Per-verb tool-line colours so the action reads at a glance instead of
+      -- blending into the purple thinking/fold lines. Reading (passive inspect)
+      -- in cyan, Running (active execute) in green; other verbs fall back to the
+      -- purple ClaudeTool. Resolved by render_tool via TOOL_HL.
+      vim.api.nvim_set_hl(0, "ClaudeToolRead", { fg = "#56B6C2" })
+      vim.api.nvim_set_hl(0, "ClaudeToolRun",  { fg = "#D19A66" })
 
       -- Inline markdown: code spans (`...`) in Dracula cyan, bold (**...**) in
       -- white-bold so they pop against the orange ClaudeProse base. Applied by

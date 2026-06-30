@@ -1852,6 +1852,7 @@ local function resolve_permission(kind)
   -- Clear state BEFORE closing so the float's WinClosed guard no-ops (it only
   -- fires a fallback deny when the window vanishes with state.perm still set).
   state.perm = nil
+  if p.resize_close then pcall(p.resize_close) end   -- drop the resize-track augroup
   if p.win and vim.api.nvim_win_is_valid(p.win) then
     pcall(vim.api.nvim_win_close, p.win, true)
   end
@@ -1918,6 +1919,61 @@ local function perm_input_lines(input)
   return out
 end
 
+-- ─── Shared SW-anchored panel-float helpers ──────────────────────────────────
+-- The permission card, question card, and chat bar are all bordered floats anchored
+-- bottom-left to the Claude panel's column. They must behave IDENTICALLY on three
+-- axes, so each routes through these helpers instead of re-deriving the math:
+--   (a) glue to the panel's REAL screen column regardless of window layout,
+--   (b) never over-scroll their content into empty space, and
+--   (c) track the panel's width/column when the terminal or windows resize.
+
+-- Col + inner width for an SW float spanning the panel column. Anchors to the panel
+-- window's actual screen position; (columns - panel_w) only lands right when the
+-- panel is the RIGHTMOST window — with a split beside it (or the panel on the left)
+-- that math drifts the float into the neighbour. Falls back to the subtraction only
+-- when the panel window isn't available.
+local function panel_float_geom()
+  local panel_w   = panel_width()
+  local float_col = vim.o.columns - panel_w
+  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+    panel_w   = vim.api.nvim_win_get_width(state.panel_win)
+    float_col = vim.api.nvim_win_get_position(state.panel_win)[2]
+  end
+  return float_col, math.max(panel_w - 2, 1)
+end
+
+-- Stop a float from scrolling its content off into blank space. A non-zero global
+-- 'scrolloff' leaks into floats: at the last line vim keeps `scrolloff` rows below
+-- the cursor, but there are none, so it over-scrolls the tail upward past EOF (the
+-- permission card's command-tail over-shoot). Zero it (plus sidescrolloff) per-window
+-- so j/k stop with the last line resting at the bottom.
+local function harden_float_scroll(win)
+  vim.wo[win].scrolloff     = 0
+  vim.wo[win].sidescrolloff = 0
+end
+
+-- Track the panel column/width on resize for an SW float. The fixed-width panel's
+-- left edge shifts as the editor grows, so a float fixed at open-time col/width
+-- drifts out of the column and clips. Recomputes col/row/width every resize; the
+-- optional on_resize(win, col, width) lets the caller re-fit height / re-render to
+-- the new width AFTER the reposition. The augroup self-removes when the window dies
+-- (autocmd returns true); also returns a teardown fn for explicit close.
+local function attach_panel_float_resize(win, group_name, on_resize)
+  vim.api.nvim_create_augroup(group_name, { clear = true })
+  vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
+    group = group_name,
+    callback = function()
+      if not vim.api.nvim_win_is_valid(win) then return true end  -- gone → self-remove
+      local col, w = panel_float_geom()
+      local c = vim.api.nvim_win_get_config(win)
+      c.col, c.row, c.width = col, vim.o.lines - 2, w
+      pcall(vim.api.nvim_win_set_config, win, c)
+      if on_resize then on_resize(win, col, w) end
+    end,
+  })
+  return function() pcall(vim.api.nvim_del_augroup_by_name, group_name) end
+end
+
 -- Build + open the focused, bordered permission float and bind its keymaps. The
 -- buffer is dedicated and wiped on close, so the keymaps need no teardown.
 local function open_permission_float(p)
@@ -1952,31 +2008,25 @@ local function open_permission_float(p)
     body_hl[#body_hl + 1] = { #lines - 1, "ClaudeDim" }
   end
 
-  -- Geometry: full panel-column width minus borders, bottom-left of the column.
-  local panel_w   = panel_width()
-  local float_col = vim.o.columns - panel_w     -- fallback: assume rightmost column
-  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
-    panel_w = vim.api.nvim_win_get_width(state.panel_win)
-    -- Anchor to the panel's REAL screen column, not (columns - panel_w). That math
-    -- only lands right when the panel is the rightmost window; with a split beside
-    -- it (or the panel on the left), it drifts the float into the neighbour. The
-    -- window's actual position keeps the card glued to the panel regardless of
-    -- layout or terminal width.
-    float_col = vim.api.nvim_win_get_position(state.panel_win)[2]
-  end
-  local float_w = math.max(panel_w - 2, 1)
+  -- Geometry: full panel-column width minus borders, anchored to the panel's real
+  -- screen column (shared helper — same anchoring the question/chat floats use).
+  local float_col, float_w = panel_float_geom()
 
   -- Height must count WRAPPED display rows, not logical lines: with wrap on, a long
   -- description (e.g. a Skill blurb) spans several screen rows. Sum ceil(width/float_w)
   -- per line, then cap at HALF the editor height: a giant command must not swallow
   -- the screen — the chat above stays visible and the command scrolls (j/k) inside
   -- the float. Buttons sit at the top (see line order) so they stay visible while
-  -- scrolling, killing the old "I can't see what I'm choosing" bug.
-  local disp_rows = 0
-  for _, l in ipairs(lines) do
-    disp_rows = disp_rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / float_w))
+  -- scrolling, killing the old "I can't see what I'm choosing" bug. Factored into a
+  -- closure so the resize handler can re-fit when the panel width changes.
+  local function perm_height(w)
+    local disp_rows = 0
+    for _, l in ipairs(lines) do
+      disp_rows = disp_rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / w))
+    end
+    return math.min(disp_rows, math.max(math.floor(vim.o.lines / 2), 3))
   end
-  local float_h = math.min(disp_rows, math.max(math.floor(vim.o.lines / 2), 3))
+  local float_h = perm_height(float_w)
 
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].bufhidden = "wipe"
@@ -2006,6 +2056,11 @@ local function open_permission_float(p)
   vim.wo[win].linebreak   = true   -- wrap at word boundaries, not mid-word
   vim.wo[win].breakindent = true   -- align wrapped continuation under the line's indent
   vim.wo[win].cursorline  = false
+  harden_float_scroll(win)         -- BUG A: no over-scroll past the command tail
+  -- BUG B: track the panel column/width on resize, re-fitting the wrapped height.
+  p.resize_close = attach_panel_float_resize(win, "ClaudePermFloat", function(_, _, w)
+    pcall(vim.api.nvim_win_set_height, win, perm_height(w))
+  end)
 
   for _, h in ipairs(body_hl) do
     -- Base group over the whole line, then layer path/dir colours on top so the
@@ -2194,14 +2249,11 @@ local function render_question_card()
     or  ("  ↑/↓ move" .. nav .. " · ⏎ select · esc cancel")
   hl[#hl + 1] = { #lines - 1, "ClaudeDim" }
 
-  -- Geometry: full panel-column width, bottom-left of the column (same math as the
-  -- permission/chat floats). Width is fixed at open; height tracks wrapped rows so
-  -- a question that grows/shrinks the option list never clips the hint.
-  local panel_w = panel_width()
-  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
-    panel_w = vim.api.nvim_win_get_width(state.panel_win)
-  end
-  local float_w = math.max(panel_w - 2, 1)
+  -- Geometry: full panel-column width (shared helper — same anchoring the
+  -- permission/chat floats use). Height tracks wrapped rows so a question that
+  -- grows/shrinks the option list never clips the hint. col/width are repositioned
+  -- by the resize handler; here we only need the width for the wrap math.
+  local _, float_w = panel_float_geom()
   local disp_rows = 0
   for _, l in ipairs(lines) do
     disp_rows = disp_rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / float_w))
@@ -2275,6 +2327,7 @@ local function close_question_card(receipt, receipt_hl)
   local q = state.qask
   if not q then return end
   state.qask = nil                                   -- before close → WinClosed no-ops
+  if q.resize_close then pcall(q.resize_close) end   -- drop the resize-track augroup
   if q.win and vim.api.nvim_win_is_valid(q.win) then
     pcall(vim.api.nvim_win_close, q.win, true)
   end
@@ -2533,12 +2586,9 @@ mod._select_question_choice = select_question_choice
 -- bar, since this is a normal interaction, not a warning) and bind its keymaps.
 -- render_question_card fills the body + sizes the height for the first question.
 local function open_question_float(q)
-  local panel_w = panel_width()
-  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
-    panel_w = vim.api.nvim_win_get_width(state.panel_win)
-  end
-  local float_w   = math.max(panel_w - 2, 1)
-  local float_col = vim.o.columns - panel_w
+  -- Shared geometry: anchors to the panel's real screen column (fixes the drift the
+  -- permission float already fixed — this path was still using columns-panel_w).
+  local float_col, float_w = panel_float_geom()
 
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].bufhidden = "wipe"
@@ -2565,6 +2615,11 @@ local function open_question_float(q)
   vim.wo[win].linebreak   = true
   vim.wo[win].breakindent = true
   vim.wo[win].cursorline  = false
+  harden_float_scroll(win)         -- BUG A: no over-scroll past the option list
+  -- BUG B: track the panel column/width on resize; re-render to re-fit height+pad.
+  q.resize_close = attach_panel_float_resize(win, "ClaudeQaskFloat", function()
+    render_question_card()
+  end)
 
   local function map(k, fn)
     vim.keymap.set("n", k, fn, { buffer = buf, nowait = true, silent = true })
@@ -3158,13 +3213,9 @@ local function open_chat_float(title, callback, opts)
   -- the (already-sent) text as a draft.
   local submitted = false
   -- Span the full panel width: left edge flush with the panel, width = panel minus
-  -- the two border chars.
-  local panel_w   = panel_width()
-  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
-    panel_w = vim.api.nvim_win_get_width(state.panel_win)
-  end
-  local float_col = vim.o.columns - panel_w
-  local float_w   = math.max(panel_w - 2, 1)   -- -2 for left+right border chars
+  -- the two border chars. Shared geometry helper (anchors to the panel's real
+  -- screen column — same as the permission/question floats).
+  local float_col, float_w = panel_float_geom()
 
   local ibuf = vim.api.nvim_create_buf(false, true)
   vim.bo[ibuf].buftype   = "prompt"   -- <CR> fires prompt_setcallback; no manual map needed
@@ -3222,6 +3273,7 @@ local function open_chat_float(title, callback, opts)
   -- horizontally off-screen. linebreak wraps at word boundaries.
   vim.wo[win].wrap      = true
   vim.wo[win].linebreak = true
+  harden_float_scroll(win)   -- uniform with the permission/question floats (no over-scroll)
 
   -- Size the box to enclose the input rows PLUS the meter row, and reserve that
   -- footprint as panel bottom padding so the newest output rides just above the
@@ -3271,26 +3323,13 @@ local function open_chat_float(title, callback, opts)
 
   -- Keep the bar pinned to the Claude column + bottom when the terminal/window is
   -- resized (the fixed-width panel's left edge shifts as the editor grows, so a
-  -- float fixed at open-time col drifts out of the column). Recompute col/row/width
-  -- and re-fit the meters to the new width.
-  local resize_grp = vim.api.nvim_create_augroup("ClaudeChatFloat", { clear = true })
-  vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
-    group = resize_grp,
-    callback = function()
-      if not vim.api.nvim_win_is_valid(win) then return true end  -- bar gone → self-remove
-      local pw = panel_width()
-      if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
-        pw = vim.api.nvim_win_get_width(state.panel_win)
-      end
-      float_w = math.max(pw - 2, 1)
-      local c = vim.api.nvim_win_get_config(win)
-      c.col   = vim.o.columns - pw
-      c.row   = vim.o.lines - 2
-      c.width = float_w
-      pcall(vim.api.nvim_win_set_config, win, c)
-      apply_layout()   -- re-fit meters to the new width + resize height
-    end,
-  })
+  -- float fixed at open-time col drifts out of the column). Shared resize helper
+  -- repositions col/row/width; the callback re-fits the meters + height to the new
+  -- width. close() tears the augroup down by name ("ClaudeChatFloat").
+  attach_panel_float_resize(win, "ClaudeChatFloat", function(_, _, w)
+    float_w = w        -- render_meters / fit_height_now wrap to this width
+    apply_layout()     -- re-fit meters to the new width + resize height
+  end)
 
   -- "❯ " prompt arrow (U+276F — not a keyboard char), highlighted terminal-green
   -- via a window-local match so it reads like a shell prompt. The arrow is

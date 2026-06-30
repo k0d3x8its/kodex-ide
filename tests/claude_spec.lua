@@ -248,19 +248,19 @@ H.check("T8 tool line appended",
 H.check("T8 tool verb and target in buffer",
   panel_text():match("Reading.*claude%.lua") ~= nil, panel_text())
 
--- ── T9: result event → no trailing separator + working cleared ───────────────
--- The turn separator is drawn at the TOP of the NEXT turn (by render_user), not
--- after the result — a response never ends with a trailing divider. The result
--- text is also NOT echoed (it duplicates the prose and can contain newlines that
--- crash nvim_buf_set_lines).
+-- ── T9: result event → churn done-line + no trailing separator + working clear ─
+-- The result text is NOT echoed (it duplicates the prose and can contain newlines
+-- that crash nvim_buf_set_lines). Instead a "✻ <word> for <time>" done line is
+-- appended (the official TUI's done state). The turn separator is drawn at the TOP
+-- of the NEXT turn (by render_user), never trailing the response.
 
 claude.state.working = true
 lines_before = vim.api.nvim_buf_line_count(claude.state.panel_buf)
 feed({ type = "result", result = "Done." })
-H.check("T9 result appends nothing (no trailing separator)",
-  vim.api.nvim_buf_line_count(claude.state.panel_buf) == lines_before, panel_text())
+H.check("T9 result appends the '✻ … for <time>' churn done-line",
+  panel_text():match("✻ %a+ for ") ~= nil, panel_text())
 H.check("T9 result text NOT echoed (no duplicate, no crash)",
-  panel_text():match("%[result%]") == nil, panel_text())
+  panel_text():match("Done%.") == nil, panel_text())
 H.check("T9 working cleared on result", claude.state.working == false)
 -- The earlier turns (T4/T5 sends) each placed a separator above their ❯ echo.
 -- panel_text() joins buffer lines with "|", so an all-dash line immediately

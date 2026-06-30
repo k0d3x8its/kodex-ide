@@ -708,10 +708,10 @@ H.check("T19 'Chat about this' deny message carries the canned clarify text + su
     and fb6:find("Questions asked:", 1, true)
     and fb6:find('"Bail?"', 1, true), vim.inspect(fb6))
 
--- "Type something" opens an input; the typed text becomes the answer value
--- (raw string, label-match bypassed). Stub vim.ui.input to feed text synchronously.
-local saved_ui_input = vim.ui.input
-vim.ui.input = function(_, cb) cb("frobnicate the widget") end
+-- "Type something" routes to the custom input (now a dedicated focused float, not
+-- vim.ui.input — the old backend drew behind the card). Selecting the row opens the
+-- input WITHOUT submitting; the float's <CR> handler then calls _set_question_custom
+-- with the typed text, which records it raw (label-match bypassed) + submits.
 feed({
   type       = "control_request",
   request_id = "req-ask-7",
@@ -726,8 +726,10 @@ feed({
 })
 claude._move_question_choice(1)   -- 2 (y)
 claude._move_question_choice(1)   -- 3 (Type something)
-claude._select_question_choice()  -- opens input → stub returns text → records + submits
-vim.ui.input = saved_ui_input
+claude._select_question_choice()  -- opens the input float; nothing submitted yet
+H.check("T19 'Type something' opens input without submitting",
+  claude.state.qask ~= nil, vim.inspect(claude.state.qask))
+claude._set_question_custom("frobnicate the widget")  -- float <CR> commit path
 local rq7 = last_control_response()
 H.check("T19 'Type something' sends the typed text as the answer value",
   rq7 and rq7.response.request_id == "req-ask-7"

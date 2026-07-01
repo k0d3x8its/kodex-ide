@@ -92,12 +92,12 @@ claude._send("hello")
 vim.wait(30)
 H.check("S0 stdout callback captured after first send", captured_stdout_cb ~= nil)
 -- Before any content block, the model is computing — the dead band must NOT read
--- as frozen. The animated in-body placeholder line carries the "typing" word (a
--- REAL buffer line, so it shows up in nvim_buf_get_lines; the bottom spinner hint
--- is virt_text and does NOT). The spinner bracket omits "typing" while the
--- placeholder owns it, so the word appears exactly once, in the body.
-H.check("S0 working compute gap paints the in-body 'typing' placeholder",
-  panel_text():find("typing", 1, true) ~= nil, panel_text())
+-- as frozen. The animated in-body activity line carries the phase WORD "Typing"
+-- (a REAL buffer line, so it shows up in nvim_buf_get_lines; the eol randomizer is
+-- virt_text and does NOT). The phase word appears exactly once — here in the body,
+-- never duplicated in the randomizer bracket.
+H.check("S0 working compute gap paints the in-body 'Typing' activity line",
+  panel_text():find("Typing", 1, true) ~= nil, panel_text())
 
 -- ── S1: text deltas DO NOT paint into the buffer ───────────────────────────────
 -- The raw text must NOT spit into the panel as it streams; the styled block
@@ -116,8 +116,8 @@ block_delta(0, "Second paragraph line.")
 H.check("S1 deltas do NOT paint raw text into the buffer", line_count() == before,
   "before=" .. before .. " after_deltas=" .. line_count())
 H.check("S1 no raw delta text present", panel_text():find("Second paragraph line.", 1, true) == nil)
-H.check("S1 in-body typing placeholder persists while text streams",
-  panel_text():find("typing", 1, true) ~= nil, panel_text())
+H.check("S1 in-body 'Typing' activity line persists while text streams",
+  panel_text():find("Typing", 1, true) ~= nil, panel_text())
 block_stop(0)
 
 -- ── S2: aggregated event renders the styled block once ─────────────────────────
@@ -138,43 +138,66 @@ H.check("S3 block still renders without any streaming",
   line_count() > s3_before
     and panel_text():find("Aggregated%-only answer with no deltas%.") ~= nil)
 
--- ── S4: thinking / tool phases still take priority over the typing default ─────
+-- ── S4: the randomizer bracket carries NO phase word (timing + tokens only) ────
+-- The phase moved OUT of the bracket onto the activity line / cornered block. The
+-- bracket keeps the climbing timer and, during thinking, the token count — but
+-- never the words "thinking" / "typing" / a tool label. The activity WORD tracks
+-- the phase (Thinking during a think block, else Typing).
 
-claude.state.think_start = vim.loop.now()
-claude.state.think_idx   = 0
-H.check("S4 thinking phase overrides the typing default",
-  (claude._spinner_label() or ""):find("thinking", 1, true) ~= nil,
-  claude._spinner_label())
-claude.state.think_start = nil
-claude.state.tool_run = { label = "Running: tree -L 1" }
-H.check("S4 tool phase overrides the typing default",
-  (claude._spinner_label() or ""):find("Running: tree", 1, true) ~= nil,
-  claude._spinner_label())
-claude.state.tool_run = nil
+claude.state.think_start  = vim.loop.now()
+claude.state.think_tokens = 111
+local lbl = claude._spinner_label() or ""
+H.check("S4 bracket shows the token count during thinking", lbl:find("111", 1, true) ~= nil, lbl)
+H.check("S4 bracket carries no phase word",
+  not lbl:find("thinking", 1, true) and not lbl:find("Typing", 1, true)
+    and not lbl:find("typing", 1, true), lbl)
+H.check("S4 activity word reflects the thinking phase",
+  claude._activity_word() == "Thinking", claude._activity_word())
+claude.state.think_start  = nil
+claude.state.think_tokens = 0
+H.check("S4 activity word is 'Typing' outside thinking/tool",
+  claude._activity_word() == "Typing", claude._activity_word())
 
--- ── S5: in-body "typing" placeholder lifecycle ────────────────────────────────
+-- ── S5: in-body activity-line lifecycle ───────────────────────────────────────
 -- A REAL animated line (unlike the virt_text hint) paints during the compute gap,
 -- is REPLACED by the styled block when content lands, and is cleared for good at
 -- the turn's `result`. _send paints it synchronously; the assistant/result events
 -- are scheduled (on_stdout defers via vim.schedule), so feed() waits for dispatch.
 claude.state.think_start = nil
 claude.state.tool_run    = nil
-claude._send("second question")     -- start_spinner paints the placeholder synchronously
-H.check("S5 placeholder painted in body during the compute gap",
-  panel_text():find("typing", 1, true) ~= nil, panel_text())
+claude._send("second question")     -- start_spinner paints the activity line synchronously
+H.check("S5 activity line painted in body during the compute gap",
+  panel_text():find("Typing", 1, true) ~= nil, panel_text())
 
 aggregated_text("A styled answer.")
--- The styled block landed; the tick may re-add the placeholder BELOW it for the
+-- The styled block landed; the tick may re-add the activity line BELOW it for the
 -- next dead band (correct), so we only assert the block is present here.
 H.check("S5 styled block lands from the aggregated event",
   panel_text():find("A styled answer%.") ~= nil, panel_text())
 
--- result ends the turn: stop_spinner clears the placeholder and stops the tick, so
--- no "typing" line survives once the model is idle.
+-- result ends the turn: stop_spinner clears the activity line and stops the tick,
+-- so no "Typing" line survives once the model is idle.
 feed({ type = "result", result = "ok", total_cost_usd = 0.02 })
-H.check("S5 result leaves no placeholder behind",
-  panel_text():find("typing", 1, true) == nil, panel_text())
+H.check("S5 result leaves no activity line behind",
+  panel_text():find("Typing", 1, true) == nil, panel_text())
 H.check("S5 styled block survives the turn end, single copy",
   count_occurrences(panel_text(), "A styled answer.") == 1, panel_text())
+
+-- ── S6: cornered ●/└ tool block (gerund header + change summary) ───────────────
+-- An Edit tool_use renders "● Editing <file>" + "  └ Added N lines, removed M".
+-- Devicons are absent in headless nvim (no plugin), so file_glyph() returns "" —
+-- assert on the text. old "a\nb" → new "a\nB\nc\nd" = added 3, removed 1.
+claude.state.think_start = nil
+claude.state.tool_run    = nil
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", name = "Edit", input = {
+    file_path  = "/tmp/foo.lua",
+    old_string = "a\nb",
+    new_string = "a\nB\nc\nd",
+  } } } } })
+H.check("S6 cornered tool header rendered",
+  panel_text():find("● Editing", 1, true) ~= nil, panel_text())
+H.check("S6 cornered detail is the change summary",
+  panel_text():find("└ Added 3 lines, removed 1 line", 1, true) ~= nil, panel_text())
 
 H.summary("claude_stream")

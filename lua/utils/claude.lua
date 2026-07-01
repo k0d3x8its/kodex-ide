@@ -1661,7 +1661,11 @@ local function render_thinking(text)
   -- set the manual fold over header + body; Vim fold ranges are 1-indexed
   local fold_start = header_idx + 1
   local fold_end   = vim.api.nvim_buf_line_count(buf)
-  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+  -- Guard on panel_win ALSO showing panel_buf (matches sites at 396/1234/1248):
+  -- if a diff transiently swapped the panel window's buffer, folding line
+  -- fold_start..fold_end there runs against a shorter buffer → E16: Invalid range.
+  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)
+      and vim.api.nvim_win_get_buf(state.panel_win) == buf then
     vim.api.nvim_win_call(state.panel_win, function()
       vim.cmd(fold_start .. "," .. fold_end .. "fold")  -- creates it CLOSED → auto-collapsed
     end)
@@ -2963,6 +2967,19 @@ local function dispatch(event)
     -- round-trip that follows. (Our own outgoing turns are written to stdin, never
     -- echoed back through dispatch, so a user event here is always a tool_result.)
     state.tool_run = nil
+    -- MG 14.2 RC1: a tool_result means the CLI finished executing — including any
+    -- Edit/Write that just hit disk. The FileChangedShell interceptor only detects
+    -- that write when something polls checktime, but its poll autocmds
+    -- (TermLeave/WinEnter/CursorHold) never fire while the user sits in the Claude
+    -- terminal panel. Poll here, right after execution, so an edit to an
+    -- unopened/already-open file raises its diff without a manual window switch.
+    -- Scheduled: checktime + its FileChangedShell must run outside this stdout
+    -- dispatch (window ops forbidden inside FileChangedShell; see claude_diff.lua).
+    -- poll() = checktime_all (writes to loaded buffers) + sweep_new (files Claude
+    -- just CREATED, which have no buffer for checktime to see).
+    vim.schedule(function()
+      require("utils.claude_diff").poll()
+    end)
 
   elseif ev_type == "assistant" then
     -- assistant events carry a message with a content array. Each block is one

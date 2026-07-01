@@ -299,4 +299,65 @@ H.check("T16 CORRECTION #2 — diff opens (implies fcs_choice was '' not 'ignore
 D2.reject_all()
 vim.wait(200, function() return D2.state.current == nil end)
 
+-- ─────────────────────────── T17: NEW file (Claude-created) → whole-file diff
+
+-- watch() on a not-yet-existing file must NOT bufadd/bufload it (that BF_NEW
+-- buffer is what raised the W13 wall). It records the path pending; once Claude
+-- creates it, poll()→sweep_new promotes it to a whole-file-additions diff.
+D2.state.current   = nil
+D2.state.scratch   = nil
+D2.state.orig_buf  = nil
+D2.state.pending_new = {}
+D2.state.new_files   = {}
+claude.state.diff_queue   = {}
+claude.state.diff_pending = false
+claude.state.claude_active = true
+
+local newf   = ws .. "/created.txt"
+local absnew = vim.fn.fnamemodify(newf, ":p")
+vim.fn.delete(newf)
+D2.watch(newf)  -- file absent → pending, no buffer created (would W13 on create)
+H.check("T17 watch records pending-new, creates NO buffer",
+  D2.state.pending_new[absnew] == true and vim.fn.bufnr(newf) == -1,
+  "pending=" .. tostring(D2.state.pending_new[absnew]) ..
+    " bufnr=" .. vim.fn.bufnr(newf))
+
+vim.fn.writefile({ "new1", "new2", "new3" }, newf)  -- Claude creates it
+D2.poll()  -- checktime_all + sweep_new + process_next
+vim.wait(300, function() return D2.state.current ~= nil end)
+H.check("T17 new-file diff opened", D2.state.current == absnew,
+  "current=" .. tostring(D2.state.current))
+H.check("T17 kind == new", D2.state.kind == "new", "kind=" .. tostring(D2.state.kind))
+H.check("T17 orig side EMPTY (whole file = additions)",
+  H.buf_lines(D2.state.orig_buf) == "", "orig=[" .. H.buf_lines(D2.state.orig_buf) .. "]")
+H.check("T17 proposed shows created content",
+  H.buf_lines(D2.state.scratch) == "new1|new2|new3", H.buf_lines(D2.state.scratch))
+
+-- reject of a NEW file DELETES it (must not leave a stray empty file)
+D2.reject_all()
+vim.wait(200, function() return D2.state.current == nil end)
+H.check("T17 reject deletes the new file from disk",
+  vim.fn.filereadable(newf) == 0 and has_log("^reject%-new%-deleted:"),
+  "readable=" .. vim.fn.filereadable(newf))
+H.check("T17 new_files cleared after resolve", next(D2.state.new_files) == nil)
+
+-- ─────────────────────────── T18: NEW file accept → file KEPT with content
+
+D2.state.pending_new = {}
+D2.state.new_files   = {}
+D2.state.current     = nil
+claude.state.diff_queue = {}
+local newf2 = ws .. "/created2.txt"
+vim.fn.delete(newf2)
+D2.watch(newf2)
+vim.fn.writefile({ "keep1", "keep2" }, newf2)
+D2.poll()
+vim.wait(300, function() return D2.state.current ~= nil end)
+D2.accept_all()
+vim.wait(200, function() return D2.state.current == nil end)
+H.check("T18 new-file accept keeps file with proposed content",
+  vim.fn.filereadable(newf2) == 1
+    and table.concat(vim.fn.readfile(newf2), "|") == "keep1|keep2",
+  "content=" .. table.concat(vim.fn.readfile(newf2), "|"))
+
 H.summary("claude_diff")

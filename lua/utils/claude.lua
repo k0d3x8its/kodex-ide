@@ -1365,6 +1365,12 @@ local function spinner_label()
   local word    = state.flavor_word or "Working"
   local elapsed = state.turn_t0 and fmt_think_dur(vim.loop.now() - state.turn_t0) or "0s"
   local parts   = { elapsed }
+  -- The bracket ALWAYS carries a phase word — the model's compute dead bands
+  -- (message_start → first content block, and the gap after a tool_result while
+  -- it formulates the next message) are the bulk of the felt wait, and a BARE
+  -- "Proofing… [12s]" there reads as "nothing is happening". Priority, most
+  -- specific first; the `else` ("typing") labels every other working moment —
+  -- the model composing/emitting its reply.
   if state.think_start then
     if type(state.think_tokens) == "number" and state.think_tokens > 0 then
       parts[#parts + 1] = string.format("↓ %d tokens", state.think_tokens)
@@ -1372,12 +1378,15 @@ local function spinner_label()
     parts[#parts + 1] = "thinking"
   elseif state.tool_run then
     parts[#parts + 1] = state.tool_run.label    -- e.g. "Running: tree -L 1"
+  else
+    parts[#parts + 1] = "typing"                -- model composing/emitting the reply
   end
   -- "\n" puts the interrupt hint on its OWN line (set_hint splits on newlines):
   -- the status word can be long and eol virtual text never soft-wraps, so keeping
   -- "<Esc> to interrupt" inline pushed it off the right edge of a narrow panel.
   return string.format("%s %s… [%s]\n<Esc> to interrupt", frame, word, table.concat(parts, " · "))
 end
+mod._spinner_label = spinner_label
 
 local function stop_spinner()
   if state.spin_timer then
@@ -2691,9 +2700,9 @@ local function dispatch(event)
   if ev_type == "system" and event.subtype == "init" then
     -- Fill the banner's version (line 0) and model (line 1) now that they're
     -- known. The banner was pre-rendered at panel open with the cwd but no model
-    -- or version (those only arrive in system/init). With per-message spawning
-    -- system/init fires on every turn; we patch the lines in-place so a second
-    -- banner is never appended.
+    -- or version (those only arrive in system/init). The process is persistent
+    -- (one long-lived `claude` per session), so system/init fires once at spawn;
+    -- we patch the lines in-place so a second banner is never appended.
     -- The init event carries the CLI version under `claude_code_version`
     -- (NOT `version`); fall back to `version` only for forward-compatibility.
     local model    = friendly_model(event.model or "")
@@ -2735,11 +2744,12 @@ local function dispatch(event)
     end
 
   elseif ev_type == "stream_event" then
-    -- Incremental SSE (from --include-partial-messages). We act ONLY on the
-    -- thinking block's lifecycle to drive the live "Thinking… Xs" counter and to
-    -- measure the TRUE thinking duration (start→stop), which the fold then shows.
-    -- All other partial events (text/tool deltas) are ignored — the aggregated
-    -- `assistant` event below still does the real rendering.
+    -- Incremental SSE (from --include-partial-messages). We drive only the
+    -- thinking block's lifecycle (live "Thinking… Xs" counter + true start→stop
+    -- duration). Text/tool deltas are NOT rendered here — painting raw text
+    -- token-by-token felt "off", so the styled prose still lands once from the
+    -- aggregated `assistant` event below. The compose-gap feel is handled by the
+    -- spinner's default "typing" phase (see spinner_label), not by these deltas.
     local se = event.event or {}
     local st = se.type or ""
     if st == "content_block_start" and (se.content_block or {}).type == "thinking" then

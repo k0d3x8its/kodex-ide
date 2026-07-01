@@ -207,6 +207,21 @@ mod.state = {
   -- True while a question card is up that dismissed an open chat bar, so the card
   -- knows to reopen it (draft restored) after the questions are answered/cancelled.
   qask_reopen_bar = false,
+
+  -- Active diff-review card, or nil (Goal 14.3). Set while claude_diff.lua has an
+  -- unreviewed diff open and this panel card is showing its Accept/Reject choice.
+  -- Independent of state.perm: diff review happens AFTER the CLI's turn already
+  -- completed the write (can_use_tool already resolved for the edit), so the two
+  -- never contend for the same request. The winbar + <leader>ca/cx keymaps in
+  -- claude_diff.lua remain a fallback — this card is additive, not a replacement.
+  diff_card = nil,
+
+  -- Extmark namespace for the diff card's choice-row highlights (mirrors perm_ns).
+  diff_card_ns = nil,
+
+  -- True while a diff card is up that dismissed an open chat bar, so on_diff_close
+  -- knows to reopen it (draft restored) once the diff is resolved.
+  diff_card_reopen_bar = false,
 }
 local state = mod.state
 
@@ -2354,6 +2369,184 @@ local function show_permission_card(event)
   render_perm_choice_row()
 end
 
+-- ─── Diff-review card (Goal 14.3) ─────────────────────────────────────────────
+-- Reuses the permission card's floating-panel mechanism (SW geometry, scroll
+-- hardening, resize tracking, choice-row highlight paint) for the Accept/Reject
+-- decision on a proposed file diff, so resolving an edit feels like every other
+-- panel decision instead of requiring a jump to the diff window's winbar. The
+-- winbar + <leader>ca/cx keymaps (claude_diff.lua) stay wired as a fallback —
+-- this card is additive, not a replacement path for either.
+
+local function render_diff_card_choice_row()
+  local d = state.diff_card
+  if not (d and d.buf and vim.api.nvim_buf_is_valid(d.buf)) then return end
+  state.diff_card_ns = state.diff_card_ns or vim.api.nvim_create_namespace("ClaudeDiffCardRow")
+  local segs, line = {}, "  "
+  for i, opt in ipairs(d.options) do
+    if i > 1 then line = line .. "    " end
+    local label = ((i == d.choice) and "❯ " or "  ") .. opt.label
+    local b0 = #line
+    line = line .. label
+    segs[#segs + 1] = { b0 = b0, b1 = #line, active = (i == d.choice) }
+  end
+  vim.bo[d.buf].modifiable = true
+  vim.api.nvim_buf_set_lines(d.buf, d.row, d.row + 1, false, { line })
+  vim.bo[d.buf].modifiable = false
+  vim.api.nvim_buf_clear_namespace(d.buf, state.diff_card_ns, d.row, d.row + 1)
+  for _, s in ipairs(segs) do
+    vim.api.nvim_buf_add_highlight(d.buf, state.diff_card_ns,
+      s.active and "ClaudeQuestion" or "ClaudeDim", d.row, s.b0, s.b1)
+  end
+end
+
+local function move_diff_card_choice(delta)
+  local d = state.diff_card
+  if not d then return end
+  d.choice = (d.choice - 1 + delta) % #d.options + 1
+  render_diff_card_choice_row()
+end
+
+-- Close the card float WITHOUT touching the diff itself. Used both when a
+-- choice resolves it and when the diff resolves some other way (the winbar
+-- <leader>ca/cx fallback, or the diff window simply being closed) and the
+-- now-stale card needs to go away.
+local function close_diff_card()
+  local d = state.diff_card
+  if not d then return end
+  state.diff_card = nil
+  if d.resize_close then pcall(d.resize_close) end
+  if d.win and vim.api.nvim_win_is_valid(d.win) then
+    pcall(vim.api.nvim_win_close, d.win, true)
+  end
+end
+mod._close_diff_card = close_diff_card
+
+-- kind is "accept" | "reject" — routes straight into claude_diff's existing
+-- accept_all/reject_all (same functions the winbar keymaps call), so a new-file
+-- reject still deletes the file and a write failure still warns + keeps the
+-- diff open exactly as it does via the fallback path.
+local function resolve_diff_card(kind)
+  local d = state.diff_card
+  if not d then return end
+  close_diff_card()
+  local diff = require("utils.claude_diff")
+  if kind == "accept" then diff.accept_all() else diff.reject_all() end
+end
+mod._resolve_diff_card = resolve_diff_card
+
+local function open_diff_card_float(d)
+  local lines, body_hl = {}, {}
+  lines[#lines + 1] = "  " .. d.display
+  body_hl[#body_hl + 1] = { #lines - 1, "ClaudeProse" }
+  lines[#lines + 1] = ""                                  -- spacer
+  lines[#lines + 1] = ""                                  -- button-row placeholder
+  d.row = #lines - 1                                       -- 0-indexed button row
+  lines[#lines + 1] = "  ←/→ select · ⏎ confirm · a accept · x reject"
+  body_hl[#body_hl + 1] = { #lines - 1, "ClaudeDim" }
+
+  -- Shared geometry/scroll/resize helpers (panel_float_geom, harden_float_scroll,
+  -- attach_panel_float_resize) — same ones the permission/question/chat floats use.
+  local float_col, float_w = panel_float_geom()
+  local function card_height(w)
+    local disp_rows = 0
+    for _, l in ipairs(lines) do
+      disp_rows = disp_rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / w))
+    end
+    return math.min(disp_rows, math.max(math.floor(vim.o.lines / 2), 3))
+  end
+  local float_h = card_height(float_w)
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile  = false
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  d.buf = buf
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative  = "editor",
+    anchor    = "SW",
+    row       = vim.o.lines - 2,
+    col       = float_col,
+    width     = float_w,
+    height    = float_h,
+    border    = "rounded",
+    style     = "minimal",
+    title     = " ⚠ Review changes ",
+    title_pos = "left",
+    zindex    = 60,
+  })
+  d.win = win
+  -- Same amber outline as the permission card — both are "your decision needed"
+  -- cards; a distinct colour per card type would read as two different systems.
+  vim.wo[win].winhighlight =
+    "FloatBorder:ClaudePermBorder,FloatTitle:ClaudePermBorder,NormalFloat:ClaudeBarBg"
+  vim.wo[win].wrap        = true
+  vim.wo[win].linebreak   = true
+  vim.wo[win].breakindent = true
+  vim.wo[win].cursorline  = false
+  harden_float_scroll(win)
+  d.resize_close = attach_panel_float_resize(win, "ClaudeDiffCardFloat", function(_, _, w)
+    pcall(vim.api.nvim_win_set_height, win, card_height(w))
+  end)
+
+  for _, h in ipairs(body_hl) do
+    vim.api.nvim_buf_add_highlight(buf, -1, h[2], h[1], 0, -1)
+  end
+  vim.bo[buf].modifiable = false
+
+  local function map(k, fn)
+    vim.keymap.set("n", k, fn, { buffer = buf, nowait = true, silent = true })
+  end
+  map("<Left>",  function() move_diff_card_choice(-1) end)
+  map("h",       function() move_diff_card_choice(-1) end)
+  map("<Right>", function() move_diff_card_choice(1) end)
+  map("l",       function() move_diff_card_choice(1) end)
+  map("<CR>", function()
+    local q = state.diff_card
+    if q then resolve_diff_card(q.options[q.choice].kind) end
+  end)
+  map("a", function() resolve_diff_card("accept") end)
+  map("x", function() resolve_diff_card("reject") end)
+  -- Unlike the permission card, Esc/q only DISMISS the card — the diff itself is
+  -- not blocking a waiting CLI, so there's no reason to force a decision. The
+  -- winbar keymaps remain live on the diff window as the fallback.
+  map("<Esc>", close_diff_card)
+  map("q",     close_diff_card)
+
+  vim.api.nvim_create_autocmd("WinClosed", {
+    pattern = tostring(win),
+    once    = true,
+    callback = function()
+      if state.diff_card and state.diff_card.win == win then
+        state.diff_card = nil -- dismissed some other way; not a decision
+      end
+    end,
+  })
+end
+
+local function show_diff_card(path, kind)
+  local d = {
+    display = (kind == "new")
+      and ("New file: " .. vim.fn.fnamemodify(path, ":t"))
+      or  ("Modified: " .. vim.fn.fnamemodify(path, ":t")),
+    choice  = 1,
+    options = { { label = "Accept", kind = "accept" }, { label = "Reject", kind = "reject" } },
+  }
+
+  -- Dismiss any open chat bar BEFORE opening the card — same SW-column overlap
+  -- the permission card guards against (both anchor to the same panel column).
+  state.diff_card_reopen_bar = false
+  if state.chat_win and vim.api.nvim_win_is_valid(state.chat_win) then
+    state.diff_card_reopen_bar = true
+    if state.chat_close then pcall(state.chat_close) end
+  end
+
+  state.diff_card = d
+  open_diff_card_float(d)
+  render_diff_card_choice_row()
+end
+mod._show_diff_card = show_diff_card
+
 -- ─── Question card (AskUserQuestion) ──────────────────────────────────────────
 -- Claude's AskUserQuestion tool arrives on the SAME can_use_tool gate as a
 -- permission (no new flag — see .work/FINDINGS.md § Q-ASK), but is NOT an
@@ -4059,6 +4252,10 @@ function mod.reset()
     pcall(vim.api.nvim_win_close, state.perm.win, true)
   end
   state.perm          = nil
+  if state.diff_card and state.diff_card.win and vim.api.nvim_win_is_valid(state.diff_card.win) then
+    pcall(vim.api.nvim_win_close, state.diff_card.win, true)
+  end
+  state.diff_card      = nil
   state.claude_active = false
   stdout_buf          = ""
 
@@ -4232,22 +4429,43 @@ end
 
 -- ─── Diff state bridge (called by claude_diff.lua) ────────────────────────────
 
---- Called by claude_diff when a vimdiff opens — locks the input bar.
+--- Called by claude_diff when a vimdiff opens — locks the input bar and raises
+-- the Accept/Reject card (Goal 14.3). `info` is { path, kind } — kind is "new"
+-- (Claude-created file) or "edit" (existing file changed); nil path skips the
+-- card (defensive — on_diff_open should always be called with one in practice).
 -- The user must accept or reject the proposed edit before sending another
 -- message; allowing a follow-up while the file is in-diff risks confusing
 -- Claude with a half-applied change still on disk.
-function mod.on_diff_open()
+function mod.on_diff_open(info)
   state.diff_pending = true
   set_hint("⚠ Awaiting review — <leader>ca accept  <leader>cx reject", "ClaudeLabel")
+  local path = info and info.path
+  if path then
+    -- pcall so a card-rendering failure can't leave diff_pending set without
+    -- ANY visible way to resolve it — the hint above (and the winbar fallback
+    -- in claude_diff.lua) still tell the user how to proceed via <leader>ca/cx.
+    local ok, err = pcall(show_diff_card, path, info.kind)
+    if not ok then
+      vim.notify("Claude: diff review card failed to render (" .. tostring(err) .. ")",
+        vim.log.levels.ERROR)
+    end
+  end
 end
 
 --- Called by claude_diff when the current diff is resolved — unlocks input.
 function mod.on_diff_close()
   state.diff_pending = false
+  -- The card may still be up if the diff resolved via the winbar/<leader>ca/cx
+  -- fallback rather than the card itself — drop it either way.
+  close_diff_card()
   if not state.working then
     clear_hint()
     -- Review done: release any messages queued during the diff.
     mod._maybe_send_next()
+  end
+  if state.diff_card_reopen_bar then
+    state.diff_card_reopen_bar = false
+    vim.schedule(function() mod.prompt_input() end)
   end
 end
 

@@ -111,10 +111,28 @@ local function close_diff()
     local win = vim.fn.bufwinid(s.orig_buf)
     if win ~= -1 then
       vim.api.nvim_win_call(win, function() vim.cmd("diffoff") end)
+      -- Restore the default (global) highlight namespace: the orig window may be
+      -- a REUSED editor window that outlives the diff. Leaving the red lens on it
+      -- would tint its normal content after the diff closes. (0 = default ns.)
+      pcall(vim.api.nvim_win_set_hl_ns, win, 0)
     end
   end
   if s.scratch and vim.api.nvim_buf_is_valid(s.scratch) then
-    vim.api.nvim_buf_delete(s.scratch, { force = true }) -- closes its window too
+    -- Close the window EXPLICITLY rather than relying on nvim_buf_delete's
+    -- window-buffer fallback: deleting a buffer that's displayed in a window
+    -- does NOT reliably close that window — Neovim can instead leave the
+    -- window open showing a blank/alternate buffer (BUG, live-observed
+    -- 2026-07-01: a stray blank pane stayed open where the diff used to be,
+    -- instead of the diff column closing and returning to the editor). Close
+    -- the window first to remove the ambiguity; deleting the now-hidden
+    -- scratch buffer after is a clean wipe with nothing left to fall back to.
+    local swin = vim.fn.bufwinid(s.scratch)
+    if swin ~= -1 and vim.api.nvim_win_is_valid(swin) then
+      pcall(vim.api.nvim_win_close, swin, true)
+    end
+    if vim.api.nvim_buf_is_valid(s.scratch) then
+      pcall(vim.api.nvim_buf_delete, s.scratch, { force = true })
+    end
   end
   if s.current then M.state.new_files[s.current] = nil end
   s.current, s.scratch, s.orig_buf = nil, nil, nil
@@ -321,6 +339,21 @@ local function open_diff(path)
     vim.wo[w].breakindent = true
   end
 
+  -- Red/green colour lenses (plugins/claude.lua): apply the RED lens to the orig
+  -- window (its diff-unique lines are removals) and the GREEN lens to the scratch
+  -- window (its diff-unique lines are additions). This is the ONLY way to get
+  -- asymmetric red-removed / green-added out of vim's symmetric diff — the Diff*
+  -- groups are resolved per-window, so a per-window namespace recolours each side
+  -- independently. Guarded: the namespaces are nil under a bare engine load (tests
+  -- / headless without the plugin spec) — skip rather than error, diff still works
+  -- with the colorscheme's default groups.
+  local del_ns = claude.state.diff_del_ns
+  local add_ns = claude.state.diff_add_ns
+  if del_ns and add_ns then
+    pcall(vim.api.nvim_win_set_hl_ns, orig_win, del_ns)
+    pcall(vim.api.nvim_win_set_hl_ns, scratch_win, add_ns)
+  end
+
   -- MG 7.2: winbar on the scratch window so the user always knows what to do
   -- without reading a notify that may have scrolled away.
   local scratch_win = vim.api.nvim_get_current_win()
@@ -342,7 +375,23 @@ local function open_diff(path)
   -- MG 7.2: notify the Claude panel so it locks the input bar and updates the
   -- virtual-text hint to "⚠ Awaiting review…". Prevents the user from sending
   -- a follow-up message while a file change is still unreviewed on disk.
-  claude.on_diff_open()
+  -- Goal 14.3: path + kind let the panel raise its own Accept/Reject card
+  -- (winbar keymaps below stay live as the fallback). pcall: the diff windows
+  -- above are ALREADY open at this point — a crash in the panel-side card must
+  -- never take them down or leave the interceptor's state stuck; surface it
+  -- loudly instead of failing silently (a silent failure here previously read
+  -- as "no diff appeared at all" with no clue why — live-observed 2026-07-01).
+  local ok, err = pcall(claude.on_diff_open, { path = path, kind = s.kind })
+  if not ok then
+    log("on-diff-open-FAILED:" .. tostring(err))
+    vim.schedule(function()
+      vim.notify(
+        "Claude: diff review card failed to open (" .. tostring(err)
+          .. ") — use <leader>ca/<leader>cx in the diff window instead",
+        vim.log.levels.ERROR
+      )
+    end)
+  end
 
   -- No vim.notify here (BUG line 96): the float renders top-of-screen and covers
   -- the first hunk of the proposed change, exactly where the user needs to look.

@@ -91,14 +91,13 @@ H.check("S0 panel buffer created",
 claude._send("hello")
 vim.wait(30)
 H.check("S0 stdout callback captured after first send", captured_stdout_cb ~= nil)
--- Before any content block, the model is computing — the bracket must NOT be
--- bare; the default "responding" phase labels the compute dead band.
--- The bracket must never be bare: whenever the model is working and not in a
--- thinking block or a tool run, the phase reads "typing" — covering both the
--- compute dead bands AND the text-emit window with one word.
-H.check("S0 working compute gap shows the 'typing' phase",
-  (claude._spinner_label() or ""):find("typing", 1, true) ~= nil,
-  claude._spinner_label())
+-- Before any content block, the model is computing — the dead band must NOT read
+-- as frozen. The animated in-body placeholder line carries the "typing" word (a
+-- REAL buffer line, so it shows up in nvim_buf_get_lines; the bottom spinner hint
+-- is virt_text and does NOT). The spinner bracket omits "typing" while the
+-- placeholder owns it, so the word appears exactly once, in the body.
+H.check("S0 working compute gap paints the in-body 'typing' placeholder",
+  panel_text():find("typing", 1, true) ~= nil, panel_text())
 
 -- ── S1: text deltas DO NOT paint into the buffer ───────────────────────────────
 -- The raw text must NOT spit into the panel as it streams; the styled block
@@ -117,9 +116,8 @@ block_delta(0, "Second paragraph line.")
 H.check("S1 deltas do NOT paint raw text into the buffer", line_count() == before,
   "before=" .. before .. " after_deltas=" .. line_count())
 H.check("S1 no raw delta text present", panel_text():find("Second paragraph line.", 1, true) == nil)
-H.check("S1 spinner still shows the typing phase while text streams",
-  (claude._spinner_label() or ""):find("typing", 1, true) ~= nil,
-  claude._spinner_label())
+H.check("S1 in-body typing placeholder persists while text streams",
+  panel_text():find("typing", 1, true) ~= nil, panel_text())
 block_stop(0)
 
 -- ── S2: aggregated event renders the styled block once ─────────────────────────
@@ -153,5 +151,30 @@ H.check("S4 tool phase overrides the typing default",
   (claude._spinner_label() or ""):find("Running: tree", 1, true) ~= nil,
   claude._spinner_label())
 claude.state.tool_run = nil
+
+-- ── S5: in-body "typing" placeholder lifecycle ────────────────────────────────
+-- A REAL animated line (unlike the virt_text hint) paints during the compute gap,
+-- is REPLACED by the styled block when content lands, and is cleared for good at
+-- the turn's `result`. _send paints it synchronously; the assistant/result events
+-- are scheduled (on_stdout defers via vim.schedule), so feed() waits for dispatch.
+claude.state.think_start = nil
+claude.state.tool_run    = nil
+claude._send("second question")     -- start_spinner paints the placeholder synchronously
+H.check("S5 placeholder painted in body during the compute gap",
+  panel_text():find("typing", 1, true) ~= nil, panel_text())
+
+aggregated_text("A styled answer.")
+-- The styled block landed; the tick may re-add the placeholder BELOW it for the
+-- next dead band (correct), so we only assert the block is present here.
+H.check("S5 styled block lands from the aggregated event",
+  panel_text():find("A styled answer%.") ~= nil, panel_text())
+
+-- result ends the turn: stop_spinner clears the placeholder and stops the tick, so
+-- no "typing" line survives once the model is idle.
+feed({ type = "result", result = "ok", total_cost_usd = 0.02 })
+H.check("S5 result leaves no placeholder behind",
+  panel_text():find("typing", 1, true) == nil, panel_text())
+H.check("S5 styled block survives the turn end, single copy",
+  count_occurrences(panel_text(), "A styled answer.") == 1, panel_text())
 
 H.summary("claude_stream")

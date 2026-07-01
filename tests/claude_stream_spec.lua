@@ -24,6 +24,7 @@ package.loaded["utils.term_layout"] = { place_vertical = function() end }
 package.loaded["utils.claude_diff"] = {
   on_panel_open = function() end, on_panel_close = function() end,
   on_diff_open  = function() end, on_diff_close  = function() end,
+  watch = function() end,  -- MG 14.2: dispatch pre-loads edit targets through this
 }
 package.loaded["utils.opencode"] = {
   state = { opencode_active = false }, toggle = function() end,

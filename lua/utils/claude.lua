@@ -1366,61 +1366,74 @@ local FLAVOR_DONE = {
 -- during the next dead band (e.g. after a tool result), so post-tool gaps fill too.
 local PH_FRAMES = { "●∙∙", "∙●∙", "∙∙●", "∙●∙" }
 
--- The animated line text. The dot frame advances on wall-clock time (~350ms) so
--- the pulse is calm and independent of the 110ms braille tick; the seconds reuse
--- the same cumulative turn timer as the spinner (turn_t0).
-local function typing_ph_line()
-  local frame = PH_FRAMES[(math.floor(vim.loop.now() / 350) % #PH_FRAMES) + 1]
-  local secs  = state.turn_t0 and fmt_think_dur(vim.loop.now() - state.turn_t0) or "0s"
-  return string.format("%s typing %s", frame, secs)
+-- The activity WORD is the current phase: "Thinking" while the model streams a
+-- thinking block, otherwise "Typing" (composing/emitting the reply). A tool run
+-- shows its own cornered block instead (see in_typing_phase), so the word only
+-- ever covers the two block-less compute phases.
+local function activity_word()
+  if state.think_start then return "Thinking" end
+  return "Typing"
 end
 
--- The placeholder shows ONLY during the model's typing/compose phase — not while
--- a thinking block or a tool run is active (those already paint their own in-body
--- content), and not while a permission card or a pending diff owns the panel.
+-- The animated line text: pulsing dot + phase word (no seconds — the eol
+-- randomizer below carries the climbing timer, so a second one here is redundant).
+-- The dot frame advances on wall-clock time (~350ms) so the pulse is calm and
+-- independent of the 110ms braille tick.
+local function typing_ph_line()
+  local frame = PH_FRAMES[(math.floor(vim.loop.now() / 350) % #PH_FRAMES) + 1]
+  return string.format("%s %s", frame, activity_word())
+end
+
+-- The activity line shows during the two block-less compute phases (Typing +
+-- Thinking) — NOT while a tool runs (its cornered ●/└ block IS the activity),
+-- and not while a permission card or a pending diff owns the panel.
 local function in_typing_phase()
   return state.working
-    and not state.think_start and not state.tool_run
+    and not state.tool_run
     and not state.perm and not state.diff_pending
 end
 
--- Delete the placeholder line. Safe to call anytime: no-op unless active. The
--- placeholder is only ever added as the LAST line and nothing appends while it is
--- active (every appender removes it first), so the last line IS the placeholder.
+-- Delete the activity block. Safe to call anytime: no-op unless active. It is
+-- always added as the LAST TWO lines (word + a trailing blank the eol randomizer
+-- anchors to) and nothing appends while active (every appender removes it first),
+-- so the last two lines ARE the block.
 local function remove_typing_ph()
   if not state.typing_ph then return end
   state.typing_ph = false
   local buf = state.panel_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   local n = vim.api.nvim_buf_line_count(buf)
-  if n <= 0 then return end
+  if n < 2 then return end
   vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, n - 1, n, false, {})
+  vim.api.nvim_buf_set_lines(buf, n - 2, n, false, {})
   vim.bo[buf].modifiable = false
 end
 mod._remove_typing_ph = remove_typing_ph
+mod._activity_word    = activity_word
 
--- Append the placeholder as a fresh last line (via buf_append so the panel
--- auto-follows it into view). Sets the flag AFTER so a later append removes it.
+-- Append the activity block: the word line + a trailing BLANK line. The blank is
+-- what set_hint anchors the eol randomizer to, so the randomizer renders on its
+-- OWN row directly BELOW the activity word (stacked, no same-row jam). buf_append
+-- auto-follows into view; the flag is set AFTER so a later append removes it.
 local function add_typing_ph()
   if state.typing_ph then return end
-  buf_append({ typing_ph_line() })
+  buf_append({ typing_ph_line(), "" })
   local n = vim.api.nvim_buf_line_count(state.panel_buf)
-  hl_lines(n - 1, n - 1, "ClaudeDim")
+  hl_lines(n - 2, n - 2, "ClaudeDim")   -- the word line; the blank stays unpainted
   state.typing_ph = true
 end
 
--- Rewrite the placeholder line in place (advance the pulse + climb the seconds).
+-- Rewrite the word line in place (advance the pulse), leaving the trailing blank.
 local function update_typing_ph()
   if not state.typing_ph then return end
   local buf = state.panel_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   local n = vim.api.nvim_buf_line_count(buf)
-  if n <= 0 then return end
+  if n < 2 then return end
   vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, n - 1, n, false, { typing_ph_line() })
+  vim.api.nvim_buf_set_lines(buf, n - 2, n - 1, false, { typing_ph_line() })
   vim.bo[buf].modifiable = false
-  hl_lines(n - 1, n - 1, "ClaudeDim")
+  hl_lines(n - 2, n - 2, "ClaudeDim")
 end
 
 -- Driven by start_spinner + the 110ms tick: show/animate the placeholder in the
@@ -1433,44 +1446,30 @@ local function tick_typing_ph()
   end
 end
 
--- The spinner hint text — phase-aware so the user always sees WHAT Claude is
--- doing, not a generic "Working…". The 110ms tick re-renders it, so the seconds
--- climb in place. Priority (most specific first):
---   * tool running  → "Running: tree …  5.2s"  (the gap between a tool_use and
---     its tool_result: tool execution + Pre/PostToolUse hooks)
---   * thinking       → "Thinking… 2.3s · 111 tok"  (live time + estimated tokens)
---   * otherwise      → "Working…"  (model round-trip / "requesting")
+-- The eol randomizer hint: the per-turn flavour word + a climbing turn timer +
+-- token count. It rides at EOL on the row BELOW the in-body activity line (the
+-- trailing blank add_typing_ph anchors it to), so the two stack:
+--   ●∙∙ Typing
+--   ⣾ Catapulting… [42s · ↓ 632 tokens]
+-- The phase (Typing / Thinking / a tool) shows ONCE — on the activity line or the
+-- cornered ●/└ tool block — never duplicated here. The 110ms tick re-renders so
+-- the timer climbs in place.
 local function spinner_label()
   local frame = SPINNER[spin_i]
-  -- One cumulative turn timer shown on EVERY phase (like the official TUI's
-  -- "42s"), so no phase — including the post-tool model round-trip — ever looks
-  -- frozen. turn_t0 is set once at dispatch and never re-baselined.
-  -- The per-request flavour word stays the PRIMARY verb the whole turn (set once
-  -- at dispatch); the phase (thinking / running a tool) goes in brackets to the
-  -- SIDE — "Proofing… [42s · ↓ 632 tokens · thinking]" (the official TUI uses
-  -- parens; we use []). The flavour word never gets taken over by "Thinking"/"Working".
+  -- turn_t0 is set once at dispatch and never re-baselined, so the timer climbs
+  -- continuously across every phase (like the official TUI's "42s") and no gap —
+  -- including the post-tool model round-trip — ever looks frozen. The flavour word
+  -- stays the PRIMARY verb the whole turn (set once at dispatch).
   local word    = state.flavor_word or "Working"
   local elapsed = state.turn_t0 and fmt_think_dur(vim.loop.now() - state.turn_t0) or "0s"
   local parts   = { elapsed }
-  -- The bracket ALWAYS carries a phase word — the model's compute dead bands
-  -- (message_start → first content block, and the gap after a tool_result while
-  -- it formulates the next message) are the bulk of the felt wait, and a BARE
-  -- "Proofing… [12s]" there reads as "nothing is happening". Priority, most
-  -- specific first; the `else` ("typing") labels every other working moment —
-  -- the model composing/emitting its reply.
-  if state.think_start then
-    if type(state.think_tokens) == "number" and state.think_tokens > 0 then
-      parts[#parts + 1] = string.format("↓ %d tokens", state.think_tokens)
-    end
-    parts[#parts + 1] = "thinking"
-  elseif state.tool_run then
-    parts[#parts + 1] = state.tool_run.label    -- e.g. "Running: tree -L 1"
-  elseif not state.typing_ph then
-    -- The in-body placeholder line already carries the "typing" word when it is
-    -- active, so omit it from the bracket to avoid the same word twice on one row.
-    -- Kept as a fallback for when the placeholder isn't shown (e.g. tests, or a
-    -- buffer-less state) so the bracket is never bare during the compose gap.
-    parts[#parts + 1] = "typing"                -- model composing/emitting the reply
+  -- The PHASE word (thinking / typing / a tool label) is NO LONGER in the bracket:
+  -- the phase now shows exactly once, either as the in-body activity line
+  -- (●∙∙ Typing / Thinking) or as the cornered ●/└ tool block. Duplicating it in
+  -- the bracket was the redundancy the user asked to cut. The bracket keeps only
+  -- the climbing turn timer + the token count when one exists (thinking).
+  if type(state.think_tokens) == "number" and state.think_tokens > 0 then
+    parts[#parts + 1] = string.format("↓ %d tokens", state.think_tokens)
   end
   -- "\n" puts the interrupt hint on its OWN line (set_hint splits on newlines):
   -- the status word can be long and eol virtual text never soft-wraps, so keeping
@@ -1682,32 +1681,126 @@ local function render_thinking(text)
   end
 end
 
--- Render a tool_use block as a single-line "⚙ Verb: target" entry.
--- One line per tool call keeps the panel scannable during long multi-tool turns.
--- Matches the compact format from ingest.py _fmt_tool_use_rich.
--- A blank line is appended after the tool entry so the working spinner has its
--- own line below (the spinner timer re-anchors EOL virt_text to the buffer's
--- last line on every tick; without the blank it shares the tool line).
-local function render_tool(name, input)
-  local verb   = TOOL_VERB[name] or name
-  local target = tool_target(input)
-  local line   = "  ⚙ " .. verb .. (target ~= "" and (": " .. target) or "")
-  local first  = vim.api.nvim_buf_line_count(state.panel_buf)
-  buf_append({ line })
-  hl_lines(first, first, TOOL_HL[verb] or "ClaudeTool")
-  buf_append({ "" })   -- spinner gets its own line below
+-- ─── Cornered tool block (TUI-faithful ●/└ two-line render) ──────────────────
 
-  -- Mark the tool as RUNNING so the spinner shows live "Running: tree … 5.2s"
-  -- during the otherwise-blank gap until its tool_result arrives (the `user`
-  -- event clears this). "Wrote" reads wrong while in flight → present-tense it.
-  -- Short target so the live label fits one row.
-  local run_verb = (name == "Write") and "Writing" or verb
-  local short    = (vim.fn.strdisplaywidth(target) > 40)
-    and (vim.fn.strcharpart(target, 0, 39) .. "…") or target
-  state.tool_run = {
-    label = run_verb .. (short ~= "" and (": " .. short) or ""),
-    t0    = vim.loop.now(),
-  }
+-- The edit-family tools (their input carries the change to summarise + diff).
+local EDIT_NAMES = { Edit = true, MultiEdit = true, Write = true, NotebookEdit = true }
+
+-- Devicon glyph for a path, as "<glyph> " (trailing space) so callers concat it
+-- straight before the name. "" when nvim-web-devicons is absent (no nerd font) so
+-- the panel still renders without it — and so headless tests see plain text.
+local function file_glyph(path)
+  if not path or path == "" then return "" end
+  local ok, devicons = pcall(require, "nvim-web-devicons")
+  if not ok then return "" end
+  local icon = devicons.get_icon(
+    vim.fn.fnamemodify(path, ":t"), vim.fn.fnamemodify(path, ":e"), { default = true })
+  return icon and (icon .. " ") or ""
+end
+
+-- Added / removed line counts between two blobs by unordered multiset diff (lines
+-- in `new` not covered by `old` = added; the reverse = removed). Cheap and good
+-- enough for the "Added N, removed M" corner summary; the ordered hunk (context +
+-- red/green) is what the vimdiff and the post-approval block render (Goal 14.4).
+local function count_added_removed(old, new)
+  local pool, oldn, newn, common = {}, 0, 0, 0
+  for _, l in ipairs(vim.split(old or "", "\n", { plain = true })) do
+    pool[l] = (pool[l] or 0) + 1; oldn = oldn + 1
+  end
+  for _, l in ipairs(vim.split(new or "", "\n", { plain = true })) do
+    newn = newn + 1
+    if (pool[l] or 0) > 0 then pool[l] = pool[l] - 1; common = common + 1 end
+  end
+  return newn - common, oldn - common
+end
+
+-- Change counts for an edit-family tool from its input dict. Write/NotebookEdit
+-- are whole-content creates/replaces (diff against empty = all added).
+local function edit_counts(name, input)
+  if name == "Write" then
+    return count_added_removed("", input.content or "")
+  elseif name == "NotebookEdit" then
+    return count_added_removed("", input.new_source or "")
+  elseif name == "MultiEdit" then
+    local a, r = 0, 0
+    for _, e in ipairs(input.edits or {}) do
+      local ea, er = count_added_removed(e.old_string or "", e.new_string or "")
+      a, r = a + ea, r + er
+    end
+    return a, r
+  end
+  return count_added_removed(input.old_string or "", input.new_string or "")  -- Edit
+end
+
+-- "Added 5 lines, removed 1 line" — pluralised; both / one-side / none.
+local function change_summary(added, removed)
+  local function u(n) return n == 1 and "line" or "lines" end
+  if added > 0 and removed > 0 then
+    return string.format("Added %d %s, removed %d %s", added, u(added), removed, u(removed))
+  elseif added > 0 then
+    return string.format("Added %d %s", added, u(added))
+  elseif removed > 0 then
+    return string.format("Removed %d %s", removed, u(removed))
+  end
+  return "No line changes"
+end
+
+-- Collapse to one corner line (kill vertical whitespace, ellipsize wide values).
+local function corner_one_line(s)
+  s = tostring(s or ""):gsub("[\r\n\t]+", " ")
+  if vim.fn.strdisplaywidth(s) > 68 then s = vim.fn.strcharpart(s, 0, 67) .. "…" end
+  return s
+end
+
+-- Path relative to cwd (~ for home), one line.
+local function rel_path(p)
+  if not p or p == "" then return "" end
+  return corner_one_line(vim.fn.fnamemodify(p, ":~:."))
+end
+
+-- Header + corner detail for a tool_use, TUI-faithful gerund style:
+--   ● Editing  claude.lua          ● Reading 1 file          ● Running bash
+--     └ Added 5 lines, removed 1      └ lua/utils/claude.lua     └ tree -L 1
+-- Returns (header, detail); detail nil/"" renders header alone.
+local function tool_lines(name, input)
+  local path = input.file_path or input.path
+  if EDIT_NAMES[name] then
+    local a, r = edit_counts(name, input)
+    return "● Editing " .. file_glyph(path) .. vim.fn.fnamemodify(path or "", ":t"),
+           change_summary(a, r)
+  elseif name == "Read" or name == "NotebookRead" then
+    return "● Reading 1 file", file_glyph(path) .. rel_path(path)
+  elseif name == "Bash" then
+    -- .sh devicon after "bash" for the shell glyph the user asked for.
+    return "● Running bash " .. file_glyph("run.sh"), corner_one_line(input.command)
+  elseif name == "Grep" then
+    return "● Searching", corner_one_line(input.pattern)
+      .. (input.path and ("  ·  " .. rel_path(input.path)) or "")
+  elseif name == "Glob" then
+    return "● Listing", corner_one_line(input.pattern)
+  end
+  local tgt = tool_target(input)
+  return "● " .. (TOOL_VERB[name] or name), (tgt ~= "" and tgt or nil)
+end
+
+-- Render a tool_use as the cornered two-line ●/└ block. The header verb colour
+-- (teal Read / amber Run / purple default) survives from TOOL_HL keyed by the
+-- resolved gerund; the corner is dim. A trailing blank follows so the eol
+-- randomizer anchors to its OWN row directly below the block (no shared row).
+local function render_tool(name, input)
+  local header, detail = tool_lines(name, input)
+  local first  = vim.api.nvim_buf_line_count(state.panel_buf)
+  local lines  = { header }
+  if detail and detail ~= "" then lines[#lines + 1] = "  └ " .. detail end
+  buf_append(lines)
+  hl_lines(first, first, TOOL_HL[TOOL_VERB[name] or name] or "ClaudeTool")
+  if #lines > 1 then hl_lines(first + 1, first + 1, "ClaudeDim") end
+  buf_append({ "" })   -- randomizer's own row, below the block
+
+  -- Mark a tool RUNNING so the in-body activity line is suppressed during the
+  -- tool gap (the cornered block above IS the activity for this phase). The
+  -- `user` (tool_result) event clears it.
+  state.tool_run = { t0 = vim.loop.now() }
 end
 
 -- Render the result event that closes a turn. The result text itself duplicates

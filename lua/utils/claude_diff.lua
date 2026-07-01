@@ -60,6 +60,32 @@ function M.push(path)
   log("queued:" .. path)
 end
 
+-- MG 14.2: pre-load a file Claude is ABOUT to edit into a listed + loaded buffer
+-- so the FileChangedShell interceptor catches the CLI's subsequent disk write.
+--
+-- Closes v1's blind spot (FINDINGS.md Q6 / header): an Edit/Write to a file with
+-- no buffer fired no FCS, so the change landed on disk silently. The dispatcher
+-- calls this on the tool_use block — which the stream always emits BEFORE the
+-- tool executes — so bufload reads the PRE-edit content (or an empty buffer for a
+-- new file Claude is creating). When the CLI then writes, checktime_all sees the
+-- mtime change and queues the diff: a new file diffs against the empty buffer =
+-- whole file as additions.
+function M.watch(path)
+  if not path or path == "" then return end
+  if not claude.state.claude_active then return end
+  -- Absolute + slash-normalised so bufadd matches the name checktime/FCS report
+  -- (a relative path would create a SECOND buffer for the same file → no FCS on
+  -- the one we loaded).
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local bufnr = vim.fn.bufadd(abs)          -- listed buffer, may be unloaded
+  if bufnr == 0 then
+    log("watch-bufadd-failed:" .. abs)
+    return
+  end
+  vim.fn.bufload(bufnr)                      -- read current content (empty if new)
+  log("watch:" .. abs)
+end
+
 -- ───────────────────────────────────────────────────────────────── diff window
 
 local function close_diff()

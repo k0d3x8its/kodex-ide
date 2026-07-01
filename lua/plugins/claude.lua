@@ -165,6 +165,37 @@ return {
       -- Reuses the header clay so the diff palette is consistent with the panel.
       vim.api.nvim_set_hl(0, "ClaudeDiffAdd", { bg = "#D97757" })
 
+      -- ── Review diff: per-window red/green colour lenses ───────────────────
+      -- Native `diffthis` is SYMMETRIC: a line unique to the LEFT (removed) and
+      -- a line unique to the RIGHT (added) BOTH render under `DiffAdd`, because
+      -- vim has no notion of "left = old, right = new". Editing the GLOBAL Diff*
+      -- groups would therefore colour both panes identically. The fix is two
+      -- highlight NAMESPACES applied per-window (claude_diff.open_diff calls
+      -- nvim_win_set_hl_ns): the orig/left window reads Diff* as RED (its unique
+      -- lines are removals), the proposed/right window reads them as GREEN (its
+      -- unique lines are additions). Same diff, two lenses → red removed / green
+      -- added in a side-by-side view. Dracula only ships fg for these groups, so
+      -- removed/changed text had no background and read as plain text — this is
+      -- what the user saw as "only additions show". (Custom-namespace highlights
+      -- are NOT reset by :colorscheme, but we set them inside define_highlights
+      -- anyway so the palette lives in one place; create is idempotent by name.)
+      local claude = require("utils.claude")
+      local del_ns = vim.api.nvim_create_namespace("ClaudeDiffDelLens")
+      local add_ns = vim.api.nvim_create_namespace("ClaudeDiffAddLens")
+      claude.state.diff_del_ns = del_ns
+      claude.state.diff_add_ns = add_ns
+      -- LEFT lens (orig): unique lines = REMOVED. DiffText (exact changed chars)
+      -- is the brightest red so an intra-line edit pops out of its changed line.
+      vim.api.nvim_set_hl(del_ns, "DiffAdd",    { bg = "#5a2b3a" })              -- removed whole line
+      vim.api.nvim_set_hl(del_ns, "DiffChange", { bg = "#3a222b" })              -- changed line (old side)
+      vim.api.nvim_set_hl(del_ns, "DiffText",   { bg = "#803347", bold = true }) -- exact removed chars
+      vim.api.nvim_set_hl(del_ns, "DiffDelete", { fg = "#6272a4" })              -- filler dashes: dim, not red
+      -- RIGHT lens (proposed): unique lines = ADDED.
+      vim.api.nvim_set_hl(add_ns, "DiffAdd",    { bg = "#2d4d36" })              -- added whole line
+      vim.api.nvim_set_hl(add_ns, "DiffChange", { bg = "#22331f" })              -- changed line (new side)
+      vim.api.nvim_set_hl(add_ns, "DiffText",   { bg = "#2f6b3e", bold = true }) -- exact added chars
+      vim.api.nvim_set_hl(add_ns, "DiffDelete", { fg = "#6272a4" })              -- filler dashes: dim
+
       -- ── Burn-bar meters (panel winbar: 5h block + weekly limit) ───────────
       -- Reads ~/.claude/kos-burn-bar-state.json (utils/claude_burn.lua). The
       -- filled run is coloured by severity (green→amber→red as usage climbs);

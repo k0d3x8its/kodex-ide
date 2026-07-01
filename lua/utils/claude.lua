@@ -2978,7 +2978,16 @@ local function dispatch(event)
       elseif btype == "thinking" then
         render_thinking(block.thinking or "")
       elseif btype == "tool_use" then
-        render_tool(block.name or "", block.input or {})
+        local name  = block.name or ""
+        local input = block.input or {}
+        render_tool(name, input)
+        -- MG 14.2: pre-load the edit target so the FileChangedShell interceptor
+        -- catches the CLI's write (covers new + unloaded files). tool_use always
+        -- precedes execution in the stream, so the buffer loads with pre-edit
+        -- content. NotebookEdit carries notebook_path, the rest file_path.
+        if EDIT_NAMES[name] then
+          require("utils.claude_diff").watch(input.file_path or input.notebook_path)
+        end
       end
       -- tool_result body rendering is deferred to v2 (TODOS.md backlog)
 

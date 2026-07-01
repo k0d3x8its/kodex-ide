@@ -129,6 +129,12 @@ mod.state = {
   -- Active braille-spinner timer handle while a turn is in flight; nil otherwise.
   spin_timer    = nil,
 
+  -- true while an animated in-body "typing" placeholder line occupies the panel's
+  -- LAST line (compute dead-band filler; see the typing-placeholder block). The
+  -- styled block replaces it when content lands. Distinct from the bottom hint,
+  -- which is virt_text — this is a real buffer line so the empty body reads active.
+  typing_ph     = false,
+
   -- Model alias/id passed to --model on (re)spawn. nil = CLI default model.
   -- Set by the <leader>cm picker; changing it respawns the process (model is a
   -- spawn-time flag, so the running session can't switch mid-flight).
@@ -1346,6 +1352,87 @@ local FLAVOR_DONE = {
   "Twiddled", "Vibed", "Whirred", "Wibbled", "Wizarded", "Worked", "Wrangled",
 }
 
+-- ─── In-body "typing" placeholder (compute dead-band filler) ──────────────────
+--
+-- The felt post-request gap is the model's COMPUTE dead bands — message_start →
+-- first content block (~4s TTFT) and the gap after a tool_result while it
+-- formulates the next message — where NOTHING streams. The bottom spinner hint
+-- alone (virt_text) leaves the transcript BODY blank there, which reads as frozen.
+-- This paints a single ANIMATED real buffer line IN the transcript flow so the
+-- body reads active. It is NOT a client trick to shorten the gap — it just fills
+-- the dead air. The styled block REPLACES it: every content-appending dispatch
+-- branch calls remove_typing_ph() before rendering, so the placeholder (always the
+-- LAST line while present) can never sit above real content. The tick re-adds it
+-- during the next dead band (e.g. after a tool result), so post-tool gaps fill too.
+local PH_FRAMES = { "●∙∙", "∙●∙", "∙∙●", "∙●∙" }
+
+-- The animated line text. The dot frame advances on wall-clock time (~350ms) so
+-- the pulse is calm and independent of the 110ms braille tick; the seconds reuse
+-- the same cumulative turn timer as the spinner (turn_t0).
+local function typing_ph_line()
+  local frame = PH_FRAMES[(math.floor(vim.loop.now() / 350) % #PH_FRAMES) + 1]
+  local secs  = state.turn_t0 and fmt_think_dur(vim.loop.now() - state.turn_t0) or "0s"
+  return string.format("%s typing %s", frame, secs)
+end
+
+-- The placeholder shows ONLY during the model's typing/compose phase — not while
+-- a thinking block or a tool run is active (those already paint their own in-body
+-- content), and not while a permission card or a pending diff owns the panel.
+local function in_typing_phase()
+  return state.working
+    and not state.think_start and not state.tool_run
+    and not state.perm and not state.diff_pending
+end
+
+-- Delete the placeholder line. Safe to call anytime: no-op unless active. The
+-- placeholder is only ever added as the LAST line and nothing appends while it is
+-- active (every appender removes it first), so the last line IS the placeholder.
+local function remove_typing_ph()
+  if not state.typing_ph then return end
+  state.typing_ph = false
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  local n = vim.api.nvim_buf_line_count(buf)
+  if n <= 0 then return end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, n - 1, n, false, {})
+  vim.bo[buf].modifiable = false
+end
+mod._remove_typing_ph = remove_typing_ph
+
+-- Append the placeholder as a fresh last line (via buf_append so the panel
+-- auto-follows it into view). Sets the flag AFTER so a later append removes it.
+local function add_typing_ph()
+  if state.typing_ph then return end
+  buf_append({ typing_ph_line() })
+  local n = vim.api.nvim_buf_line_count(state.panel_buf)
+  hl_lines(n - 1, n - 1, "ClaudeDim")
+  state.typing_ph = true
+end
+
+-- Rewrite the placeholder line in place (advance the pulse + climb the seconds).
+local function update_typing_ph()
+  if not state.typing_ph then return end
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  local n = vim.api.nvim_buf_line_count(buf)
+  if n <= 0 then return end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, n - 1, n, false, { typing_ph_line() })
+  vim.bo[buf].modifiable = false
+  hl_lines(n - 1, n - 1, "ClaudeDim")
+end
+
+-- Driven by start_spinner + the 110ms tick: show/animate the placeholder in the
+-- typing phase, drop it otherwise. Idempotent — safe to call every tick.
+local function tick_typing_ph()
+  if in_typing_phase() then
+    if state.typing_ph then update_typing_ph() else add_typing_ph() end
+  else
+    remove_typing_ph()
+  end
+end
+
 -- The spinner hint text — phase-aware so the user always sees WHAT Claude is
 -- doing, not a generic "Working…". The 110ms tick re-renders it, so the seconds
 -- climb in place. Priority (most specific first):
@@ -1378,7 +1465,11 @@ local function spinner_label()
     parts[#parts + 1] = "thinking"
   elseif state.tool_run then
     parts[#parts + 1] = state.tool_run.label    -- e.g. "Running: tree -L 1"
-  else
+  elseif not state.typing_ph then
+    -- The in-body placeholder line already carries the "typing" word when it is
+    -- active, so omit it from the bracket to avoid the same word twice on one row.
+    -- Kept as a fallback for when the placeholder isn't shown (e.g. tests, or a
+    -- buffer-less state) so the bracket is never bare during the compose gap.
     parts[#parts + 1] = "typing"                -- model composing/emitting the reply
   end
   -- "\n" puts the interrupt hint on its OWN line (set_hint splits on newlines):
@@ -1393,6 +1484,9 @@ local function stop_spinner()
     vim.fn.timer_stop(state.spin_timer)
     state.spin_timer = nil
   end
+  -- Turn end / interrupt / reset all route through here — the compose gap is over,
+  -- so drop the in-body placeholder too (it must not outlive the turn).
+  remove_typing_ph()
   -- Drop the live phase indicators so a "Thinking…"/"Running…" label can't outlive
   -- the spinner (turn end / interrupt / reset all route through here). Safe because
   -- start_spinner's own stop_spinner call only fires between turns, never mid-phase.
@@ -1404,12 +1498,16 @@ end
 local function start_spinner()
   stop_spinner()
   spin_i = 1
+  -- Paint the placeholder BEFORE the hint so set_hint anchors its virt_text to the
+  -- placeholder (the new last line), not the line above it.
+  tick_typing_ph()
   set_hint(spinner_label(), "ClaudeInput")
   render_queue()
   state.spin_timer = vim.fn.timer_start(110, function()
     if not state.working then stop_spinner(); return end
-    if state.perm then return end   -- a permission card owns the hint; don't clobber
+    if state.perm then remove_typing_ph(); return end  -- a permission card owns the panel; don't clobber
     spin_i = spin_i % #SPINNER + 1
+    tick_typing_ph()
     set_hint(spinner_label(), "ClaudeInput")
     -- Re-anchor the queue to the (now lower) last line as output streams in.
     render_queue()
@@ -2776,6 +2874,9 @@ local function dispatch(event)
   elseif ev_type == "assistant" then
     -- assistant events carry a message with a content array. Each block is one
     -- of: text (prose), thinking (extended thinking), or tool_use.
+    -- The styled block REPLACES the in-body typing placeholder: drop it before any
+    -- render so content never lands below the placeholder line.
+    remove_typing_ph()
     local content = (event.message or {}).content or {}
     for _, block in ipairs(content) do
       local btype = block.type or ""
@@ -2796,6 +2897,9 @@ local function dispatch(event)
   elseif ev_type == "result" then
     -- result closes the current turn. After this, claude is waiting for more
     -- input — unlock the input bar (unless a diff review is still pending).
+    -- Drop the placeholder before render_result appends the churn line (it runs
+    -- before stop_spinner below, so the placeholder would otherwise sit above it).
+    remove_typing_ph()
     local result_text = event.result or ""
     render_result(result_text)
     -- total_cost_usd is the session's cumulative cost so far; store it for the
@@ -2819,6 +2923,9 @@ local function dispatch(event)
     -- The CLI is asking permission for a tool that isn't allowlisted (enabled by
     -- the --permission-prompt-tool stdio flag). tool_name/input/permission_
     -- suggestions live under `request`; the request_id we must echo is top-level.
+    -- The card / question selector renders in-body; drop the placeholder first so
+    -- it doesn't land above the card (the tick's perm-guard keeps it gone after).
+    remove_typing_ph()
     local req  = event.request or {}
     local tool = req.tool_name or ""
     if EDIT_TOOLS[tool] then
@@ -3162,6 +3269,12 @@ end
 -- Send a brand-new turn: echo the message into the transcript (normal colour),
 -- a blank line so the spinner gets its own line, then dispatch it.
 local function send(text)
+  -- Clear any lingering placeholder BEFORE the user echo. render_user runs before
+  -- dispatch_send's start_spinner, so a placeholder still on the last line (a turn
+  -- that ended without a result event, or a rapid re-send) would otherwise get the
+  -- echo appended below it — and then stop_spinner's "delete last line" would eat
+  -- the echo instead of the placeholder.
+  remove_typing_ph()
   render_user(text)
   buf_append({ "" })
   dispatch_send(text)

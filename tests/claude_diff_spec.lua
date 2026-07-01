@@ -5,6 +5,9 @@
 --   T14: augroup isolation — ClaudeDiff must not clobber OpencodeDiff
 --   T15: CORRECTION #1 — on_panel_open() disables autoread
 --   T16: CORRECTION #2 — fcs_choice set to "" (not "ignore")
+--   T17/T18: new-file path (pending-new → sweep_new whole-file-additions diff)
+--   T19: Goal 14.3 diff-review panel card — armed on open, resolves like the
+--        winbar/<leader>ca/cx fallback, fallback also clears a stale card
 -- The remaining CORRECTION behaviors (3,4,5) are exercised implicitly by T2/T7/T5.
 -- Run: nvim --headless -u NONE --cmd "set runtimepath+=." -c "luafile tests/claude_diff_spec.lua"
 
@@ -92,6 +95,19 @@ local scratch_name = vim.api.nvim_buf_get_name(D.state.scratch)
 H.check("T2 scratch named [Claude proposed]",
   scratch_name:match("%[Claude proposed%]") ~= nil, scratch_name)
 
+-- T19a: opening the diff also arms the panel card (Goal 14.3) with the same
+-- edit/new distinction the winbar makes.
+H.check("T19 diff card armed on open", claude.state.diff_card ~= nil,
+  vim.inspect(claude.state.diff_card))
+H.check("T19 diff card shows 'Modified: <name>' for an existing-file edit",
+  claude.state.diff_card and claude.state.diff_card.display == "Modified: alpha.txt",
+  vim.inspect(claude.state.diff_card and claude.state.diff_card.display))
+H.check("T19 diff card options are Accept/Reject",
+  claude.state.diff_card and #claude.state.diff_card.options == 2
+    and claude.state.diff_card.options[1].kind == "accept"
+    and claude.state.diff_card.options[2].kind == "reject",
+  vim.inspect(claude.state.diff_card and claude.state.diff_card.options))
+
 -- T3: immediate re-checktime → timestamps synced, no re-fire
 D.checktime_all()
 vim.wait(100)
@@ -113,6 +129,10 @@ H.check("T5 reject succeeded (no FAILED)",
 H.check("T5 disk restored to original",
   table.concat(vim.fn.readfile(file1), "|") == "a1|a2|a3",
   table.concat(vim.fn.readfile(file1), "|"))
+-- T19b: resolving via the FALLBACK path (D.reject_all directly, card untouched)
+-- must still clear the now-stale panel card — no float left orphaned behind.
+H.check("T19 fallback reject_all also clears the panel card",
+  claude.state.diff_card == nil, vim.inspect(claude.state.diff_card))
 D.checktime_all(); vim.wait(100); D.checktime_all(); vim.wait(100)
 H.check("T5 NO infinite re-queue after reject",
   fcs_count() == 2 and #claude.state.diff_queue == 0,
@@ -359,5 +379,73 @@ H.check("T18 new-file accept keeps file with proposed content",
   vim.fn.filereadable(newf2) == 1
     and table.concat(vim.fn.readfile(newf2), "|") == "keep1|keep2",
   "content=" .. table.concat(vim.fn.readfile(newf2), "|"))
+
+-- ─────────────────────────── T19c/d: resolving VIA the panel card itself
+
+-- 19c: Accept via claude._resolve_diff_card must behave exactly like accept_all
+-- — write to disk, close the diff, clear the card, unlock input.
+D2.state.pending_new = {}
+D2.state.new_files   = {}
+D2.state.current     = nil
+claude.state.diff_queue = {}
+local file3 = ws .. "/gamma.txt"
+vim.fn.writefile({ "g1", "g2" }, file3)
+vim.cmd("edit " .. file3)
+-- Snapshot the window set BEFORE the diff opens. If the scratch/card windows
+-- don't genuinely CLOSE on accept (BUG, live-observed 2026-07-01: a window
+-- fell back to a blank buffer instead of closing), the post-accept window set
+-- would differ from this baseline even though the window COUNT might still
+-- happen to match by coincidence — comparing the actual id sets catches both.
+local function win_set()
+  local s = {}
+  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do s[w] = true end
+  return s
+end
+local function win_set_eq(a, b)
+  for w in pairs(a) do if not b[w] then return false end end
+  for w in pairs(b) do if not a[w] then return false end end
+  return true
+end
+local wins_before_diff = win_set()
+H.ext_write(file3, { "g1", "g2", "g3" })
+D2.checktime_all()
+vim.wait(200, function() return D2.state.current ~= nil end)
+H.check("T19 card armed for existing-file edit before card-accept",
+  claude.state.diff_card and claude.state.diff_card.display == "Modified: gamma.txt",
+  vim.inspect(claude.state.diff_card))
+claude._resolve_diff_card("accept")
+vim.wait(200, function() return D2.state.current == nil end)
+H.check("T19 accept-via-card wrote proposed content",
+  table.concat(vim.fn.readfile(file3), "|") == "g1|g2|g3",
+  table.concat(vim.fn.readfile(file3), "|"))
+H.check("T19 accept-via-card leaves NO stray window (scratch+card fully closed)",
+  win_set_eq(wins_before_diff, win_set()),
+  vim.inspect(vim.tbl_keys(win_set())) .. " vs before " .. vim.inspect(vim.tbl_keys(wins_before_diff)))
+H.check("T19 accept-via-card cleared the panel card",
+  claude.state.diff_card == nil, vim.inspect(claude.state.diff_card))
+H.check("T19 accept-via-card unlocked input (diff_pending false)",
+  claude.state.diff_pending == false)
+
+-- 19d: Reject via the card on a NEW file must DELETE it, exactly matching the
+-- winbar's "reject (delete file)" wording/behaviour for new-file diffs.
+D2.state.pending_new = {}
+D2.state.new_files   = {}
+D2.state.current     = nil
+claude.state.diff_queue = {}
+local newf3 = ws .. "/card_new.txt"
+vim.fn.delete(newf3)
+D2.watch(newf3)
+vim.fn.writefile({ "x1" }, newf3)
+D2.poll()
+vim.wait(300, function() return D2.state.current ~= nil end)
+H.check("T19 card armed for new-file kind before card-reject",
+  claude.state.diff_card and claude.state.diff_card.display == "New file: card_new.txt",
+  vim.inspect(claude.state.diff_card))
+claude._resolve_diff_card("reject")
+vim.wait(200, function() return D2.state.current == nil end)
+H.check("T19 reject-via-card deletes the new file",
+  vim.fn.filereadable(newf3) == 0)
+H.check("T19 reject-via-card cleared the panel card",
+  claude.state.diff_card == nil, vim.inspect(claude.state.diff_card))
 
 H.summary("claude_diff")

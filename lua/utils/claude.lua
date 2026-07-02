@@ -112,6 +112,12 @@ mod.state = {
   -- we must not send a follow-up message while the previous edit is unreviewed.
   diff_pending  = false,
 
+  -- Held pre-write edit permission (Issue-B gate, prototype: Write/Edit), or nil.
+  -- { request_id, input } for the can_use_tool request the pre-write diff is
+  -- reviewing; on_prewrite_resolve releases it as allow/deny. The CLI blocks the
+  -- turn until then — exactly like a permission card, but the "card" is a vimdiff.
+  prewrite      = nil,
+
   -- Active permission card, or nil. Set while a non-edit can_use_tool request is
   -- awaiting the user's Allow once / Allow always / Reject choice; blocks input
   -- and owns the hint until resolved. Holds request_id, tool, input, suggestions,
@@ -2002,9 +2008,90 @@ local function send_permission_response(request_id, decision, o)
 end
 mod._send_permission_response = send_permission_response
 
--- Tools whose permission we auto-allow: edits stay vimdiff (the existing
--- FileChangedShell+vimdiff flow owns them), so gating them here would double-gate.
+-- Edit-family tools at the can_use_tool gate. GATED ones (Issue-B prototype:
+-- Write/Edit) hold the request open and show a PRE-write diff reconstructed from
+-- the tool input — accept releases "allow" (the CLI then writes + narrates,
+-- post-approval), reject releases "deny" (nothing touches disk). The rest
+-- (MultiEdit/NotebookEdit) keep the old contract: auto-allow, then the post-write
+-- FileChangedShell+vimdiff flow owns the review.
 local EDIT_TOOLS = { Edit = true, Write = true, MultiEdit = true, NotebookEdit = true }
+local GATED_EDIT_TOOLS = { Edit = true, Write = true }
+
+-- Reconstruct the post-edit file content for an Edit tool input WITHOUT the CLI
+-- having written anything: read the (still pristine) file from disk and mirror the
+-- CLI's plain-text old_string→new_string replacement, honouring replace_all.
+-- Returns a lines list, or nil when reconstruction isn't possible (file missing,
+-- old_string absent/empty) — the caller falls back to auto-allow + post-write.
+-- Disk, not buffer: the CLI edits the on-disk content, so unsaved buffer edits
+-- must not leak into the "proposed" side.
+local function reconstruct_edit(path, input)
+  local old_s, new_s = input.old_string, input.new_string
+  if type(old_s) ~= "string" or old_s == "" or type(new_s) ~= "string" then
+    return nil
+  end
+  local ok, lines = pcall(vim.fn.readfile, path)
+  if not ok then return nil end
+  local text = table.concat(lines, "\n")
+  local out
+  if input.replace_all then
+    -- split(plain)+concat replaces every occurrence with no pattern-escaping
+    -- pitfalls (old_s/new_s are literal strings, not Lua patterns).
+    local pieces = vim.split(text, old_s, { plain = true })
+    if #pieces < 2 then return nil end -- old_string not found
+    out = table.concat(pieces, new_s)
+  else
+    local s, e = string.find(text, old_s, 1, true)
+    if not s then return nil end
+    out = text:sub(1, s - 1) .. new_s .. text:sub(e + 1)
+  end
+  return vim.split(out, "\n", { plain = true })
+end
+mod._reconstruct_edit = reconstruct_edit
+
+-- Try to hold a gated edit's can_use_tool request behind a pre-write diff.
+-- Returns true when the diff is up (request stays open until the user decides);
+-- false → caller must auto-allow (old post-write flow) so the CLI never hangs.
+local function try_prewrite_gate(request_id, tool, input)
+  local path = input.file_path
+  if type(path) ~= "string" or path == "" then return false end
+  local proposed
+  if tool == "Write" then
+    proposed = vim.split(input.content or "", "\n", { plain = true })
+  else -- Edit
+    proposed = reconstruct_edit(path, input)
+  end
+  if not proposed then return false end
+  -- Arm the held request BEFORE opening the diff: the review card can resolve
+  -- synchronously in headless tests, and on_prewrite_resolve needs it set.
+  state.prewrite = { request_id = request_id, input = input }
+  local ok, opened = pcall(require("utils.claude_diff").open_prewrite, path, proposed)
+  if not (ok and opened) then
+    state.prewrite = nil
+    return false
+  end
+  return true
+end
+
+-- Release the held pre-write request: allow (CLI writes the file, then narrates —
+-- now post-approval) or deny (CLI never writes; the deny message tells it why).
+-- Called by claude_diff.accept_all/reject_all in prewrite mode, which also close
+-- the diff windows; the spinner restart mirrors resolve_permission (the turn is
+-- still in flight — the CLI was blocked on us).
+function mod.on_prewrite_resolve(accepted)
+  local p = state.prewrite
+  if not p then return end
+  state.prewrite = nil
+  if accepted then
+    send_permission_response(p.request_id, "allow", { input = p.input })
+  else
+    send_permission_response(p.request_id, "deny",
+      { message = "User rejected the proposed change in review" })
+  end
+  if state.working then
+    state.activity_t0 = vim.loop.now()
+    start_spinner()
+  end
+end
 
 -- ─── Permission card (step 4) ─────────────────────────────────────────────────
 -- Interactive bordered FLOAT for a non-edit can_use_tool request (Bash, WebFetch,
@@ -3195,7 +3282,10 @@ local function dispatch(event)
         -- catches the CLI's write (covers new + unloaded files). tool_use always
         -- precedes execution in the stream, so the buffer loads with pre-edit
         -- content. NotebookEdit carries notebook_path, the rest file_path.
-        if EDIT_NAMES[name] then
+        -- GATED tools are reviewed pre-write at can_use_tool instead — watching
+        -- them here would queue a post-write diff of the already-approved edit
+        -- (and put a new file in pending_new for sweep_new to double-gate).
+        if EDIT_NAMES[name] and not GATED_EDIT_TOOLS[name] then
           require("utils.claude_diff").watch(input.file_path or input.notebook_path)
         end
       end
@@ -3241,9 +3331,19 @@ local function dispatch(event)
     local req  = event.request or {}
     local tool = req.tool_name or ""
     if EDIT_TOOLS[tool] then
-      -- Edits stay vimdiff — auto-allow so the FileChangedShell+vimdiff flow owns
-      -- them. (Without this they'd double-gate: card here AND vimdiff after.)
-      send_permission_response(event.request_id, "allow", { input = req.input })
+      local input = req.input or {}
+      local gated = GATED_EDIT_TOOLS[tool]
+        and try_prewrite_gate(event.request_id, tool, input)
+      if not gated then
+        -- Post-write flow (MultiEdit/NotebookEdit, or a gated edit the pre-write
+        -- diff couldn't reconstruct/show): pre-load the target so the
+        -- FileChangedShell interceptor catches the write, then auto-allow — the
+        -- vimdiff review happens AFTER the CLI writes. (Gated tools skip watch()
+        -- at tool_use time, so the fallback must watch here; for the others this
+        -- is a harmless re-watch of the same path.)
+        require("utils.claude_diff").watch(input.file_path or input.notebook_path)
+        send_permission_response(event.request_id, "allow", { input = req.input })
+      end
     elseif tool == "AskUserQuestion" then
       -- Structured multiple-choice questions ride the same gate but are NOT an
       -- allow/reject decision — render the vertical question selector instead of
@@ -4248,6 +4348,7 @@ function mod.reset()
   state.working       = false
   state.system_ready  = false
   state.diff_pending  = false
+  state.prewrite      = nil
   if state.perm and state.perm.win and vim.api.nvim_win_is_valid(state.perm.win) then
     pcall(vim.api.nvim_win_close, state.perm.win, true)
   end

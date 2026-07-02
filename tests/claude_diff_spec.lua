@@ -448,4 +448,168 @@ H.check("T19 reject-via-card deletes the new file",
 H.check("T19 reject-via-card cleared the panel card",
   claude.state.diff_card == nil, vim.inspect(claude.state.diff_card))
 
+-- ── T20: Issue-B pre-write gate — existing file, accept → allow + silent reload ─
+-- open_prewrite shows disk (pristine) vs proposed (reconstructed from tool input);
+-- NOTHING is on disk yet. accept_all releases the held can_use_tool request as
+-- "allow" via claude.on_prewrite_resolve and flags the path approved so the FCS
+-- fired by the CLI's subsequent write reloads silently instead of double-gating.
+
+-- Hermetic start: earlier tests leave stale queue entries / pending paths behind
+-- (T13 deliberately strands a failed reject; T17–T19 churn new-file state). The
+-- pre-write flow must start from a clean slate or q-delta assertions misfire.
+D2.state.current     = nil
+D2.state.scratch     = nil
+D2.state.orig_buf    = nil
+D2.state.pending_new = {}
+D2.state.new_files   = {}
+D2.state.approved    = {}
+claude.state.diff_queue   = {}
+claude.state.diff_pending = false
+-- Flush FCS debris too: earlier tests changed files on disk under still-loaded
+-- buffers; the window churn during T20's mount would checktime them (nested
+-- WinEnter autocmd) and queue THEIR diffs behind the pre-write review, polluting
+-- the q-delta and reload assertions. Poll now and discard whatever surfaces.
+D2.poll()
+vim.wait(300)
+while D2.state.current do
+  local before = D2.state.current
+  D2.accept_all()
+  vim.wait(200, function() return D2.state.current ~= before end)
+end
+claude.state.diff_queue = {}
+
+-- Safe to stub chansend now: T8's real terminal job is long finished, and the
+-- stub is what lets us decode the control_response the resolve sends.
+local pw_sends = {}
+vim.fn.chansend = function(_, data) table.insert(pw_sends, data); return 1 end
+claude.state.job_id  = 4242
+claude.state.working = false -- skip the spinner restart branch (no panel here)
+
+local function last_pw_response()
+  local ok, ev = pcall(vim.json.decode, pw_sends[#pw_sends] or "")
+  if not ok or type(ev) ~= "table" or ev.type ~= "control_response" then return nil end
+  return ev
+end
+
+local pwf = ws .. "/prewrite.txt"
+vim.fn.writefile({ "p1", "p2", "p3" }, pwf)
+claude.state.prewrite = { request_id = "pw-1", input = { file_path = pwf } }
+local opened = D2.open_prewrite(pwf, { "p1", "P2-new", "p3" })
+vim.wait(200, function() return D2.state.current ~= nil end)
+H.check("T20 open_prewrite opens in prewrite mode",
+  opened == true and D2.state.current == pwf and D2.state.prewrite == true
+    and D2.state.kind == "edit",
+  vim.inspect({ opened, D2.state.current, D2.state.prewrite, D2.state.kind }))
+H.check("T20 two diff windows up", diff_win_count() == 2, "wins=" .. diff_win_count())
+H.check("T20 scratch shows the PROPOSED (unwritten) content",
+  H.buf_lines(D2.state.scratch) == "p1|P2-new|p3", H.buf_lines(D2.state.scratch))
+H.check("T20 disk still pristine while reviewing",
+  table.concat(vim.fn.readfile(pwf), "|") == "p1|p2|p3")
+H.check("T20 second open_prewrite refused while one is up",
+  D2.open_prewrite(pwf, { "x" }) == false)
+H.check("T20 panel card armed",
+  claude.state.diff_card ~= nil
+    and claude.state.diff_card.display == "Modified: prewrite.txt",
+  vim.inspect(claude.state.diff_card))
+
+D2.accept_all()
+vim.wait(200, function() return D2.state.current == nil end)
+local pr1 = last_pw_response()
+H.check("T20 accept releases the held request as allow",
+  pr1 and pr1.response.request_id == "pw-1"
+    and pr1.response.response.behavior == "allow", vim.inspect(pr1))
+H.check("T20 held request cleared", claude.state.prewrite == nil)
+H.check("T20 diff closed + mode reset",
+  D2.state.current == nil and D2.state.prewrite == false)
+H.check("T20 path flagged approved for the incoming write",
+  D2.state.approved[pwf] == true, vim.inspect(D2.state.approved))
+
+-- The CLI (allowed) now performs the write. poll's checktime must RELOAD the
+-- loaded buffer silently — no second review of an already-approved change.
+-- (q-delta can't be asserted: earlier tests' deleted-file buffers re-fire FCS on
+-- EVERY checktime, so unrelated debris flows through the queue. Assert on the
+-- approved path specifically instead.)
+vim.fn.writefile({ "p1", "P2-new", "p3" }, pwf)
+D2.poll()
+vim.wait(300)
+H.check("T20 approved write reloads silently (log)",
+  has_log("^fcs%-approved%-reload:"), table.concat(D2.state.log, ","))
+local pwf_requeued = D2.state.current == pwf
+for _, p in ipairs(claude.state.diff_queue) do
+  if p == pwf then pwf_requeued = true end
+end
+H.check("T20 approved write NOT re-reviewed (no queue/current entry)",
+  not pwf_requeued,
+  "current=" .. tostring(D2.state.current)
+    .. " q=" .. vim.inspect(claude.state.diff_queue))
+vim.wait(500, function() return H.buf_lines(vim.fn.bufnr(pwf)) == "p1|P2-new|p3" end)
+H.check("T20 buffer reloaded to the approved content",
+  H.buf_lines(vim.fn.bufnr(pwf)) == "p1|P2-new|p3",
+  H.buf_lines(vim.fn.bufnr(pwf)))
+H.check("T20 approved flag is one-shot", D2.state.approved[pwf] == nil)
+
+-- ── T21: pre-write gate — NEW file, reject → deny, nothing ever on disk ───────
+local pwn = ws .. "/prewrite_new.txt"
+claude.state.prewrite = { request_id = "pw-2", input = { file_path = pwn } }
+local opened2 = D2.open_prewrite(pwn, { "n1", "n2" })
+vim.wait(200, function() return D2.state.current ~= nil end)
+H.check("T21 new-file prewrite opens as kind=new",
+  opened2 == true and D2.state.kind == "new" and D2.state.prewrite == true,
+  vim.inspect({ opened2, D2.state.kind, D2.state.prewrite }))
+H.check("T21 'current' side is a scratch (no real-path buffer → no W13 trap)",
+  D2.state.orig_buf and vim.bo[D2.state.orig_buf].buftype == "nofile",
+  tostring(D2.state.orig_buf))
+H.check("T21 card says New file",
+  claude.state.diff_card ~= nil
+    and claude.state.diff_card.display == "New file: prewrite_new.txt",
+  vim.inspect(claude.state.diff_card))
+
+local orig_scratch = D2.state.orig_buf
+D2.reject_all()
+vim.wait(200, function() return D2.state.current == nil end)
+local pr2 = last_pw_response()
+H.check("T21 reject releases the held request as deny",
+  pr2 and pr2.response.request_id == "pw-2"
+    and pr2.response.response.behavior == "deny", vim.inspect(pr2))
+H.check("T21 file never touched disk", vim.fn.filereadable(pwn) == 0)
+H.check("T21 throwaway 'current' scratch wiped",
+  not vim.api.nvim_buf_is_valid(orig_scratch))
+H.check("T21 diff closed + card cleared",
+  D2.state.current == nil and claude.state.diff_card == nil)
+
+-- ── T22: pre-write gate — NEW file, accept → allow, reveal created file ───────
+-- The buggy path pre-fix: accepting a new-file pre-write left NO buffer to catch
+-- the CLI's async write, so close_diff restored the diff window to a blank
+-- alternate buffer and the created file never appeared. accept_all now records
+-- reveal_new; poll()→reveal_created opens the file once the write lands.
+local pwn2 = ws .. "/prewrite_new_accept.txt"
+vim.fn.delete(pwn2)
+claude.state.prewrite = { request_id = "pw-3", input = { file_path = pwn2 } }
+local opened3 = D2.open_prewrite(pwn2, { "created-1", "created-2" })
+vim.wait(200, function() return D2.state.current ~= nil end)
+H.check("T22 new-file prewrite opens as kind=new",
+  opened3 == true and D2.state.kind == "new" and D2.state.prewrite == true,
+  vim.inspect({ opened3, D2.state.kind, D2.state.prewrite }))
+
+D2.accept_all()
+vim.wait(200, function() return D2.state.current == nil end)
+local pr3 = last_pw_response()
+H.check("T22 accept releases the held request as allow",
+  pr3 and pr3.response.request_id == "pw-3"
+    and pr3.response.response.behavior == "allow", vim.inspect(pr3))
+H.check("T22 new file recorded for reveal (no approved flag — no buffer to reload)",
+  D2.state.reveal_new == pwn2 and D2.state.approved[pwn2] == nil,
+  vim.inspect({ D2.state.reveal_new, D2.state.approved[pwn2] }))
+
+-- The CLI (allowed) now performs the write; poll reveals it in an editor window.
+vim.fn.writefile({ "created-1", "created-2" }, pwn2)
+D2.poll()
+vim.wait(300)
+H.check("T22 reveal_new cleared after reveal", D2.state.reveal_new == nil)
+H.check("T22 created file is open in a window with its content",
+  vim.fn.bufwinid(vim.fn.bufnr(pwn2)) ~= -1
+    and H.buf_lines(vim.fn.bufnr(pwn2)) == "created-1|created-2",
+  "winid=" .. vim.fn.bufwinid(vim.fn.bufnr(pwn2))
+    .. " content=" .. H.buf_lines(vim.fn.bufnr(pwn2)))
+
 H.summary("claude_diff")

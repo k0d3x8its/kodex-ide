@@ -233,6 +233,18 @@ return {
       group    = vim.api.nvim_create_augroup("ClaudeHighlights", { clear = true }),
       callback = define_highlights,
     })
+
+    -- Right-click "Ask Claude" on a visual selection, at the TOP of the PopUp
+    -- menu (above Cut/Copy/Paste). vnoremenu = shown only in visual mode (when
+    -- text is highlighted); the default mousemodel "popup_setpos" keeps the
+    -- selection when the click lands inside it, so ask_selection reads '<,'>.
+    -- The 1.x priority prefixes force it above the default entries (~500); a
+    -- separator sits just below it. Registered in init (runs at startup) so the
+    -- menu exists before the panel's keys lazy-load.
+    vim.cmd([[
+      vnoremenu 1.10 PopUp.Ask\ Claude  <Cmd>lua require('utils.claude').ask_selection()<CR>
+      vnoremenu 1.20 PopUp.-ClaudeSep-  <Nop>
+    ]])
   end,
 
   keys = {

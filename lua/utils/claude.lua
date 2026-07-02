@@ -268,8 +268,11 @@ end
 -- suffixes), so "claude-opus-4-8" → "Opus 4.8". Mirrors ingest.py _MODEL_NAMES;
 -- the most recent ids come first so a longer id never shadows a shorter prefix.
 local MODEL_NAMES = {
+  { "claude-fable-5",             "Fable 5" },
   { "claude-opus-4-8",            "Opus 4.8" },
   { "claude-opus-4-7",           "Opus 4.7" },
+  { "claude-opus-4-6",           "Opus 4.6" },
+  { "claude-sonnet-5",           "Sonnet 5" },
   { "claude-sonnet-4-6",         "Sonnet 4.6" },
   { "claude-haiku-4-5",          "Haiku 4.5" },
   { "claude-opus-4-5",           "Opus 4.5" },
@@ -281,7 +284,7 @@ local MODEL_NAMES = {
   -- exact id) → the friendly name of the latest model in each family. Listed
   -- LAST so a full date-suffixed id always matches its specific entry first.
   { "opus",                      "Opus 4.8" },
-  { "sonnet",                    "Sonnet 4.6" },
+  { "sonnet",                    "Sonnet 5" },
   { "haiku",                     "Haiku 4.5" },
 }
 
@@ -4374,10 +4377,20 @@ end
 
 -- ─── Model picker + plan-mode toggle ─────────────────────────────────────────
 
--- Selectable model aliases. "default" clears --model (CLI/account default).
--- Aliases resolve to the latest of each family at spawn time, matching the
--- terminal's `--model opus|sonnet|haiku`.
-local MODEL_CHOICES = { "default", "opus", "sonnet", "haiku" }
+-- Selectable models, newest-first per family. No selection (state.model stays
+-- nil) leaves --model unset, so the CLI/account default is used. Bare aliases
+-- ("opus"/"sonnet"/"haiku") resolve to the latest of each family at spawn
+-- time, matching the terminal's `--model opus|sonnet|haiku`; older/pinned
+-- versions use the dated full id since the CLI has no bare alias for them.
+local MODEL_CHOICES = {
+  { label = "Fable 5",    value = "claude-fable-5" },
+  { label = "Opus 4.8",   value = "opus" },
+  { label = "Opus 4.7",   value = "claude-opus-4-7" },
+  { label = "Opus 4.6",   value = "claude-opus-4-6" },
+  { label = "Sonnet 5",   value = "sonnet" },
+  { label = "Sonnet 4.6", value = "claude-sonnet-4-6" },
+  { label = "Haiku 4.5",  value = "haiku" },
+}
 
 --- Pick the model for the panel session (`<leader>cm`).
 -- Model is a spawn-time flag, so a running session can't switch mid-flight: we
@@ -4385,20 +4398,23 @@ local MODEL_CHOICES = { "default", "opus", "sonnet", "haiku" }
 -- That resets conversation context, so we tell the user. The banner updates at
 -- once to reflect the choice.
 function mod.pick_model()
-  vim.ui.select(MODEL_CHOICES, { prompt = "Claude model" }, function(choice)
+  vim.ui.select(MODEL_CHOICES, {
+    prompt = "Claude model",
+    kind = "claude_model",   -- lets dressing.lua size this picker independently
+    format_item = function(item) return item.label end,
+  }, function(choice)
     if not choice then return end
-    state.model = (choice == "default") and nil or choice
+    state.model = choice.value
     -- Tear down the live process so the next message respawns with --model.
     local had_session = state.job_id ~= nil
     stop_process()
-    -- Reflect immediately in the banner. friendly_model maps the alias to the
-    -- full display name ("sonnet" → "Sonnet 4.6"); "default" blanks the line so
-    -- system/init fills the real model after the first message.
+    -- Reflect immediately in the banner. friendly_model maps the alias/id to
+    -- the full display name ("sonnet" → "Sonnet 5").
     local fm = state.model and friendly_model(state.model) or ""
     state.model_display = fm   -- modal statusline; "" until system/init re-fills it
     update_banner_model(fm)
     vim.notify(
-      "Claude model → " .. choice ..
+      "Claude model → " .. choice.label ..
       (had_session and "  (new session — context reset)" or ""),
       vim.log.levels.INFO
     )

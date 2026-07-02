@@ -1629,17 +1629,42 @@ local function render_user(text)
     buf_append({ sep_line() })
     hl_lines(sep_at, sep_at, "ClaudeHeader")
   end
+  -- Fence-aware echo: prose lines get the ❯ arrow (first) / 2-space indent and
+  -- ClaudeUser; a ```lang fenced block (e.g. the selection from <leader>cq)
+  -- renders as a real syntax-highlighted code block via render_code_block, so
+  -- the user's own submitted code reads the same as Claude's code blocks — not
+  -- literal backticks. Only fences are special-cased; a plain message with no
+  -- fence renders exactly as before.
   local raw = vim.split(text, "\n", { plain = true })
-  local lines = {}
-  for i, l in ipairs(raw) do
-    lines[i] = (i == 1 and USER_ARROW or "  ") .. l
+  local idx, prose_row = 1, 0
+  while idx <= #raw do
+    local line = raw[idx]
+    if is_fence(line) then
+      local lang = line:match("^%s*```%s*(%S*)") or ""
+      local body, j = {}, idx + 1
+      while j <= #raw and not is_fence(raw[j]) do
+        body[#body + 1] = raw[j]; j = j + 1
+      end
+      local clean, hls = render_code_block(lang, body)
+      local cfirst = vim.api.nvim_buf_line_count(state.panel_buf)
+      buf_append(clean)
+      for li = 1, #clean do
+        local ln = cfirst + li - 1
+        for _, h in ipairs(hls[li]) do hl_range(ln, h[1], h[2], h[3]) end
+      end
+      idx = (j <= #raw) and j + 1 or j          -- skip the closing fence
+    else
+      prose_row = prose_row + 1
+      local disp = (prose_row == 1 and USER_ARROW or "  ") .. line
+      local ln   = vim.api.nvim_buf_line_count(state.panel_buf)
+      buf_append({ disp })
+      hl_lines(ln, ln, "ClaudeUser")
+      -- Paint just the arrow glyph terminal-green so it reads like a shell
+      -- prompt and matches the input bar's arrow.
+      if prose_row == 1 then hl_range(ln, 0, #USER_ARROW, "ClaudeArrow") end
+      idx = idx + 1
+    end
   end
-  local first = vim.api.nvim_buf_line_count(state.panel_buf)
-  buf_append(lines)
-  hl_lines(first, first + #lines - 1, "ClaudeUser")
-  -- Paint just the arrow glyph terminal-green so it reads like a shell prompt
-  -- and matches the input bar's arrow.
-  hl_range(first, 0, #USER_ARROW, "ClaudeArrow")
 end
 
 -- Foldtext for a collapsed thinking block. The buffer's first fold line is the
@@ -4045,6 +4070,111 @@ local function open_chat_float(title, callback, opts)
   vim.cmd("startinsert!")   -- ! = start after existing content (end of prompt)
 end
 
+-- Selection-anchored input float (<leader>cq). Unlike the panel chat bar, this
+-- pops right where the user is working — anchored to the cursor/selection in the
+-- CURRENT file window (relative="cursor") — so they ask about highlighted code
+-- in place, not on the panel. Deliberately lean: no burn meters, no panel
+-- bottom-pad, no panel-column resize tracking (all of which couple the chat bar
+-- to the panel). On submit the caller (ask_selection) opens/answers in the panel.
+local function open_selection_float(title, callback)
+  local mode_label = (state.permission_mode == "plan") and " - Plan Mode" or " - Build Mode"
+  local label      = title .. mode_label
+
+  -- Fit inside the current (file) window, clamped to a comfortable range.
+  local win_w   = vim.api.nvim_win_get_width(0)
+  local float_w = math.min(math.max(win_w - 8, 30), 80)
+
+  local ibuf = vim.api.nvim_create_buf(false, true)
+  vim.bo[ibuf].buftype   = "prompt"   -- <CR> fires prompt_setcallback
+  vim.bo[ibuf].bufhidden = "wipe"
+  vim.bo[ibuf].swapfile  = false
+  vim.bo[ibuf].filetype  = "claude"   -- same modal statusline styling as the bar
+
+  -- Anchor just below the cursor — after ask_selection escapes visual mode the
+  -- cursor sits at the selection end ('>), so the box lands on the highlight.
+  -- nvim auto-flips it above the line if it would run off the bottom of screen.
+  local win = vim.api.nvim_open_win(ibuf, true, {
+    relative  = "cursor",
+    anchor    = "NW",
+    row       = 1,
+    col       = 0,
+    width     = float_w,
+    height    = 1,
+    border    = "rounded",
+    style     = "minimal",
+    title     = " " .. label .. " ",
+    title_pos = "left",
+    zindex    = 60,
+  })
+
+  local border_hl = (state.permission_mode == "plan") and "ClaudeBarBorderPlan" or "ClaudeBarBorder"
+  vim.wo[win].winhighlight = "FloatBorder:" .. border_hl
+    .. ",FloatTitle:" .. border_hl
+    .. ",NormalFloat:ClaudeBarBg"
+  vim.wo[win].wrap      = true
+  vim.wo[win].linebreak = true
+  harden_float_scroll(win)
+
+  -- Grow up to MAX_INPUT_ROWS as the question wraps (no meters/pad to reconcile).
+  local MAX_INPUT_ROWS = 12
+  local cur_rows = 1
+  local function fit_height_now()
+    if not vim.api.nvim_win_is_valid(win) then return end
+    local rows = 0
+    for _, l in ipairs(vim.api.nvim_buf_get_lines(ibuf, 0, -1, false)) do
+      rows = rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / float_w))
+    end
+    rows = math.min(math.max(rows, 1), MAX_INPUT_ROWS)
+    if rows ~= cur_rows then
+      cur_rows = rows
+      local c = vim.api.nvim_win_get_config(win)
+      c.height = rows
+      vim.api.nvim_win_set_config(win, c)
+    end
+  end
+  vim.api.nvim_create_autocmd({ "TextChangedI", "TextChanged", "TextChangedP" }, {
+    buffer = ibuf, callback = fit_height_now,
+  })
+
+  vim.fn.prompt_setprompt(ibuf, "❯ ")
+  vim.fn.matchadd("ClaudeArrow", "^❯")
+  -- Ensure a visible cursor while typing (the panel hides it globally).
+  vim.o.guicursor = state.real_guicursor or "a:block,a:blinkon0"
+
+  local closed = false
+  local function close()
+    if closed then return end
+    closed = true
+    pcall(vim.api.nvim_del_augroup_by_name, "ClaudeSelectionFloat")
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end
+
+  vim.fn.prompt_setcallback(ibuf, function(text)
+    close()
+    callback(text ~= "" and text or nil)
+  end)
+
+  vim.keymap.set("i", "<Esc>", function() close(); callback(nil) end,
+    { buffer = ibuf, nowait = true, silent = true })
+  vim.keymap.set("n", "<Esc>", function() close(); callback(nil) end,
+    { buffer = ibuf, nowait = true, silent = true })
+  vim.keymap.set("n", "q", function() close(); callback(nil) end,
+    { buffer = ibuf, nowait = true, silent = true })
+
+  -- Dismiss if focus leaves the box (clicked away). close() guards re-entry, so
+  -- the submit path (which shifts focus to the panel) closing it too is harmless.
+  local grp = vim.api.nvim_create_augroup("ClaudeSelectionFloat", { clear = true })
+  vim.api.nvim_create_autocmd({ "WinLeave", "BufLeave" }, {
+    group = grp, buffer = ibuf, once = true,
+    callback = function() close() end,
+  })
+
+  vim.cmd("startinsert!")
+end
+mod._open_selection_float = open_selection_float
+
 -- Test seam: the input float is a real nvim_open_win prompt buffer, which can't
 -- be driven from a headless spec (no interactive <CR>). Routing both input
 -- entry points (prompt_input, ask_selection) through this indirection lets the
@@ -4653,8 +4783,15 @@ function mod.ask_selection()
     vim.notify("Claude: no text selected", vim.log.levels.WARN)
     return
   end
+  -- Filetype of the source file → the fenced-block language, so the selection
+  -- renders syntax-highlighted (both in the panel echo and for Claude). Captured
+  -- now while the file buffer is still current — the float switches buffers.
+  local lang = vim.bo.filetype or ""
 
-  mod._open_chat_float("Ask claude @selection", function(question)
+  -- Input pops at the selection in the FILE window (not on the panel), so the
+  -- user asks about the highlight in place. On submit the panel opens (if closed)
+  -- or answers in the already-open panel.
+  mod._open_selection_float("Ask Claude about selection", function(question)
     if not question then return end
     -- Open the panel first (idempotent if already open), then send.
     mod.open()
@@ -4662,7 +4799,7 @@ function mod.ask_selection()
     -- sending the message after a scheduler tick ensures the panel is fully
     -- initialised before we try to write to the subprocess stdin.
     vim.schedule(function()
-      submit(question .. "\n\n```\n" .. selection .. "\n```")
+      submit(question .. "\n\n```" .. lang .. "\n" .. selection .. "\n```")
     end)
   end)
 end

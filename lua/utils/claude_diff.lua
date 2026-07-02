@@ -34,6 +34,19 @@ M.state = {
   -- on disk). sweep_new() promotes each to new_files + the diff queue once it lands.
   pending_new = {}, -- abs path → true, awaiting creation on disk
   new_files   = {}, -- abs path → true, queued/open as a whole-file-additions diff
+  -- Issue-B pre-write gate (prototype: Write/Edit). When true, the open diff shows
+  -- content reconstructed from the tool INPUT — the file is NOT yet written. Accept
+  -- releases the held can_use_tool request as "allow" (the CLI then writes), reject
+  -- as "deny" (nothing ever touches disk). MultiEdit/NotebookEdit stay post-write.
+  prewrite = false,
+  -- abs path → true: an approved pre-write edit is about to land on disk. The FCS
+  -- interceptor consumes the flag and silently reloads instead of queueing a diff —
+  -- without this the approved write would be double-gated by the post-write flow.
+  approved = {},
+  -- abs path of an approved pre-write NEW file, awaiting reveal. Unlike an edit
+  -- (whose loaded buffer FCS-reloads), a new file has no buffer to repaint, so
+  -- poll() opens it in an editor window once the CLI's write lands. Single-shot.
+  reveal_new = nil,
 }
 
 local function log(msg)
@@ -134,9 +147,31 @@ local function close_diff()
       pcall(vim.api.nvim_buf_delete, s.scratch, { force = true })
     end
   end
+  -- Pre-write new-file case: the "current" side is a throwaway scratch (a real-path
+  -- buffer would be BF_NEW and trip W13 on the post-approval checktime). Wipe it —
+  -- unlike the post-write orig, there's no file content worth keeping on screen.
+  -- The window must be MOVED OFF the scratch first: when it's the only normal
+  -- window and a float (the review card) is focused, nvim_buf_delete silently
+  -- no-ops — it returns success but the buffer stays valid (live-reproduced).
+  -- `buffer #` restores whatever the window showed before mount_diff replaced it;
+  -- a fresh empty buffer is the fallback when no alternate exists.
+  if s.prewrite and s.kind == "new"
+      and s.orig_buf and vim.api.nvim_buf_is_valid(s.orig_buf) then
+    local w = vim.fn.bufwinid(s.orig_buf)
+    if w ~= -1 then
+      local restored = pcall(vim.api.nvim_win_call, w, function()
+        vim.cmd("buffer #")
+      end)
+      if not restored then
+        pcall(vim.api.nvim_win_set_buf, w, vim.api.nvim_create_buf(true, false))
+      end
+    end
+    pcall(vim.api.nvim_buf_delete, s.orig_buf, { force = true })
+  end
   if s.current then M.state.new_files[s.current] = nil end
   s.current, s.scratch, s.orig_buf = nil, nil, nil
   s.kind = "edit"
+  s.prewrite = false
   -- Notify the Claude panel that the diff is resolved so it can unlock the
   -- input bar (MG 7.2 — mirrors the on_diff_open call in open_diff below).
   claude.on_diff_close()
@@ -145,6 +180,26 @@ end
 
 function M.accept_all()
   local s = M.state
+  -- Pre-write gate: nothing to write — accepting RELEASES the held permission
+  -- request as "allow"; the CLI does the write itself right after. Flag the path
+  -- approved first so the FCS the write triggers reloads silently (no second diff).
+  if s.prewrite then
+    if s.current and s.kind ~= "new" then
+      M.state.approved[s.current] = true
+    elseif s.current and s.kind == "new" then
+      -- New file: no real-path buffer catches the CLI's async write (one would be
+      -- BF_NEW and trip W13, the trap open_prewrite dodges with a throwaway scratch),
+      -- so the FCS approved-reload path can't run. Without this, close_diff restores
+      -- the diff window to a blank alternate buffer and the created file never shows
+      -- (live-observed 2026-07-01: new-file approve left a blank page on screen).
+      -- Record the path; poll() reveals it in an editor window once the write lands.
+      M.state.reveal_new = s.current
+    end
+    log("prewrite-accept:" .. tostring(s.current))
+    claude.on_prewrite_resolve(true)
+    close_diff()
+    return
+  end
   -- The original buffer can be :bd'd while the scratch diff is still open;
   -- writing into an invalid buffer throws. Bail to the next queue item instead.
   if not (s.scratch  and vim.api.nvim_buf_is_valid(s.scratch)
@@ -181,6 +236,14 @@ end
 
 function M.reject_all()
   local s = M.state
+  -- Pre-write gate: the file was never written — rejecting DENIES the held
+  -- permission request and the CLI moves on. No disk revert, no file delete.
+  if s.prewrite then
+    log("prewrite-reject:" .. tostring(s.current))
+    claude.on_prewrite_resolve(false)
+    close_diff()
+    return
+  end
   -- New file: rejecting means it should NOT exist. Delete it from disk (writing
   -- the empty orig back would leave a stray empty file) and wipe its buffer.
   if s.kind == "new" then
@@ -259,48 +322,10 @@ local function editor_win()
   return nil
 end
 
-local function open_diff(path)
-  local s = M.state
-  local is_new = M.state.new_files[path] == true
-
-  local buf
-  if is_new then
-    -- Claude CREATED this file: no pre-existing buffer. Add + load one for the
-    -- path (it exists on disk now — sweep_new only queues readable paths), then
-    -- blank it below so the "original" side reads as empty and the diff renders
-    -- the whole file as additions.
-    buf = vim.fn.bufadd(path)
-    vim.fn.bufload(buf)
-  else
-    buf = vim.fn.bufnr(path)
-    if buf == -1 then
-      log("no-buffer:" .. path) -- v1 limitation: see header comment
-      vim.schedule(M.process_next) -- don't strand the rest of the queue
-      return
-    end
-  end
-  -- Claude may have DELETED the file (FCS fires for deletion too); readfile
-  -- then throws inside this scheduled callback. Skip and drain the queue.
-  local ok, disk = pcall(vim.fn.readfile, path)
-  if not ok then
-    log("readfile-failed:" .. path)
-    M.state.new_files[path] = nil
-    vim.schedule(M.process_next)
-    return
-  end
-
-  -- For a new file the original is empty (it did not exist); blank the orig buffer
-  -- so diffthis shows every line as an addition. accept_all then writes the
-  -- proposed content straight back (no-op vs disk); reject_all deletes the file.
-  if is_new then
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
-  end
-
-  local scratch = vim.api.nvim_create_buf(false, true) -- nofile scratch
-  vim.api.nvim_buf_set_lines(scratch, 0, -1, false, disk)
-  vim.api.nvim_buf_set_name(scratch,
-    "[Claude proposed] " .. vim.fn.fnamemodify(path, ":t"))
-
+-- Shared window mount for BOTH diff flavours (post-write open_diff and pre-write
+-- open_prewrite): host the orig buffer in a real editor window, split the scratch
+-- (proposed) to its right, diffthis both, wrap, lenses, winbar, keymaps.
+local function mount_diff(buf, scratch, is_new, prewrite)
   local win = vim.fn.bufwinid(buf)
   if win ~= -1 then
     -- Orig buffer already on screen: focus its window.
@@ -356,21 +381,81 @@ local function open_diff(path)
 
   -- MG 7.2: winbar on the scratch window so the user always knows what to do
   -- without reading a notify that may have scrolled away.
-  local scratch_win = vim.api.nvim_get_current_win()
-  -- New-file reject DELETES the file (it shouldn't exist); say so in the winbar so
-  -- the user isn't surprised that <leader>cx removes the file rather than reverting.
-  vim.wo[scratch_win].winbar = is_new
-    and "⚠ Claude created (new file)  │  <leader>ca accept all  │  <leader>cx reject (delete file)"
-    or  "⚠ Claude proposed  │  <leader>ca accept all  │  <leader>cx reject all"
+  -- Post-write new-file reject DELETES the file (it shouldn't exist); pre-write
+  -- wording says approve/deny — nothing is on disk yet either way.
+  local winbar
+  if prewrite then
+    winbar = is_new
+      and "⚠ Claude proposes new file  │  <leader>ca approve & create  │  <leader>cx deny"
+      or  "⚠ Claude proposes  │  <leader>ca approve & write  │  <leader>cx deny"
+  else
+    winbar = is_new
+      and "⚠ Claude created (new file)  │  <leader>ca accept all  │  <leader>cx reject (delete file)"
+      or  "⚠ Claude proposed  │  <leader>ca accept all  │  <leader>cx reject all"
+  end
+  vim.wo[scratch_win].winbar = winbar
 
   -- Buffer-local on the scratch only (FINDINGS.md Q10) — auto-removed on close.
   vim.keymap.set("n", "<leader>ca", M.accept_all,
     { buffer = scratch, desc = "Claude diff: accept all" })
   vim.keymap.set("n", "<leader>cx", M.reject_all,
     { buffer = scratch, desc = "Claude diff: reject all" })
+end
+
+local function open_diff(path)
+  local s = M.state
+  local is_new = M.state.new_files[path] == true
+
+  local buf
+  if is_new then
+    -- Claude CREATED this file: no pre-existing buffer. Add + load one for the
+    -- path (it exists on disk now — sweep_new only queues readable paths), then
+    -- blank it below so the "original" side reads as empty and the diff renders
+    -- the whole file as additions.
+    buf = vim.fn.bufadd(path)
+    vim.fn.bufload(buf)
+  else
+    buf = vim.fn.bufnr(path)
+    if buf == -1 then
+      log("no-buffer:" .. path) -- v1 limitation: see header comment
+      vim.schedule(M.process_next) -- don't strand the rest of the queue
+      return
+    end
+  end
+  -- Claude may have DELETED the file (FCS fires for deletion too); readfile
+  -- then throws inside this scheduled callback. Skip and drain the queue.
+  local ok, disk = pcall(vim.fn.readfile, path)
+  if not ok then
+    log("readfile-failed:" .. path)
+    M.state.new_files[path] = nil
+    vim.schedule(M.process_next)
+    return
+  end
+
+  -- For a new file the original is empty (it did not exist); blank the orig buffer
+  -- so diffthis shows every line as an addition. accept_all then writes the
+  -- proposed content straight back (no-op vs disk); reject_all deletes the file.
+  if is_new then
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
+  end
+
+  local scratch = vim.api.nvim_create_buf(false, true) -- nofile scratch
+  vim.api.nvim_buf_set_lines(scratch, 0, -1, false, disk)
+  vim.api.nvim_buf_set_name(scratch,
+    "[Claude proposed] " .. vim.fn.fnamemodify(path, ":t"))
+  -- Match the real file's filetype so the proposed column gets the same
+  -- syntax/treesitter (Dracula) highlighting as the orig column — a bare nofile
+  -- scratch has no filetype and renders plain, so the right pane looked unlit
+  -- next to the highlighted left pane (live-observed 2026-07-01). Match on the
+  -- real path, not the "[Claude proposed] …" buffer name which never matches.
+  local ft = vim.filetype.match({ filename = path })
+  if ft then vim.bo[scratch].filetype = ft end
+
+  mount_diff(buf, scratch, is_new, false)
 
   s.current, s.scratch, s.orig_buf = path, scratch, buf
   s.kind = is_new and "new" or "edit"
+  s.prewrite = false
 
   -- MG 7.2: notify the Claude panel so it locks the input bar and updates the
   -- virtual-text hint to "⚠ Awaiting review…". Prevents the user from sending
@@ -406,6 +491,69 @@ function M.process_next()
   open_diff(table.remove(queue(), 1))
 end
 
+-- Issue-B pre-write gate (prototype). Open a diff for a proposed edit BEFORE the
+-- CLI writes it: orig side = current disk content, scratch side = `proposed`
+-- (reconstructed from the tool input by claude.lua). The held can_use_tool
+-- request resolves through accept_all/reject_all → claude.on_prewrite_resolve.
+-- Returns false when a diff is already open (one review at a time — the caller
+-- falls back to the post-write flow) so the CLI is never left waiting on a gate
+-- we can't show.
+function M.open_prewrite(path, proposed)
+  local s = M.state
+  if s.current ~= nil then return false end
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local is_new = vim.fn.filereadable(abs) == 0
+
+  local buf
+  if is_new then
+    -- The "current" side of a new file is a throwaway EMPTY scratch — a real-path
+    -- buffer here would be BF_NEW, and the post-approval checktime would raise the
+    -- blocking W13 dialog on it (the exact trap watch() dodges). close_diff wipes it.
+    buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_name(buf, "[No file] " .. vim.fn.fnamemodify(abs, ":t"))
+  else
+    -- Real pre-edit content: the file is still untouched on disk, so loading the
+    -- buffer (or reusing an already-loaded one) IS the "before" side.
+    buf = vim.fn.bufadd(abs)
+    if buf == 0 then
+      log("prewrite-bufadd-failed:" .. abs)
+      return false
+    end
+    vim.fn.bufload(buf)
+  end
+
+  local scratch = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(scratch, 0, -1, false, proposed)
+  vim.api.nvim_buf_set_name(scratch,
+    "[Claude proposed] " .. vim.fn.fnamemodify(abs, ":t"))
+  -- Filetype = same syntax/treesitter (Dracula) highlighting as the orig column;
+  -- see open_diff for why (bare nofile scratch renders plain). Match on abs path.
+  local ft = vim.filetype.match({ filename = abs })
+  if ft then vim.bo[scratch].filetype = ft end
+
+  mount_diff(buf, scratch, is_new, true)
+
+  s.current, s.scratch, s.orig_buf = abs, scratch, buf
+  s.kind = is_new and "new" or "edit"
+  s.prewrite = true
+
+  -- Same panel bridge as open_diff: lock the input bar + raise the Accept/Reject
+  -- card (pcall for the same never-take-down-the-diff reason documented there).
+  local ok, err = pcall(claude.on_diff_open, { path = abs, kind = s.kind })
+  if not ok then
+    log("on-diff-open-FAILED:" .. tostring(err))
+    vim.schedule(function()
+      vim.notify(
+        "Claude: diff review card failed to open (" .. tostring(err)
+          .. ") — use <leader>ca/<leader>cx in the diff window instead",
+        vim.log.levels.ERROR
+      )
+    end)
+  end
+  log("prewrite-open:" .. abs)
+  return true
+end
+
 -- ────────────────────────────────────────────────────────────────────── autocmds
 
 -- CORRECTION #3: bare :checktime fires FileChangedShell only for the CURRENT
@@ -434,12 +582,34 @@ function M.sweep_new()
   end
 end
 
+-- Reveal an approved pre-write NEW file once the CLI's write has landed. accept_all
+-- records the path (no buffer catches a new-file write — see there); this opens it
+-- in an editor window so the diff doesn't collapse to a blank alternate buffer.
+-- Runs from poll(), which fires on the tool_result that FOLLOWS the approved write,
+-- so the file exists by now; if not (write failed/slow), the path stays recorded
+-- for the next poll rather than opening an empty window.
+function M.reveal_created()
+  local path = M.state.reveal_new
+  if not path then return end
+  if vim.fn.filereadable(path) == 0 then return end
+  M.state.reveal_new = nil
+  local win = editor_win()
+  if win then
+    vim.api.nvim_win_call(win, function()
+      vim.cmd("edit " .. vim.fn.fnameescape(path))
+    end)
+  end
+  log("reveal-new:" .. path)
+end
+
 -- Single post-tool poll called from claude.lua on every tool_result (the CLI has
 -- finished executing — including any Edit/Write that just hit disk). checktime_all
--- catches writes to already-loaded buffers; sweep_new catches brand-new files.
+-- catches writes to already-loaded buffers; sweep_new catches brand-new files;
+-- reveal_created surfaces an approved pre-write new file.
 function M.poll()
   M.checktime_all()
   M.sweep_new()
+  M.reveal_created()
   vim.schedule(M.process_next)
 end
 
@@ -464,6 +634,38 @@ local function ensure_autocmds()
       -- CORRECTION #2: must be set synchronously in this callback, and the
       -- valid "autocmd handles everything" value is "" — "ignore" is invalid
       -- (silently behaves like "", the plan only worked by accident).
+      -- Pre-write gate: this write was ALREADY reviewed and approved (the user
+      -- accepted the pre-write diff; the CLI just performed the write). Reload
+      -- silently instead of queueing a second review. Flag is one-shot per path.
+      local abs = vim.api.nvim_buf_get_name(ev.buf)
+      if M.state.approved[abs] then
+        M.state.approved[abs] = nil
+        -- Reload OURSELVES (scheduled — buffer ops are forbidden in this
+        -- callback) instead of vim.v.fcs_choice = "reload": the native reload
+        -- is silently skipped in some window states (observed headless when
+        -- other FCS events land in the same checktime sweep), and a stale
+        -- buffer after an approved write would read as the edit being lost.
+        vim.v.fcs_choice = ""
+        local b = ev.buf
+        vim.schedule(function()
+          if vim.api.nvim_buf_is_valid(b) then
+            pcall(vim.api.nvim_buf_call, b, function() vim.cmd("silent edit!") end)
+          end
+        end)
+        log("fcs-approved-reload:" .. abs)
+        if vim.bo[ev.buf].modified then
+          -- reload discards unsaved buffer edits; the approved change wins, but
+          -- silently eating local work would read as data loss — say so.
+          vim.schedule(function()
+            vim.notify(
+              "Claude: approved edit to " .. vim.fn.fnamemodify(abs, ":t")
+                .. " overwrote unsaved local buffer edits",
+              vim.log.levels.WARN
+            )
+          end)
+        end
+        return
+      end
       vim.v.fcs_choice = ""
       local modified = vim.bo[ev.buf].modified
       log("fcs-fired:" .. ev.file .. (modified and ":WARN-local-edits" or ""))
@@ -527,6 +729,8 @@ function M.on_panel_close()
   -- one already resolved) must not leak into the next panel session.
   M.state.pending_new = {}
   M.state.new_files   = {}
+  M.state.approved    = {}
+  M.state.reveal_new  = nil
 end
 
 return M

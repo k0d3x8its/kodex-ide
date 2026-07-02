@@ -879,4 +879,71 @@ H.check("T22 occupied diff → Write auto-allows (fallback)",
 prewrite_result = true
 vim.fn.delete(t21)
 
+-- ── T23–T25: Open-buffer awareness (FINDINGS § Q-CTX) ─────────────────────────
+-- host_file_of/current_host_file filter to real on-disk file windows; a fresh
+-- session's first turn appends an @<path> mention (once), later turns don't.
+
+local hostpath = "/tmp/claude_host_" .. tostring(vim.loop.now()) .. ".lua"
+vim.fn.writefile({ "-- host file", "local x = 1", "return x" }, hostpath)
+local host_abs = vim.fn.fnamemodify(hostpath, ":p")
+
+vim.cmd("tabnew " .. host_abs)           -- clean editor window backed by a real file
+local ewin = vim.api.nvim_get_current_win()
+
+local hf = claude._host_file_of(ewin)
+H.check("T23 host_file_of returns abs path for a real file",
+  type(hf) == "table" and hf.path == host_abs, vim.inspect(hf))
+
+-- nofile scratch buffer → not a host file
+local sbuf = vim.api.nvim_create_buf(false, true)   -- buftype=nofile
+vim.api.nvim_win_set_buf(ewin, sbuf)
+H.check("T23 host_file_of nil for a nofile buffer",
+  claude._host_file_of(ewin) == nil)
+
+-- unnamed (never-saved) buffer → not a host file
+local ubuf = vim.api.nvim_create_buf(true, false)
+vim.api.nvim_win_set_buf(ewin, ubuf)
+H.check("T23 host_file_of nil for an unnamed buffer",
+  claude._host_file_of(ewin) == nil)
+
+-- current_host_file scans the tabpage and finds the real-file window
+vim.cmd("edit " .. host_abs)
+H.check("T24 current_host_file finds the open file",
+  (claude._current_host_file() or {}).path == host_abs,
+  vim.inspect(claude._current_host_file()))
+
+-- attach_host_context: first turn appends the mention, later turns don't
+claude.state.host_ctx_sent = false
+claude.state.host_file = { path = host_abs, disp = host_abs }
+local w1 = claude._attach_host_context("hello")
+H.check("T25 first turn appends @<path> mention",
+  w1:find("@" .. host_abs, 1, true) ~= nil and w1:find("hello", 1, true) ~= nil, w1)
+H.check("T25 host_ctx_sent flips true after first attach",
+  claude.state.host_ctx_sent == true)
+local w2 = claude._attach_host_context("second")
+H.check("T25 later turns send verbatim (no re-attach)", w2 == "second")
+
+-- no double-attach when the user already referenced the file themselves
+claude.state.host_ctx_sent = false
+local w3 = claude._attach_host_context("look at " .. host_abs)
+H.check("T25 no double-attach when path already present",
+  w3 == "look at " .. host_abs and claude.state.host_ctx_sent == true)
+
+-- no host file → text is untouched
+claude.state.host_ctx_sent = false
+claude.state.host_file = nil
+vim.cmd("tabnew")   -- empty unnamed buffer, no real-file window in this tab
+H.check("T25 attach is a no-op with no open file",
+  claude._attach_host_context("plain") == "plain")
+
+-- disabled (host_ctx_enabled=false) → no injection even with a file armed
+claude.state.host_ctx_sent = false
+claude.state.host_file = { path = host_abs, disp = host_abs }
+claude.state.host_ctx_enabled = false
+H.check("T25 attach is a no-op when open-buffer context is OFF",
+  claude._attach_host_context("hi") == "hi")
+claude.state.host_ctx_enabled = true   -- restore
+
+vim.fn.delete(host_abs)
+
 H.summary("claude")

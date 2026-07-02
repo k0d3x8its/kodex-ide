@@ -92,6 +92,9 @@ claude.is_available = function() return true end
 -- synchronously with whatever `next_answer` is set to (nil = user cancelled).
 local next_answer = nil
 claude._open_chat_float = function(_title, cb) cb(next_answer) end
+-- ask_selection now uses a SEPARATE selection-anchored float; stub it the same
+-- way (synchronous callback) so T10/T11 drive it without an interactive window.
+claude._open_selection_float = function(_title, cb) cb(next_answer) end
 
 -- ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -945,5 +948,19 @@ H.check("T25 attach is a no-op when open-buffer context is OFF",
 claude.state.host_ctx_enabled = true   -- restore
 
 vim.fn.delete(host_abs)
+
+-- ── T26: user echo renders a ```fence as a code block, not literal backticks ───
+-- The <leader>cq selection is sent as a fenced block; render_user must show it
+-- with the code gutter (▎) and drop the ``` fence rows.
+claude.state.working = false
+claude.state.host_ctx_enabled = false   -- keep the message verbatim (no @-append)
+claude._send("check this\n\n```lua\nlocal y = 7\n```")
+vim.wait(30)
+local echo = panel_text()
+H.check("T26 fenced user message renders a code gutter (▎)",
+  echo:find("▎", 1, true) ~= nil, echo)
+H.check("T26 fenced user message drops literal ``` rows",
+  echo:find("```", 1, true) == nil, echo)
+claude.state.host_ctx_enabled = true    -- restore
 
 H.summary("claude")

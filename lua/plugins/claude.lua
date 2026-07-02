@@ -267,6 +267,14 @@ return {
       desc = "Claude: toggle Plan mode",
     },
     {
+      -- Toggle open-buffer awareness: when ON, the panel silently attaches the
+      -- file you have open (@-mention) to your first message. Persisted across
+      -- Kodex IDE restarts. c=claude, b=buffer.
+      "<leader>cb",
+      function() require("utils.claude").toggle_host_ctx() end,
+      desc = "Claude: toggle open-buffer context",
+    },
+    {
       -- Visual-mode only: yank selection, prompt for a question, send both to
       -- the Claude panel. <leader>cq — c=claude, q=question (mirrors <leader>oq).
       "<leader>cq",

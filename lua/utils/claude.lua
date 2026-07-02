@@ -153,6 +153,20 @@ mod.state = {
   -- to "plan" (and back to "default"), respawning the process.
   permission_mode = "default",
 
+  -- Open-buffer awareness (FINDINGS § Q-CTX). host_file = the real file the user
+  -- had open in the editor when the panel opened (captured pre-focus-steal):
+  -- { path=<abs>, disp=<~/.-relative> } or nil. host_ctx_sent gates the ambient
+  -- @-mention injection to ONCE per session (re-inlining every turn bloats
+  -- context + drifts). Both cleared on session teardown / panel close.
+  --
+  -- Injection is SILENT, matching OpenCode: the user's first real message gets an
+  -- @<path> appended to the WIRE only (the transcript echo stays their own text),
+  -- so there is NO visible auto-prompt. host_ctx_enabled is the master on/off,
+  -- toggled by <leader>cb and PERSISTED across restarts (see host_ctx_pref_*).
+  host_file       = nil,
+  host_ctx_sent   = false,
+  host_ctx_enabled = true,   -- overwritten from disk at module load
+
   -- Messages the user typed while a turn was in flight, FIFO. Shown as shaded
   -- virtual lines at the panel bottom; drained one-by-one as each turn ends
   -- (each then echoes in the normal user colour when actually sent).
@@ -3681,6 +3695,96 @@ local function dispatch_send(text)
   return true
 end
 
+-- ─── Open-buffer awareness (FINDINGS § Q-CTX) ────────────────────────────────
+
+-- The real, on-disk file backing a window's buffer, or nil. Skips the panel,
+-- floats (chat bar / cards), terminals, non-file UI buffers (alpha/NvimTree/the
+-- panel itself), and unnamed or unsaved scratch buffers — none of which the CLI
+-- could @-mention. Returns { path=<abs>, disp=<~/.-relative for display> }.
+local function host_file_of(win)
+  if not (win and vim.api.nvim_win_is_valid(win)) then return nil end
+  if win == state.panel_win then return nil end
+  if vim.api.nvim_win_get_config(win).relative ~= "" then return nil end     -- float
+  local buf = vim.api.nvim_win_get_buf(win)
+  if vim.bo[buf].buftype ~= "" then return nil end                           -- terminal/nofile
+  local ft = vim.bo[buf].filetype
+  if ft == "alpha" or ft == "NvimTree" or ft == "claude" then return nil end
+  local name = vim.api.nvim_buf_get_name(buf)
+  if name == "" then return nil end
+  local abs = vim.fn.fnamemodify(name, ":p")
+  if vim.fn.filereadable(abs) == 0 then return nil end                       -- unsaved/new
+  return { path = abs, disp = vim.fn.fnamemodify(abs, ":~:.") }
+end
+mod._host_file_of = host_file_of
+
+-- The file the user currently has open in the editor. Prefers a given window
+-- (the pre-panel-open focus captured in toggle()), else scans the tabpage for
+-- the first real-file window — the editor left of the panel.
+local function current_host_file(prefer_win)
+  local hf = prefer_win and host_file_of(prefer_win) or nil
+  if hf then return hf end
+  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    hf = host_file_of(w)
+    if hf then return hf end
+  end
+  return nil
+end
+mod._current_host_file = current_host_file
+
+-- Append an @<abspath> mention of the open file to the WIRE text on the FIRST
+-- turn of a session, so the CLI inlines the file with no Read round-trip
+-- (verified: stream-json input honours @-mentions, absolute paths included —
+-- FINDINGS § Q-CTX empirical result). Once per session (host_ctx_sent); later
+-- turns send the user's text verbatim. NEUTRAL phrasing only — command-y text
+-- ("ignore … do not use tools") trips the CLI's prompt-injection heuristic. The
+-- transcript echo stays the user's own text; only the wire carries the mention.
+local function attach_host_context(text)
+  if not state.host_ctx_enabled then return text end
+  if state.host_ctx_sent then return text end
+  local hf = state.host_file or current_host_file()
+  if not hf then return text end
+  state.host_ctx_sent = true
+  -- Don't double-attach if the user already referenced the file themselves.
+  if text:find(hf.path, 1, true) or text:find("@" .. hf.disp, 1, true) then
+    return text
+  end
+  return text .. "\n\n(For context, the file I currently have open in my editor: @"
+    .. hf.path .. ")"
+end
+mod._attach_host_context = attach_host_context
+
+-- Persist the open-buffer-awareness on/off choice across nvim restarts. Stored
+-- as a single "1"/"0" in stdpath('state') so a toggle survives closing Kodex
+-- IDE until it is toggled back. Load is best-effort (missing file → default ON).
+local host_ctx_pref_file = vim.fn.stdpath("state") .. "/kodex_claude_host_ctx"
+
+local function save_host_ctx_pref(on)
+  pcall(vim.fn.writefile, { on and "1" or "0" }, host_ctx_pref_file)
+end
+
+local function load_host_ctx_pref()
+  local ok, lines = pcall(vim.fn.readfile, host_ctx_pref_file)
+  if not ok or type(lines) ~= "table" or not lines[1] then return true end  -- default ON
+  return lines[1] ~= "0"
+end
+
+-- Load the persisted preference at module init (overrides the state default).
+state.host_ctx_enabled = load_host_ctx_pref()
+
+-- Toggle open-buffer awareness on/off (<leader>cb) and remember it across
+-- restarts. Off = the panel never injects the open file; on = silent first-turn
+-- @-mention. host_ctx_sent is reset so re-enabling mid-session re-arms injection.
+function mod.toggle_host_ctx()
+  state.host_ctx_enabled = not state.host_ctx_enabled
+  state.host_ctx_sent = false
+  save_host_ctx_pref(state.host_ctx_enabled)
+  vim.notify(
+    "Claude open-buffer context " .. (state.host_ctx_enabled and "ON" or "OFF")
+      .. " (remembered across restarts)",
+    vim.log.levels.INFO
+  )
+end
+
 -- Send a brand-new turn: echo the message into the transcript (normal colour),
 -- a blank line so the spinner gets its own line, then dispatch it.
 local function send(text)
@@ -3692,7 +3796,9 @@ local function send(text)
   remove_typing_ph()
   render_user(text)
   buf_append({ "" })
-  dispatch_send(text)
+  -- Wire text may carry a first-turn @-mention of the open file; the echo above
+  -- shows the user's own text unchanged.
+  dispatch_send(attach_host_context(text))
 end
 mod._send = send
 
@@ -4271,6 +4377,11 @@ end
 function mod.toggle(root_override)
   if not ensure_available() then return end
 
+  -- Snapshot the window the user is in BEFORE anything steals focus (the mutex
+  -- toggle below, or open_panel_window). This is the editor window whose file we
+  -- attach as ambient context (FINDINGS § Q-CTX).
+  local prev_win = vim.api.nvim_get_current_win()
+
   -- Mutex: if OpenCode is open, close it before opening Claude (FINDINGS.md § A5).
   -- Both panels use place_vertical(wincmd L); running both simultaneously would
   -- strand one of them on a stale alternate screen. One panel at a time.
@@ -4291,6 +4402,8 @@ function mod.toggle(root_override)
     vim.api.nvim_win_close(state.panel_win, true)
     state.panel_win    = nil
     state.claude_active = false
+    state.host_file     = nil
+    state.host_ctx_sent = false
     pcall(vim.api.nvim_del_augroup_by_name, "ClaudeDirTrack")
     require("utils.claude_diff").on_panel_close()
     return
@@ -4305,11 +4418,17 @@ function mod.toggle(root_override)
   state.stored_root = root
 
   local buf = ensure_panel_buf()
+  -- Capture the open file + arm a fresh session's ambient context BEFORE the
+  -- panel window steals focus (FINDINGS § Q-CTX). fresh = brand-new buffer, not
+  -- a reopen (which reuses scrollback + an already-primed session).
+  local fresh         = vim.api.nvim_buf_line_count(buf) <= 1
+  state.host_file     = current_host_file(prev_win)
+  if fresh then state.host_ctx_sent = false end
   open_panel_window(buf)
 
   -- Render banner on fresh buffer only (reopen after close reuses scrollback).
   -- The persistent subprocess is NOT spawned here; the first send() spawns it.
-  if vim.api.nvim_buf_line_count(buf) <= 1 then
+  if fresh then
     -- cwd + version known now (version from the binary path); model shows the
     -- picked --model if set, else fills from system/init after the first message.
     -- Show ~-relative path so long absolute roots don't overflow the panel.
@@ -4317,6 +4436,8 @@ function mod.toggle(root_override)
       vim.fn.fnamemodify(state.stored_root or root, ":~"))
   end
   clear_hint()
+  -- No auto-prompt: matching OpenCode, the open file is injected SILENTLY on the
+  -- user's first real message (attach_host_context), not announced up front.
 end
 
 --- Open the panel without toggling — dock-launch flow (FINDINGS.md § A2).
@@ -4352,6 +4473,8 @@ function mod.reset()
   state.system_ready  = false
   state.diff_pending  = false
   state.prewrite      = nil
+  state.host_file     = nil
+  state.host_ctx_sent = false
   if state.perm and state.perm.win and vim.api.nvim_win_is_valid(state.perm.win) then
     pcall(vim.api.nvim_win_close, state.perm.win, true)
   end

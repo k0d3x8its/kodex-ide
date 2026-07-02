@@ -52,11 +52,24 @@ package.loaded["utils.term_layout"] = {
 -- claude_diff: on_panel_open would register FileChangedShell autocmds that
 -- could interfere with the stream-json tests. Stub it out; the diff module
 -- has its own spec (claude_diff_spec.lua).
+-- prewrite_calls records open_prewrite(path, proposed) invocations from the
+-- Issue-B gate; prewrite_result is what the stub reports back (true = "diff is
+-- up, hold the request", false = "couldn't show it, fall back to auto-allow").
+-- The REAL open_prewrite (windows, accept/reject routing) is covered in
+-- claude_diff_spec.lua; here we test claude.lua's side of the contract.
+local prewrite_calls  = {}
+local prewrite_result = true
 package.loaded["utils.claude_diff"] = {
   on_panel_open  = function() end,
   on_panel_close = function() end,
   on_diff_open   = function() end,
   on_diff_close  = function() end,
+  watch          = function() end,
+  poll           = function() end,
+  open_prewrite  = function(path, proposed)
+    table.insert(prewrite_calls, { path = path, proposed = proposed })
+    return prewrite_result
+  end,
 }
 
 -- opencode: the mutex check in claude.toggle() does pcall(require, "utils.opencode").
@@ -427,8 +440,9 @@ H.check("T16 no rules → 2 options (Allow once, Reject)",
     and claude.state.perm.options[2].kind == "deny",
   vim.inspect(claude.state.perm and claude.state.perm.options))
 
--- Edit tool: auto-allowed so the FileChangedShell+vimdiff flow owns it. Must NOT
--- disturb the pending card (cards are one-at-a-time; edits never queue one).
+-- Edit tool with NO old_string: unreconstructable for the pre-write gate (T20+),
+-- so it falls back to auto-allow + the post-write FileChangedShell+vimdiff flow.
+-- Must NOT disturb the pending card (cards are one-at-a-time; edits never queue one).
 feed({
   type       = "control_request",
   request_id = "req-edit-1",
@@ -737,5 +751,132 @@ H.check("T19 'Type something' sends the typed text as the answer value",
     and rq7.response.response.updatedInput.answers["Freeform?"] == "frobnicate the widget"
     and claude.state.qask == nil,
   vim.inspect(rq7 and rq7.response.response.updatedInput))
+
+-- ── T20: Issue-B pre-write gate — Write/Edit HELD behind a reconstructed diff ──
+-- Gated edit tools no longer auto-allow: the can_use_tool request stays open
+-- while a diff of the PROPOSED content (from the tool input — nothing on disk
+-- yet) is reviewed. Accept releases allow, reject releases deny. Reconstruction
+-- failure falls back to the old auto-allow + post-write flow so the CLI never
+-- hangs on a gate we can't show.
+
+-- Write: proposed content is the input's `content` verbatim.
+local sends_pw = #chansend_calls
+feed({
+  type       = "control_request",
+  request_id = "req-write-1",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "Write",
+    input     = { file_path = "/tmp/pw_new.txt", content = "alpha\nbeta" },
+  },
+})
+H.check("T20 gated Write sends NO immediate control_response",
+  #chansend_calls == sends_pw, "sends delta=" .. (#chansend_calls - sends_pw))
+H.check("T20 pre-write diff opened with the proposed content",
+  #prewrite_calls == 1
+    and prewrite_calls[1].path == "/tmp/pw_new.txt"
+    and table.concat(prewrite_calls[1].proposed, "\n") == "alpha\nbeta",
+  vim.inspect(prewrite_calls))
+H.check("T20 held request armed (state.prewrite)",
+  claude.state.prewrite ~= nil
+    and claude.state.prewrite.request_id == "req-write-1",
+  vim.inspect(claude.state.prewrite))
+
+-- Accept → allow, echoing the request input back as updatedInput.
+claude.on_prewrite_resolve(true)
+local rw1 = last_control_response()
+H.check("T20 accept releases allow with echoed input",
+  rw1 and rw1.response.request_id == "req-write-1"
+    and rw1.response.response.behavior == "allow"
+    and rw1.response.response.updatedInput.content == "alpha\nbeta",
+  vim.inspect(rw1))
+H.check("T20 held request cleared after resolve",
+  claude.state.prewrite == nil, vim.inspect(claude.state.prewrite))
+
+-- ── T21: Edit reconstruction — old_string→new_string mirrored from disk ───────
+local t21 = "/tmp/claude_prewrite_t21.txt"
+vim.fn.writefile({ "one foo two", "three foo four", "five" }, t21)
+
+feed({
+  type       = "control_request",
+  request_id = "req-edit-2",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "Edit",
+    input     = { file_path = t21, old_string = "three foo", new_string = "three bar" },
+  },
+})
+local pc = prewrite_calls[#prewrite_calls]
+H.check("T21 single replacement reconstructed from disk",
+  claude.state.prewrite ~= nil and pc and pc.path == t21
+    and table.concat(pc.proposed, "\n") == "one foo two\nthree bar four\nfive",
+  vim.inspect(pc and pc.proposed))
+
+-- Reject → deny with a reason; the file was never written so disk is untouched.
+claude.on_prewrite_resolve(false)
+local re2 = last_control_response()
+H.check("T21 reject releases deny with a message",
+  re2 and re2.response.request_id == "req-edit-2"
+    and re2.response.response.behavior == "deny"
+    and type(re2.response.response.message) == "string",
+  vim.inspect(re2))
+H.check("T21 disk untouched after deny",
+  table.concat(vim.fn.readfile(t21), "\n") == "one foo two\nthree foo four\nfive")
+
+-- replace_all: every occurrence replaced, not just the first.
+feed({
+  type       = "control_request",
+  request_id = "req-edit-3",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "Edit",
+    input     = { file_path = t21, old_string = "foo",
+                  new_string = "baz", replace_all = true },
+  },
+})
+local pc3 = prewrite_calls[#prewrite_calls]
+H.check("T21 replace_all reconstructs every occurrence",
+  pc3 and table.concat(pc3.proposed, "\n") == "one baz two\nthree baz four\nfive",
+  vim.inspect(pc3 and pc3.proposed))
+claude.on_prewrite_resolve(false) -- clean up the held request
+
+-- ── T22: gate fallbacks — reconstruction failure / diff already open ──────────
+-- old_string absent from the file → can't reconstruct → auto-allow immediately
+-- (old post-write contract), nothing held.
+feed({
+  type       = "control_request",
+  request_id = "req-edit-4",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "Edit",
+    input     = { file_path = t21, old_string = "NOT THERE", new_string = "x" },
+  },
+})
+local re4 = last_control_response()
+H.check("T22 unreconstructable Edit auto-allows (fallback)",
+  re4 and re4.response.request_id == "req-edit-4"
+    and re4.response.response.behavior == "allow"
+    and claude.state.prewrite == nil,
+  vim.inspect(re4))
+
+-- open_prewrite says no (a post-write diff is already up) → same fallback.
+prewrite_result = false
+feed({
+  type       = "control_request",
+  request_id = "req-write-2",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "Write",
+    input     = { file_path = "/tmp/pw_other.txt", content = "x" },
+  },
+})
+local rw2 = last_control_response()
+H.check("T22 occupied diff → Write auto-allows (fallback)",
+  rw2 and rw2.response.request_id == "req-write-2"
+    and rw2.response.response.behavior == "allow"
+    and claude.state.prewrite == nil,
+  vim.inspect(rw2))
+prewrite_result = true
+vim.fn.delete(t21)
 
 H.summary("claude")

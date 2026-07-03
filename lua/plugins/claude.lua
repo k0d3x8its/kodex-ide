@@ -64,6 +64,10 @@ return {
       -- are easy to spot. Deliberately deeper than the clay header (#D97757).
       vim.api.nvim_set_hl(0, "ClaudeQuestion", { fg = "#D9531E", bold = true })
 
+      -- Failed tool_result bodies (is_error:true) — Dracula red, clearly an error
+      -- and distinct from the burnt-orange ClaudeQuestion prompt colour.
+      vim.api.nvim_set_hl(0, "ClaudeError",    { fg = "#FF5555" })
+
       -- Bracketed spans ([VERIFY], [link]) — Dracula pink so they read clearly
       -- apart from the teal code colour.
       vim.api.nvim_set_hl(0, "ClaudeBracket",  { fg = "#FF79C6" })

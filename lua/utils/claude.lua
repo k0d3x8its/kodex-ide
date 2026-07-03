@@ -1904,7 +1904,18 @@ end
 
 -- Visible body lines before a tool_result is collapsed behind the expand
 -- affordance. Kept small so a big Read/Bash result is a preview, not a dump.
-local RESULT_HEAD_K = 6
+local RESULT_HEAD_K = 5
+
+-- Truncate a body line to ONE display row (width cells) with a trailing ellipsis.
+-- The preview must never soft-wrap — a single wide line (e.g. a <system-reminder>
+-- banner) would otherwise balloon 5 logical lines into a dozen display rows.
+local function result_row(s, width)
+  s = tostring(s):gsub("[\r\n\t]+", " ")
+  if vim.fn.strdisplaywidth(s) > width then
+    s = disp_take(s, math.max(width - 1, 1)) .. "…"
+  end
+  return s
+end
 
 -- Render a tool_result body under its tool block: each line indented two spaces,
 -- dim (or ClaudeError red when is_error). Bodies longer than RESULT_HEAD_K show
@@ -1940,8 +1951,11 @@ local function render_tool_result(content, is_error)
   -- affordance align under the text after the corner ("  └ " = 4 display cells).
   local CORNER, INDENT = "  └ ", "    "
   local CORNER_B = #CORNER   -- byte width of the corner prefix (dim-highlighted)
+  local avail = math.max(panel_width() - 6, 20)   -- one-row budget after the 4-cell prefix
   local shown = {}
-  for i = 1, n_shown do shown[i] = (i == 1 and CORNER or INDENT) .. body[i] end
+  for i = 1, n_shown do
+    shown[i] = (i == 1 and CORNER or INDENT) .. result_row(body[i], avail)
+  end
   local first = vim.api.nvim_buf_line_count(buf)
   buf_append(shown)
   -- Corner dim, body text in group; continuation lines all group.

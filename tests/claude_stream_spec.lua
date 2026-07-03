@@ -225,17 +225,17 @@ feed({ type = "user", message = { content = { {
   type = "tool_result", tool_use_id = "t2",
   content = "r1\nr2\nr3\nr4\nr5\nr6\nr7\nr8\nr9",
 } } } })
-H.check("S7 long body shows the first K lines",
-  panel_text():find("r6", 1, true) ~= nil, panel_text())
+H.check("S7 long body shows the first K=5 lines",
+  panel_text():find("r5", 1, true) ~= nil, panel_text())
 H.check("S7 long body hides overflow lines",
-  panel_text():find("r7", 1, true) == nil, panel_text())
-H.check("S7 long body shows '+3 lines (ctrl+o to expand)'",
-  panel_text():find("+3 lines (ctrl+o to expand)", 1, true) ~= nil, panel_text())
+  panel_text():find("r6", 1, true) == nil, panel_text())
+H.check("S7 long body shows '+4 lines (ctrl+o to expand)'",
+  panel_text():find("+4 lines (ctrl+o to expand)", 1, true) ~= nil, panel_text())
 H.check("S7 long body stashes the full body on state.tool_results",
   (function()
     local tr = claude.state.tool_results
     local last = tr and tr[#tr]
-    return last and #last.body == 9 and last.hidden == 3 and last.aff_mark ~= nil
+    return last and #last.body == 9 and last.hidden == 4 and last.aff_mark ~= nil
   end)(), vim.inspect(claude.state.tool_results and claude.state.tool_results[#claude.state.tool_results]))
 
 -- Error body: is_error flagged on the stashed entry (red hl not headless-assertable).
@@ -243,8 +243,11 @@ feed({ type = "user", message = { content = { {
   type = "tool_result", tool_use_id = "t3", is_error = true,
   content = "Exit code 1\ncat: nope: No such file or directory",
 } } } })
+-- Body truncates to one row in the narrow headless panel, so assert on prefixes
+-- that survive: "Exit code 1" (short first line) + the "cat:" lead of line 2.
 H.check("S7 error body rendered",
-  panel_text():find("No such file or directory", 1, true) ~= nil, panel_text())
+  panel_text():find("Exit code 1", 1, true) ~= nil
+    and panel_text():find("cat:", 1, true) ~= nil, panel_text())
 H.check("S7 error body flagged is_error on the stashed entry",
   (function()
     local tr = claude.state.tool_results

@@ -2885,10 +2885,12 @@ function W.apply_task_tool(name, input)
 end
 mod._apply_task_tool = W.apply_task_tool   -- test hook
 
--- Open or update the bottom-pinned TodoWrite widget from state.todos. A borderless,
--- non-focusable SW float at the very bottom of the panel column; the other bottom
--- floats + the chat pad read todo_height() to stack ABOVE it. Hidden (closed) when
--- the list is empty. The caller reflows the other floats after this returns.
+-- Open or update the bottom-pinned task-plan card from state.todos. A bordered
+-- (rounded, amber-outlined, titled) non-focusable SW float at the bottom of the
+-- panel column — same modal styling as the permission/question cards, but a
+-- persistent status display (no focus, no keymaps). The other bottom floats + the
+-- chat pad read todo_height() (content + 2 border rows) to stack ABOVE it. Hidden
+-- (closed) when the list is empty. The caller reflows the other floats after.
 function W.update_todo_widget()
   local todos = state.todos
   if not (todos and #todos > 0) then W.close_todo_widget(); return end
@@ -2910,19 +2912,28 @@ function W.update_todo_widget()
       vim.api.nvim_buf_add_highlight(buf, state.todo_ns, h[3], i - 1, h[1], h[2])
     end
   end
-  state.todo_h = #lines
+  -- Footprint = content rows + 2 for the rounded border, so float_bottom_row /
+  -- set_bottom_pad reserve the FULL bordered height and the chat bar + modals
+  -- stack cleanly above the card (not over its top border).
+  state.todo_h = #lines + 2
 
   local col, w = panel_float_geom()
+  -- Bordered card (matches the permission/question modals): rounded outline in the
+  -- amber ClaudePermBorder, titled, but non-focusable + persistent (a status
+  -- display, not a decision prompt — no keymaps, never steals focus). width is the
+  -- panel-column minus the 2 border cells.
   local cfg = {
     relative = "editor", anchor = "SW",
-    row = vim.o.lines - 2, col = col, width = w, height = #lines,
+    row = vim.o.lines - 2, col = col, width = math.max(w - 2, 1), height = #lines,
     style = "minimal", focusable = false, zindex = 30,   -- below modals (default 50)
+    border = "rounded", title = " ✻ Task Plan ", title_pos = "left",
   }
   if state.todo_win and vim.api.nvim_win_is_valid(state.todo_win) then
     pcall(vim.api.nvim_win_set_config, state.todo_win, cfg)
   else
     state.todo_win = vim.api.nvim_open_win(buf, false, cfg)
-    vim.wo[state.todo_win].winhl = "Normal:ClaudeNormal,NormalNC:ClaudeNormal"
+    vim.wo[state.todo_win].winhl =
+      "Normal:ClaudeNormal,NormalNC:ClaudeNormal,FloatBorder:ClaudePermBorder,FloatTitle:ClaudePermBorder"
     harden_float_scroll(state.todo_win)
     -- The widget pins to the panel BOTTOM (not float_bottom_row), so it needs its
     -- own resize path: re-render at lines-2 + re-fit width, then reflow the floats
@@ -3838,14 +3849,10 @@ local function dispatch(event)
   local ev_type = event.type or ""
 
   if ev_type == "system" and event.subtype == "init" then
-    -- A fresh session restarts the CLI's "Task #N" counter at 1, so drop any
-    -- prior task list + our matching id counter to stay aligned (Task* widget,
-    -- FINDINGS § Q-TODO-TRIGGER). system/init fires once per session spawn.
-    if state.todos then
-      state.todos, state.todo_seq = nil, nil
-      W.close_todo_widget()
-      W.reflow_bottom_floats()
-    end
+    -- NOTE: system/init fires once per TURN in stream-json mode (verified: 2 inits
+    -- for a 2-turn session), NOT once per session — so the task-list reset must NOT
+    -- live here (it wiped the widget on the next turn). It lives in ensure_process
+    -- (genuine once-per-spawn). See FINDINGS § Q-TODO-TRIGGER.
     -- Fill the banner's version (line 0) and model (line 1) now that they're
     -- known. The banner was pre-rendered at panel open with the cwd but no model
     -- or version (those only arrive in system/init). The process is persistent
@@ -4378,6 +4385,14 @@ end
 local function ensure_process()
   if state.job_id then return state.job_id end
   stdout_buf = ""
+  -- Fresh session: the CLI restarts its "Task #N" counter at 1, so drop any prior
+  -- task list + our id counter to realign (Task* widget, § Q-TODO-TRIGGER). This is
+  -- the genuine once-per-session hook — system/init fires per TURN, not per spawn.
+  if state.todos then
+    state.todos, state.todo_seq = nil, nil
+    W.close_todo_widget()
+    W.reflow_bottom_floats()
+  end
   local job = vim.fn.jobstart(build_args(), {
     cwd = state.stored_root or vim.fn.getcwd(),
     -- PATH: prepend nvm/npm-global/linuxbrew/~/.local/bin so the Bash search

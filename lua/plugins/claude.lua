@@ -68,6 +68,15 @@ return {
       -- and distinct from the burnt-orange ClaudeQuestion prompt colour.
       vim.api.nvim_set_hl(0, "ClaudeError",    { fg = "#FF5555" })
 
+      -- TodoWrite task-list widget (bottom-pinned float). Done = dim strikethrough
+      -- with a green check; in-progress = burnt-orange bold; pending = neutral; the
+      -- "N tasks (…)" header + "+N more" overflow are dim.
+      vim.api.nvim_set_hl(0, "ClaudeTodoHeader",  { fg = "#6272A4", bold = true })
+      vim.api.nvim_set_hl(0, "ClaudeTodoCheck",   { fg = "#50FA7B" })
+      vim.api.nvim_set_hl(0, "ClaudeTodoDone",    { fg = "#6272A4", strikethrough = true })
+      vim.api.nvim_set_hl(0, "ClaudeTodoActive",  { fg = "#D97757", bold = true })
+      vim.api.nvim_set_hl(0, "ClaudeTodoPending", { fg = "#A6ACCD" })
+
       -- Bracketed spans ([VERIFY], [link]) — Dracula pink so they read clearly
       -- apart from the teal code colour.
       vim.api.nvim_set_hl(0, "ClaudeBracket",  { fg = "#FF79C6" })

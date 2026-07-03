@@ -1917,13 +1917,84 @@ local function result_row(s, width)
   return s
 end
 
--- Render a tool_result body under its tool block: each line indented two spaces,
--- dim (or ClaudeError red when is_error). Bodies longer than RESULT_HEAD_K show
--- the first K lines + a dim "… +N lines (ctrl+o to expand)" affordance; the FULL
--- body is stashed on state.tool_results (keyed by an extmark on the affordance
--- line) for the <C-o> expand keymap wired in a later increment. This is the
--- shared foundation the skill-result / error / truncation features build on.
-local function render_tool_result(content, is_error)
+-- Strip a `cat -n` leading line number ("    12  code" → "code") so a Read body
+-- parses cleanly as source when rendered through the code-block renderer.
+local function strip_line_numbers(body)
+  local out = {}
+  for i, l in ipairs(body) do out[i] = (l:gsub("^%s*%d+%s+", "")) end
+  return out
+end
+
+-- Corner + continuation prefixes for a rendered tool_result body.
+local RES_CORNER, RES_INDENT = "  └ ", "    "
+
+-- Build the COLLAPSED preview: first K one-row-truncated lines off a dim `└`
+-- corner + a dim "… +N lines (ctrl+o to expand)" affordance on overflow.
+-- Returns (lines, line_hls) where line_hls[i] = list of {b0, b1, group}.
+local function build_collapsed(entry)
+  local group   = entry.is_error and "ClaudeError" or "ClaudeDim"
+  local n_shown = math.min(#entry.body, RESULT_HEAD_K)
+  local hidden  = #entry.body - n_shown
+  local avail   = math.max(panel_width() - 6, 20)   -- one-row budget after the prefix
+  local lines, hls = {}, {}
+  for i = 1, n_shown do
+    lines[i] = (i == 1 and RES_CORNER or RES_INDENT) .. result_row(entry.body[i], avail)
+    hls[i]   = (i == 1)
+      and { { 0, #RES_CORNER, "ClaudeDim" }, { #RES_CORNER, -1, group } }
+      or  { { 0, -1, group } }
+  end
+  if hidden > 0 then
+    lines[#lines + 1] = string.format("%s… +%d %s (ctrl+o to expand)",
+      RES_INDENT, hidden, hidden == 1 and "line" or "lines")
+    hls[#hls + 1] = { { 0, -1, "ClaudeDim" } }
+  end
+  return lines, hls
+end
+
+-- Build the EXPANDED view: a ▎-gutter syntax-highlighted code block when the
+-- source was a Read of a known filetype (entry.lang set), else the full body off
+-- the dim corner (un-truncated; wrapping is fine — the user asked to see it all).
+local function build_expanded(entry)
+  if entry.lang then
+    return render_code_block(entry.lang, entry.code_body)
+  end
+  local group = entry.is_error and "ClaudeError" or "ClaudeDim"
+  local lines, hls = {}, {}
+  for i, l in ipairs(entry.body) do
+    lines[i] = (i == 1 and RES_CORNER or RES_INDENT) .. l
+    hls[i]   = (i == 1)
+      and { { 0, #RES_CORNER, "ClaudeDim" }, { #RES_CORNER, -1, group } }
+      or  { { 0, -1, group } }
+  end
+  return lines, hls
+end
+
+-- Apply per-line hl span lists (from build_*/render_code_block) starting at the
+-- 0-indexed buffer line `s`.
+local function apply_line_hls(buf, s, hls)
+  for i, spans in ipairs(hls) do
+    for _, h in ipairs(spans) do
+      vim.api.nvim_buf_add_highlight(buf, -1, h[3], s + i - 1, h[1], h[2])
+    end
+  end
+end
+
+-- Derive code metadata for a tool_result from its originating tool_use (matched
+-- by tool_use_id upstream). Only a Read of a filetype-matchable file becomes
+-- "code"; returns (lang, stripped_body) or (nil, nil).
+local function result_code_meta(meta, body)
+  if not (meta and meta.path) then return nil, nil end
+  if meta.name ~= "Read" and meta.name ~= "NotebookRead" then return nil, nil end
+  local ft = vim.filetype.match({ filename = meta.path })
+  if not ft or ft == "" then return nil, nil end
+  return ft, strip_line_numbers(body)
+end
+
+-- Render a tool_result body under its tool block as the collapsed preview, and
+-- stash it on state.tool_results for the <C-o> toggle. `meta` is the originating
+-- tool_use {name,path} — a Read result renders as a syntax-highlighted code block
+-- when expanded. Shared foundation for the skill-result / error / search features.
+local function render_tool_result(content, is_error, meta)
   local body = tool_result_lines(content)
   if #body == 0 then return end
   local buf = state.panel_buf
@@ -1932,10 +2003,6 @@ local function render_tool_result(content, is_error)
   state.tool_result_ns = state.tool_result_ns
     or vim.api.nvim_create_namespace("claude_tool_result")
   state.tool_results = state.tool_results or {}
-
-  local group   = is_error and "ClaudeError" or "ClaudeDim"
-  local n_shown = math.min(#body, RESULT_HEAD_K)
-  local hidden  = #body - n_shown
 
   -- The running tool block left a trailing blank (the eol randomizer's row); drop
   -- it so the result attaches DIRECTLY under the `└ <command>` line with no gap,
@@ -1947,41 +2014,78 @@ local function render_tool_result(content, is_error)
     vim.bo[buf].modifiable = false
   end
 
-  -- The body hangs off a dim `└` corner on line 1; continuation lines + the
-  -- affordance align under the text after the corner ("  └ " = 4 display cells).
-  local CORNER, INDENT = "  └ ", "    "
-  local CORNER_B = #CORNER   -- byte width of the corner prefix (dim-highlighted)
-  local avail = math.max(panel_width() - 6, 20)   -- one-row budget after the 4-cell prefix
-  local shown = {}
-  for i = 1, n_shown do
-    shown[i] = (i == 1 and CORNER or INDENT) .. result_row(body[i], avail)
-  end
-  local first = vim.api.nvim_buf_line_count(buf)
-  buf_append(shown)
-  -- Corner dim, body text in group; continuation lines all group.
-  hl_range(first, 0, CORNER_B, "ClaudeDim")
-  hl_range(first, CORNER_B, -1, group)
-  if n_shown > 1 then hl_lines(first + 1, first + n_shown - 1, group) end
-
-  local aff_mark
-  if hidden > 0 then
-    local aff = vim.api.nvim_buf_line_count(buf)
-    buf_append({ string.format("%s… +%d %s (ctrl+o to expand)",
-      INDENT, hidden, hidden == 1 and "line" or "lines") })
-    hl_lines(aff, aff, "ClaudeDim")
-    -- Extmark tracks the affordance line across later appends so <C-o> can find
-    -- it even after the buffer grows below the block.
-    aff_mark = vim.api.nvim_buf_set_extmark(buf, state.tool_result_ns, aff, 0, {})
-  end
-  buf_append({ "" })   -- trailing blank so the eol randomizer / next block clears the body
-
-  state.tool_results[#state.tool_results + 1] = {
-    body     = body,       -- full, unindented lines
-    is_error = is_error,
-    hidden   = hidden,     -- lines behind the affordance
-    aff_mark = aff_mark,   -- extmark id of the affordance line (nil when nothing hidden)
-    expanded = false,
+  local lang, code_body = result_code_meta(meta, body)
+  local entry = {
+    body       = body,                    -- full, unindented lines
+    is_error   = is_error,
+    lang       = lang,                    -- filetype for the expanded code block (or nil)
+    code_body  = code_body,               -- line-number-stripped body for code render
+    toggleable = #body > RESULT_HEAD_K,   -- only overflowing blocks collapse/expand
+    expanded   = false,
   }
+
+  local lines, hls = build_collapsed(entry)
+  local first = vim.api.nvim_buf_line_count(buf)
+  buf_append(lines)
+  apply_line_hls(buf, first, hls)
+  -- Start/end extmarks bound the block's line range across later appends so the
+  -- <C-o> toggle can locate and replace it in place.
+  entry.start_mark = vim.api.nvim_buf_set_extmark(buf, state.tool_result_ns, first, 0, {})
+  entry.end_mark   = vim.api.nvim_buf_set_extmark(buf, state.tool_result_ns,
+    first + #lines - 1, 0, {})
+
+  buf_append({ "" })   -- trailing blank so the eol randomizer / next block clears the body
+  state.tool_results[#state.tool_results + 1] = entry
+end
+
+-- Toggle the tool_result block at (or nearest to) the cursor between its collapsed
+-- preview and the full body (a syntax-highlighted code block for Read results,
+-- reverting to the dim preview on collapse). Panel-buffer-local <C-o>; no-op
+-- unless a toggleable block is near.
+function mod.expand_result()
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if not (state.tool_results and state.tool_result_ns) then return end
+  local win = state.panel_win
+  if not (win and vim.api.nvim_win_is_valid(win)) then return end
+  local cur = vim.api.nvim_win_get_cursor(win)[1] - 1   -- 0-indexed cursor line
+
+  -- Pick the toggleable block whose [start, end] span holds the cursor, else the
+  -- nearest by line distance.
+  local pick, pick_d
+  for _, e in ipairs(state.tool_results) do
+    if e.toggleable and e.start_mark and e.end_mark then
+      local sp = vim.api.nvim_buf_get_extmark_by_id(buf, state.tool_result_ns, e.start_mark, {})
+      local ep = vim.api.nvim_buf_get_extmark_by_id(buf, state.tool_result_ns, e.end_mark, {})
+      if sp and sp[1] and ep and ep[1] then
+        local s, en = sp[1], ep[1]
+        local d = (cur >= s and cur <= en) and 0
+          or math.min(math.abs(cur - s), math.abs(cur - en))
+        if not pick_d or d < pick_d then pick_d, pick = d, { e = e, s = s, en = en } end
+      end
+    end
+  end
+  if not pick then return end
+
+  local e = pick.e
+  -- NB: build_* return TWO values; the `cond and f() or g()` idiom truncates
+  -- multi-returns to one, so use an explicit if/else to keep (lines, hls).
+  local lines, hls
+  if e.expanded then
+    lines, hls = build_collapsed(e)
+  else
+    lines, hls = build_expanded(e)
+  end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, pick.s, pick.en + 1, false, lines)
+  vim.bo[buf].modifiable = false
+  apply_line_hls(buf, pick.s, hls)
+  -- Refresh the marks around the newly written range.
+  e.start_mark = vim.api.nvim_buf_set_extmark(buf, state.tool_result_ns, pick.s, 0, {})
+  e.end_mark   = vim.api.nvim_buf_set_extmark(buf, state.tool_result_ns,
+    pick.s + #lines - 1, 0, {})
+  e.expanded = not e.expanded
+  reanchor_pad()   -- the height change may push the last row under a reserved pad
 end
 
 -- Render the result event that closes a turn. The result text itself duplicates
@@ -3408,7 +3512,8 @@ local function dispatch(event)
     remove_typing_ph()
     for _, block in ipairs((event.message or {}).content or {}) do
       if (block.type or "") == "tool_result" then
-        render_tool_result(block.content, block.is_error == true)
+        render_tool_result(block.content, block.is_error == true,
+          state.tool_meta and state.tool_meta[block.tool_use_id])
       end
     end
     -- MG 14.2 RC1: a tool_result means the CLI finished executing — including any
@@ -3442,6 +3547,12 @@ local function dispatch(event)
         local name  = block.name or ""
         local input = block.input or {}
         render_tool(name, input)
+        -- Correlate this tool_use with its later tool_result (by id) so the
+        -- result render knows the tool + file path (e.g. a Read → code block).
+        if block.id then
+          state.tool_meta = state.tool_meta or {}
+          state.tool_meta[block.id] = { name = name, path = input.file_path or input.path }
+        end
         -- MG 14.2: pre-load the edit target so the FileChangedShell interceptor
         -- catches the CLI's write (covers new + unloaded files). tool_use always
         -- precedes execution in the stream, so the buffer loads with pre-edit
@@ -3714,6 +3825,19 @@ local function set_panel_keymaps(buf)
     noremap = true,
     silent  = true,
     desc    = "Claude: toggle fold + re-anchor pad",
+  })
+
+  -- Expand a collapsed tool_result block under the cursor. <C-o> is Neovim's
+  -- default jumplist jump, but this read-only transcript never uses the jumplist,
+  -- so overriding it BUFFER-LOCALLY (panel only) is free and matches the CC TUI's
+  -- "ctrl+o to expand" affordance. No-op when no collapsed block is near.
+  vim.keymap.set("n", "<C-o>", function()
+    mod.expand_result()
+  end, {
+    buffer  = buf,
+    noremap = true,
+    silent  = true,
+    desc    = "Claude: expand tool_result under cursor",
   })
 end
 
@@ -4728,6 +4852,7 @@ function mod.reset()
   state.host_file     = nil
   state.host_ctx_sent = false
   state.tool_results  = {}
+  state.tool_meta     = {}
   if state.perm and state.perm.win and vim.api.nvim_win_is_valid(state.perm.win) then
     pcall(vim.api.nvim_win_close, state.perm.win, true)
   end

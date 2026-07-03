@@ -25,6 +25,7 @@ package.loaded["utils.claude_diff"] = {
   on_panel_open = function() end, on_panel_close = function() end,
   on_diff_open  = function() end, on_diff_close  = function() end,
   watch = function() end,  -- MG 14.2: dispatch pre-loads edit targets through this
+  poll  = function() end,  -- the `user` (tool_result) branch schedules poll()
 }
 package.loaded["utils.opencode"] = {
   state = { opencode_active = false }, toggle = function() end,
@@ -200,5 +201,63 @@ H.check("S6 cornered tool header rendered",
   panel_text():find("● Editing", 1, true) ~= nil, panel_text())
 H.check("S6 cornered detail is the change summary",
   panel_text():find("└ Added 3 lines, removed 1 line", 1, true) ~= nil, panel_text())
+
+-- ── S7: tool_result BODIES render under the tool block ─────────────────────────
+-- A `user` event from the CLI carries tool_result blocks; the panel used to drop
+-- them. Now the body renders indented + dim, long bodies collapse behind a
+-- "… +N lines (ctrl+o to expand)" affordance, is_error bodies flag red.
+claude.state.think_start = nil
+claude.state.tool_run    = nil
+
+-- Short body (≤ K lines): full body, no affordance.
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "t1",
+  content = "line-alpha\nline-beta",
+} } } })
+H.check("S7 short tool_result body rendered",
+  panel_text():find("line-alpha", 1, true) ~= nil
+    and panel_text():find("line-beta", 1, true) ~= nil, panel_text())
+H.check("S7 short body shows NO expand affordance",
+  panel_text():find("ctrl+o to expand", 1, true) == nil, panel_text())
+
+-- Long body (> K = 6 lines): first 6 shown, rest collapsed behind the affordance.
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "t2",
+  content = "r1\nr2\nr3\nr4\nr5\nr6\nr7\nr8\nr9",
+} } } })
+H.check("S7 long body shows the first K lines",
+  panel_text():find("r6", 1, true) ~= nil, panel_text())
+H.check("S7 long body hides overflow lines",
+  panel_text():find("r7", 1, true) == nil, panel_text())
+H.check("S7 long body shows '+3 lines (ctrl+o to expand)'",
+  panel_text():find("+3 lines (ctrl+o to expand)", 1, true) ~= nil, panel_text())
+H.check("S7 long body stashes the full body on state.tool_results",
+  (function()
+    local tr = claude.state.tool_results
+    local last = tr and tr[#tr]
+    return last and #last.body == 9 and last.hidden == 3 and last.aff_mark ~= nil
+  end)(), vim.inspect(claude.state.tool_results and claude.state.tool_results[#claude.state.tool_results]))
+
+-- Error body: is_error flagged on the stashed entry (red hl not headless-assertable).
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "t3", is_error = true,
+  content = "Exit code 1\ncat: nope: No such file or directory",
+} } } })
+H.check("S7 error body rendered",
+  panel_text():find("No such file or directory", 1, true) ~= nil, panel_text())
+H.check("S7 error body flagged is_error on the stashed entry",
+  (function()
+    local tr = claude.state.tool_results
+    local last = tr and tr[#tr]
+    return last and last.is_error == true
+  end)())
+
+-- Empty body: no crash, nothing appended.
+local s7_before = line_count()
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "t4", content = "",
+} } } })
+H.check("S7 empty tool_result body appends nothing",
+  line_count() == s7_before, "before=" .. s7_before .. " after=" .. line_count())
 
 H.summary("claude_stream")

@@ -419,4 +419,35 @@ feed({ type = "assistant", message = { content = { {
 H.check("S15 non-search Bash is unchanged",
   panel_text():find("● Running bash", 1, true) ~= nil, panel_text())
 
+-- ── S16: Task (subagent) → "● Task(<desc>)" + agent type + result body ─────────
+-- The Task tool spawns a subagent; header names the short description, corner
+-- names the agent type, and the subagent's final result renders via the
+-- foundation (its intermediate activity isn't in the headless stream).
+claude.state.think_start = nil
+claude.state.tool_run    = nil
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "tk1", name = "Task",
+  input = { description = "Explore render code", subagent_type = "Explore",
+            prompt = "find all render_ functions" },
+} } } })
+H.check("S16 Task header names the description",
+  panel_text():find("● Task(Explore render code)", 1, true) ~= nil, panel_text())
+H.check("S16 Task corner names the agent type",
+  panel_text():find("└ Explore agent", 1, true) ~= nil, panel_text())
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "tk1",
+  content = "Found render_tool, render_prose, render_thinking.",
+} } } })
+H.check("S16 Task result body renders",
+  panel_text():find("Found render_tool", 1, true) ~= nil, panel_text())
+
+-- The headless build names the subagent tool "Agent"; it gets the same header.
+claude.state.tool_run = nil
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "ag1", name = "Agent",
+  input = { description = "Audit float layout", subagent_type = "general-purpose" },
+} } } })
+H.check("S16 Agent tool_use also renders as a Task header",
+  panel_text():find("● Task(Audit float layout)", 1, true) ~= nil, panel_text())
+
 H.summary("claude_stream")

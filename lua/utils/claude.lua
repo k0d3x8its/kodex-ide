@@ -1870,6 +1870,106 @@ local function render_tool(name, input)
   state.tool_run = { t0 = vim.loop.now() }
 end
 
+-- Normalise a tool_result `content` field to a flat list of display lines.
+-- The CLI sends `content` as either a plain STRING (the common case, e.g.
+-- "1\n2\n…") or an array of `{type="text",text=…}` blocks. Tabs → two spaces
+-- (nvim_buf_set_lines forbids raw tabs in some widths and they render ragged).
+-- Blank/whitespace-only lines are DROPPED so the glance-preview stays dense —
+-- a Read result's separator blank (e.g. after a <system-reminder> banner) would
+-- otherwise open a gap; numbered `cat -n` lines survive (they carry the number).
+local function tool_result_lines(content)
+  local s
+  if type(content) == "string" then
+    s = content
+  elseif type(content) == "table" then
+    local parts = {}
+    for _, c in ipairs(content) do
+      if type(c) == "table" and (c.type == "text") then
+        parts[#parts + 1] = c.text or ""
+      elseif type(c) == "string" then
+        parts[#parts + 1] = c
+      end
+    end
+    s = table.concat(parts, "\n")
+  else
+    s = ""
+  end
+  s = tostring(s):gsub("\t", "  ")
+  local lines = {}
+  for _, l in ipairs(vim.split(s, "\n", { plain = true })) do
+    if not l:match("^%s*$") then lines[#lines + 1] = l end
+  end
+  return lines
+end
+
+-- Visible body lines before a tool_result is collapsed behind the expand
+-- affordance. Kept small so a big Read/Bash result is a preview, not a dump.
+local RESULT_HEAD_K = 6
+
+-- Render a tool_result body under its tool block: each line indented two spaces,
+-- dim (or ClaudeError red when is_error). Bodies longer than RESULT_HEAD_K show
+-- the first K lines + a dim "… +N lines (ctrl+o to expand)" affordance; the FULL
+-- body is stashed on state.tool_results (keyed by an extmark on the affordance
+-- line) for the <C-o> expand keymap wired in a later increment. This is the
+-- shared foundation the skill-result / error / truncation features build on.
+local function render_tool_result(content, is_error)
+  local body = tool_result_lines(content)
+  if #body == 0 then return end
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+
+  state.tool_result_ns = state.tool_result_ns
+    or vim.api.nvim_create_namespace("claude_tool_result")
+  state.tool_results = state.tool_results or {}
+
+  local group   = is_error and "ClaudeError" or "ClaudeDim"
+  local n_shown = math.min(#body, RESULT_HEAD_K)
+  local hidden  = #body - n_shown
+
+  -- The running tool block left a trailing blank (the eol randomizer's row); drop
+  -- it so the result attaches DIRECTLY under the `└ <command>` line with no gap,
+  -- matching the CC TUI. set_hint re-anchors the randomizer on the next tick.
+  local last = vim.api.nvim_buf_line_count(buf)
+  if last > 0 and vim.api.nvim_buf_get_lines(buf, last - 1, last, false)[1] == "" then
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, last - 1, last, false, {})
+    vim.bo[buf].modifiable = false
+  end
+
+  -- The body hangs off a dim `└` corner on line 1; continuation lines + the
+  -- affordance align under the text after the corner ("  └ " = 4 display cells).
+  local CORNER, INDENT = "  └ ", "    "
+  local CORNER_B = #CORNER   -- byte width of the corner prefix (dim-highlighted)
+  local shown = {}
+  for i = 1, n_shown do shown[i] = (i == 1 and CORNER or INDENT) .. body[i] end
+  local first = vim.api.nvim_buf_line_count(buf)
+  buf_append(shown)
+  -- Corner dim, body text in group; continuation lines all group.
+  hl_range(first, 0, CORNER_B, "ClaudeDim")
+  hl_range(first, CORNER_B, -1, group)
+  if n_shown > 1 then hl_lines(first + 1, first + n_shown - 1, group) end
+
+  local aff_mark
+  if hidden > 0 then
+    local aff = vim.api.nvim_buf_line_count(buf)
+    buf_append({ string.format("%s… +%d %s (ctrl+o to expand)",
+      INDENT, hidden, hidden == 1 and "line" or "lines") })
+    hl_lines(aff, aff, "ClaudeDim")
+    -- Extmark tracks the affordance line across later appends so <C-o> can find
+    -- it even after the buffer grows below the block.
+    aff_mark = vim.api.nvim_buf_set_extmark(buf, state.tool_result_ns, aff, 0, {})
+  end
+  buf_append({ "" })   -- trailing blank so the eol randomizer / next block clears the body
+
+  state.tool_results[#state.tool_results + 1] = {
+    body     = body,       -- full, unindented lines
+    is_error = is_error,
+    hidden   = hidden,     -- lines behind the affordance
+    aff_mark = aff_mark,   -- extmark id of the affordance line (nil when nothing hidden)
+    expanded = false,
+  }
+end
+
 -- Render the result event that closes a turn. The result text itself duplicates
 -- the assistant prose already rendered (and may carry embedded newlines that
 -- nvim_buf_set_lines forbids), so it's NOT rendered. Instead we drop the official
@@ -3289,6 +3389,14 @@ local function dispatch(event)
     -- round-trip that follows. (Our own outgoing turns are written to stdin, never
     -- echoed back through dispatch, so a user event here is always a tool_result.)
     state.tool_run = nil
+    -- Render the tool_result BODY under its tool block (was dropped as "v2").
+    -- Drop the typing placeholder first so the body never lands below it.
+    remove_typing_ph()
+    for _, block in ipairs((event.message or {}).content or {}) do
+      if (block.type or "") == "tool_result" then
+        render_tool_result(block.content, block.is_error == true)
+      end
+    end
     -- MG 14.2 RC1: a tool_result means the CLI finished executing — including any
     -- Edit/Write that just hit disk. The FileChangedShell interceptor only detects
     -- that write when something polls checktime, but its poll autocmds
@@ -4605,6 +4713,7 @@ function mod.reset()
   state.prewrite      = nil
   state.host_file     = nil
   state.host_ctx_sent = false
+  state.tool_results  = {}
   if state.perm and state.perm.win and vim.api.nvim_win_is_valid(state.perm.win) then
     pcall(vim.api.nvim_win_close, state.perm.win, true)
   end

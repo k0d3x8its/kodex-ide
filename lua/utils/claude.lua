@@ -2857,6 +2857,17 @@ end
 -- TaskUpdate.taskId is that N — so we mint ids from our own todo_seq in creation
 -- order to match. We rebuild the same {content,status,activeForm} rows the widget
 -- already renders. Returns true when it handled the tool.
+-- True only when the plan is non-empty AND every task is completed. Pure — the
+-- auto-dismiss decision is tested through this, not the timer.
+function W.plan_complete(todos)
+  if not (todos and #todos > 0) then return false end
+  for _, t in ipairs(todos) do
+    if t.status ~= "completed" then return false end
+  end
+  return true
+end
+mod._plan_complete = W.plan_complete   -- test hook
+
 function W.apply_task_tool(name, input)
   input = input or {}
   if name == "TaskCreate" then
@@ -2890,6 +2901,26 @@ function W.apply_task_tool(name, input)
   local old_h = state.todo_h or 0
   W.update_todo_widget()
   if (state.todo_h or 0) ~= old_h then W.reflow_bottom_floats() end
+
+  -- Auto-dismiss the card once the WHOLE plan is done. Armed ONLY from a completing
+  -- TaskUpdate (never a TaskCreate), so a model that creates-then-completes tasks
+  -- one at a time can't momentarily read as "all done" and dismiss early. The
+  -- deferred close re-checks plan_complete at fire time, so any task added/reopened
+  -- within the window cancels it. Guarded so repeated updates don't stack timers.
+  if name == "TaskUpdate" and W.plan_complete(state.todos) then
+    if not state.todo_done_pending then
+      state.todo_done_pending = true
+      vim.defer_fn(function()
+        state.todo_done_pending = false
+        if W.plan_complete(state.todos) then
+          W.close_todo_widget()
+          W.reflow_bottom_floats()
+        end
+      end, 2500)
+    end
+  else
+    state.todo_done_pending = false
+  end
   return true
 end
 mod._apply_task_tool = W.apply_task_tool   -- test hook
@@ -2962,33 +2993,6 @@ function W.update_todo_widget()
     state.todo_resize_teardown = function()
       pcall(vim.api.nvim_del_augroup_by_name, "ClaudeTodoResize")
     end
-  end
-
-  -- Auto-dismiss once every task is completed: the card shows the all-✔ state
-  -- (rendered above), then fades after a short beat so a finished plan doesn't
-  -- linger. Guarded by todo_done_pending so repeated updates don't stack timers;
-  -- the deferred close re-checks (a new TaskCreate within the window cancels it by
-  -- flipping a task back to non-completed → all_done false → flag reset below).
-  local all_done = true
-  for _, t in ipairs(todos) do
-    if t.status ~= "completed" then all_done = false break end
-  end
-  if all_done then
-    if not state.todo_done_pending then
-      state.todo_done_pending = true
-      vim.defer_fn(function()
-        state.todo_done_pending = false
-        local td = state.todos
-        if not (td and #td > 0) then return end
-        for _, t in ipairs(td) do
-          if t.status ~= "completed" then return end   -- plan changed → keep it
-        end
-        W.close_todo_widget()
-        W.reflow_bottom_floats()
-      end, 2500)
-    end
-  else
-    state.todo_done_pending = false
   end
 end
 

@@ -301,4 +301,17 @@ H.check("S9 collapse restores the affordance",
   panel_text():find("+3 lines (ctrl+o to expand)", 1, true) ~= nil, panel_text())
 H.check("S9 entry marked collapsed", x_entry.expanded == false)
 
+-- ── S10: Skill tool_use renders "● Skill(<name>)" ──────────────────────────────
+-- A Skill invocation is a tool_use name="Skill" with the skill name in input.skill.
+-- It used to fall through to a bare "● Skill" (no name); now the header names the
+-- skill so the block reads like the CC TUI. The result body ("Successfully loaded
+-- skill …") renders via the shared tool_result-body foundation (S7), not here.
+claude.state.think_start = nil
+claude.state.tool_run    = nil
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", name = "Skill", input = { skill = "diagnose" },
+} } } })
+H.check("S10 Skill header names the skill",
+  panel_text():find("● Skill(diagnose)", 1, true) ~= nil, panel_text())
+
 H.summary("claude_stream")

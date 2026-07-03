@@ -463,7 +463,7 @@ local todos = {
 }
 local tlines = claude._render_todo_lines(todos)
 H.check("S17 header counts by status",
-  tlines[1] == "5 tasks (1 done, 1 in progress, 3 open)", tlines[1])
+  tlines[1] == " 5 tasks (1 done, 1 in progress, 3 open)", tlines[1])
 H.check("S17 completed row shows the check glyph",
   tlines[2]:find("✔", 1, true) ~= nil, tlines[2])
 H.check("S17 in-progress row uses activeForm",
@@ -566,11 +566,12 @@ H.check("S18 system/init preserves the task list (per-turn event)",
   claude.state.todos and #claude.state.todos == before_n and before_n == 3,
   vim.inspect(claude.state.todos))
 
--- Completed-row text span must start AFTER the glyph + separator space, else the
--- strikethrough covers the space and bleeds a line into the ✔ (live-observed).
+-- Completed-row text span must start AFTER the 1-space pad + glyph + separator
+-- space, else the strikethrough covers the space and bleeds a line into the ✔
+-- (live-observed). Offset = #PAD(1) + #"✔" + 1 separator.
 local _, chls = claude._render_todo_lines({ { content = "done", status = "completed" } })
-H.check("S18 completed text span skips the glyph+space (no strike bleed)",
-  chls[2] and chls[2][2] and chls[2][2][1] == #"✔" + 1,
+H.check("S18 completed text span skips the pad+glyph+space (no strike bleed)",
+  chls[2] and chls[2][2] and chls[2][2][1] == 1 + #"✔" + 1,
   vim.inspect(chls[2]))
 
 -- plan_complete: the pure all-tasks-done gate (auto-dismiss fires ONLY on this).

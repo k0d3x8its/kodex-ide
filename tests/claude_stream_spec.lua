@@ -450,4 +450,51 @@ feed({ type = "assistant", message = { content = { {
 H.check("S16 Agent tool_use also renders as a Task header",
   panel_text():find("● Task(Audit float layout)", 1, true) ~= nil, panel_text())
 
+-- ── S17: TodoWrite drives the bottom task widget, not an inline block ───────────
+-- render_todo_lines is pure: header counts + glyph rows + activeForm for the
+-- in-progress task + "+N more" cap. Dispatch captures the list and suppresses both
+-- the inline tool block and the noisy "Todos have been modified" result body.
+local todos = {
+  { content = "Add helpers",        status = "completed"   },
+  { content = "Fix perm float",     status = "in_progress", activeForm = "Fixing perm float" },
+  { content = "Fix question float", status = "pending"     },
+  { content = "Refactor chat",      status = "pending"     },
+  { content = "Run make test",      status = "pending"     },
+}
+local tlines = claude._render_todo_lines(todos)
+H.check("S17 header counts by status",
+  tlines[1] == "5 tasks (1 done, 1 in progress, 3 open)", tlines[1])
+H.check("S17 completed row shows the check glyph",
+  tlines[2]:find("✔", 1, true) ~= nil, tlines[2])
+H.check("S17 in-progress row uses activeForm",
+  tlines[3]:find("Fixing perm float", 1, true) ~= nil, tlines[3])
+
+-- Cap: 10 tasks → header + 7 rows + "… +3 more".
+local many = {}
+for i = 1, 10 do many[i] = { content = "task " .. i, status = "pending" } end
+local mlines = claude._render_todo_lines(many)
+H.check("S17 caps the list with a '+N more' tail",
+  mlines[#mlines]:find("… +3 more", 1, true) ~= nil, mlines[#mlines])
+
+-- Dispatch: TodoWrite captures the list, renders NO inline tool block.
+claude.state.think_start = nil
+claude.state.tool_run    = nil
+local s17_txt_before = panel_text()
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "td1", name = "TodoWrite", input = { todos = todos },
+} } } })
+H.check("S17 TodoWrite captures the todo list on state",
+  claude.state.todos and #claude.state.todos == 5, vim.inspect(claude.state.todos))
+H.check("S17 TodoWrite renders no inline tool block",
+  panel_text():find("Update Todos", 1, true) == nil
+    and panel_text():find("● TodoWrite", 1, true) == nil, panel_text())
+
+-- The TodoWrite result ack is suppressed (widget already reflects the change).
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "td1",
+  content = "Todos have been modified successfully",
+} } } })
+H.check("S17 TodoWrite result ack is not rendered",
+  panel_text():find("have been modified", 1, true) == nil, panel_text())
+
 H.summary("claude_stream")

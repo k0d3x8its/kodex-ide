@@ -573,4 +573,26 @@ H.check("S18 completed text span skips the glyph+space (no strike bleed)",
   chls[2] and chls[2][2] and chls[2][2][1] == #"✔" + 1,
   vim.inspect(chls[2]))
 
+-- plan_complete: the pure all-tasks-done gate (auto-dismiss fires ONLY on this).
+H.check("S18 plan_complete is false when any task is unfinished",
+  claude._plan_complete({ { status = "completed" }, { status = "pending" } }) == false)
+H.check("S18 plan_complete is true only when every task is completed",
+  claude._plan_complete({ { status = "completed" }, { status = "completed" } }) == true)
+H.check("S18 plan_complete is false for an empty plan",
+  claude._plan_complete({}) == false)
+
+-- Behavior: completing ONE of two must NOT arm the dismiss; completing ALL does.
+-- (Guards against per-task disappearance — the card only fades when the whole plan
+-- is done.)
+claude.state.todos, claude.state.todo_seq = nil, nil
+claude.state.todo_done_pending = false
+task_create("d1", "First")
+task_create("d2", "Second")
+task_update("du1", "1", "completed")
+H.check("S18 completing one of two does NOT arm the dismiss",
+  claude.state.todo_done_pending == false, tostring(claude.state.todo_done_pending))
+task_update("du2", "2", "completed")
+H.check("S18 completing ALL tasks arms the dismiss",
+  claude.state.todo_done_pending == true, tostring(claude.state.todo_done_pending))
+
 H.summary("claude_stream")

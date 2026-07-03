@@ -235,7 +235,8 @@ H.check("S7 long body stashes the full body on state.tool_results",
   (function()
     local tr = claude.state.tool_results
     local last = tr and tr[#tr]
-    return last and #last.body == 9 and last.hidden == 4 and last.aff_mark ~= nil
+    return last and #last.body == 9 and last.toggleable == true
+      and last.start_mark ~= nil and last.end_mark ~= nil
   end)(), vim.inspect(claude.state.tool_results and claude.state.tool_results[#claude.state.tool_results]))
 
 -- Error body: is_error flagged on the stashed entry (red hl not headless-assertable).
@@ -262,5 +263,42 @@ feed({ type = "user", message = { content = { {
 } } } })
 H.check("S7 empty tool_result body appends nothing",
   line_count() == s7_before, "before=" .. s7_before .. " after=" .. line_count())
+
+-- ── S8: <C-o> expand swaps the preview for the full body ───────────────────────
+-- A fresh long result (8 lines → 5 shown, 3 hidden). Put the cursor on the block,
+-- expand, and confirm the previously-hidden lines appear and the affordance is
+-- removed — while a DIFFERENT collapsed block (S7's r-block, "+4 lines") stays
+-- collapsed (expand is cursor-scoped, not global).
+claude.state.think_start = nil
+claude.state.tool_run    = nil
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "t5",
+  content = "x1\nx2\nx3\nx4\nx5\nx6\nx7\nx8",
+} } } })
+H.check("S8 preview hides overflow before expand",
+  panel_text():find("x8", 1, true) == nil, panel_text())
+
+local x_entry = claude.state.tool_results[#claude.state.tool_results]
+local function cursor_on(entry)
+  local sp = vim.api.nvim_buf_get_extmark_by_id(
+    claude.state.panel_buf, claude.state.tool_result_ns, entry.start_mark, {})
+  vim.api.nvim_win_set_cursor(claude.state.panel_win, { sp[1] + 1, 0 })
+end
+
+cursor_on(x_entry)
+claude.expand_result()
+H.check("S8 expand reveals the full body", panel_text():find("x8", 1, true) ~= nil, panel_text())
+H.check("S8 entry marked expanded", x_entry.expanded == true)
+H.check("S8 a different collapsed block stays collapsed",
+  panel_text():find("+4 lines (ctrl+o to expand)", 1, true) ~= nil, panel_text())
+
+-- ── S9: a second <C-o> collapses the block back to the preview ─────────────────
+cursor_on(x_entry)
+claude.expand_result()
+H.check("S9 collapse hides the overflow again",
+  panel_text():find("x8", 1, true) == nil, panel_text())
+H.check("S9 collapse restores the affordance",
+  panel_text():find("+3 lines (ctrl+o to expand)", 1, true) ~= nil, panel_text())
+H.check("S9 entry marked collapsed", x_entry.expanded == false)
 
 H.summary("claude_stream")

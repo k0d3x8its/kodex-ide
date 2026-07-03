@@ -4068,11 +4068,12 @@ end
 -- Search-block renderer fires and search is structural. `sg` is off-limits: on
 -- this machine it resolves to the system group tool, not ast-grep.
 local SEARCH_NUDGE = table.concat({
-  "For code search, prefer `ast-grep` for structural/AST queries and `rg` ",
-  "(ripgrep) for plain-text search. Run the search tool as the leading shell ",
-  "command — do not pipe through `cat` or `grep`. Never invoke `sg`: on this ",
-  "system that is the group-management tool, not ast-grep — always spell it ",
-  "`ast-grep`.",
+  "For code search, run the `ast-grep` COMMAND-LINE TOOL (the shell binary) for ",
+  "structural/AST queries and `rg` (ripgrep) for plain-text search, as the ",
+  "leading shell command — never piped through `cat` or `grep`. Do NOT launch ",
+  "the `ast-grep` skill for searches; call the `ast-grep` binary directly in ",
+  "Bash. Never run `sg`: on this system it is the group-management tool, not ",
+  "ast-grep — always spell it `ast-grep`.",
 }, "")
 
 -- Directories to guarantee on the panel process's PATH. GNOME launches nvim

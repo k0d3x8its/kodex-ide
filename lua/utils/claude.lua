@@ -417,6 +417,18 @@ end
 -- bar — instead of scrolling it flush to the window bottom (under the float).
 local anchor_last_line
 local set_bottom_pad
+-- HACK: `W` is a namespace table for the search + TodoWrite-widget helpers
+-- (W.search_descriptor, W.render_search[_result], W.render_todo_lines,
+-- W.todo_height, W.float_bottom_row, W.close_todo_widget, W.reflow_bottom_floats,
+-- W.update_todo_widget). WHY: this file hit Lua's hard limit of 200 local
+-- variables in a single function — adding these as top-level `local function`s
+-- overflowed it ("main function has more than 200 local variables" at load).
+-- Table FIELDS cost zero locals, so hanging ~10 helpers off one `local W` buys
+-- back 9 slots. Forward-declared `local`s would NOT help (they still count).
+-- This is a stopgap: the real fix is splitting claude.lua into submodules — see
+-- the [CHORE] "Refactor lua/utils/claude.lua" TODO. When that lands, these become
+-- normal module-scoped functions and `W` goes away.
+local W = {}
 
 local function buf_append(lines)
   local buf = state.panel_buf
@@ -439,7 +451,7 @@ local function buf_append(lines)
     -- pad to the new last line (set_bottom_pad re-places it AND re-anchors), not
     -- just re-anchor — otherwise the pad sits mid-buffer and the lift is lost.
     if (state.pad_rows or 0) > 0 then
-      set_bottom_pad(state.pad_rows)
+      set_bottom_pad(state.chat_pad or 0)   -- re-place; total recomputed w/ widget
     else
       pcall(vim.api.nvim_win_call, state.panel_win, function()
         vim.cmd("keepjumps normal! G")
@@ -1253,41 +1265,38 @@ function anchor_last_line(win, reserve)
   end)
 end
 
+-- `rows` is the BASE reserve the caller (chat bar / question float) wants. The
+-- ACTUAL pad also includes the bottom-pinned task widget's height so transcript
+-- content clears BOTH. state.chat_pad = the base (re-fed on re-place/re-anchor to
+-- avoid double-counting the widget); state.pad_rows = the effective total the
+-- WinScrolled clamp reads.
 function set_bottom_pad(rows)
   local buf = state.panel_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf) and state.pad_ns) then return end
+  state.chat_pad = (rows and rows >= 1) and rows or 0
+  local total = state.chat_pad + (W.todo_height and W.todo_height() or 0)
   vim.api.nvim_buf_clear_namespace(buf, state.pad_ns, 0, -1)
-  -- Record the pad height BEFORE anchoring so the WinScrolled clamp (which the
-  -- topline change triggers) already knows to allow the extra rows.
-  state.pad_rows = (rows and rows >= 1) and rows or 0
-  if not rows or rows < 1 then return end
-  local last = vim.api.nvim_buf_line_count(buf) - 1
-  if last < 0 then last = 0 end
-  -- `rows` blank pad lines below the last real line fill the area the float covers
-  -- (plus one visible separator row). They also give the view real content below
-  -- the last line so topline can lift it clear of the bar.
-  local vlines = {}
-  for _ = 1, rows do vlines[#vlines + 1] = { { "", "ClaudeNormal" } } end
-  vim.api.nvim_buf_set_extmark(buf, state.pad_ns, last, 0, { virt_lines = vlines })
-  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)
-      and vim.api.nvim_win_get_buf(state.panel_win) == buf then
-    anchor_last_line(state.panel_win, rows)
+  state.pad_rows = total
+  local is_panel = state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)
+    and vim.api.nvim_win_get_buf(state.panel_win) == buf
+  if total < 1 then
+    if is_panel then anchor_last_line(state.panel_win, 0) end
+    return
   end
+  local last = math.max(vim.api.nvim_buf_line_count(buf) - 1, 0)
+  -- `total` blank pad lines below the last real line fill the area the floats cover
+  -- (plus a visible separator row), giving topline real content to lift the last
+  -- line clear of the bar + widget.
+  local vlines = {}
+  for _ = 1, total do vlines[#vlines + 1] = { { "", "ClaudeNormal" } } end
+  vim.api.nvim_buf_set_extmark(buf, state.pad_ns, last, 0, { virt_lines = vlines })
+  if is_panel then anchor_last_line(state.panel_win, total) end
 end
 
+-- Drop the chat/question float's base reserve. The task widget (if visible) keeps
+-- its own reserve, so route through set_bottom_pad(0) rather than clearing raw.
 local function clear_bottom_pad()
-  state.pad_rows = 0
-  local buf = state.panel_buf
-  if buf and vim.api.nvim_buf_is_valid(buf) and state.pad_ns then
-    vim.api.nvim_buf_clear_namespace(buf, state.pad_ns, 0, -1)
-    -- Reflow the newest output flush to the window bottom now the bar's gone, so a
-    -- close doesn't leave the conversation stranded mid-window with blank space
-    -- below (and so the next open recomputes from a clean bottom-anchored view).
-    if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)
-        and vim.api.nvim_win_get_buf(state.panel_win) == buf then
-      anchor_last_line(state.panel_win, 0)
-    end
-  end
+  set_bottom_pad(0)
 end
 
 -- Re-pin the last content line to its resting position when a pad is reserved.
@@ -1296,7 +1305,9 @@ end
 -- it drops below its anchor and hides UNDER the question card / chat bar. Re-running
 -- set_bottom_pad re-anchors it to `pad_rows` above the bottom. No-op with no pad.
 local function reanchor_pad()
-  if (state.pad_rows or 0) > 0 then set_bottom_pad(state.pad_rows) end
+  if (state.chat_pad or 0) > 0 or (W.todo_height and W.todo_height() > 0) then
+    set_bottom_pad(state.chat_pad or 0)
+  end
 end
 
 -- Test seams: expose the pad/anchor internals so the headless spec can drive the
@@ -2056,30 +2067,26 @@ local function render_tool_result(content, is_error, meta)
   state.tool_results[#state.tool_results + 1] = entry
 end
 
--- Search-shaped shell commands → the verb they read as. In headless SDK mode the
--- panel's claude has NO Grep/Glob tool — it searches via Bash (rg/grep/ast-grep/
--- fd/find). Detecting those lets a Bash search render as a "● Searching" block
--- instead of a generic "● Running bash". `files` = the command's output is a
--- clean path list (→ count header + `└ file` list); else the body is match lines.
-local SEARCH_CMDS = {
-  rg = "Searching", grep = "Searching", egrep = "Searching", fgrep = "Searching",
-  ["ast-grep"] = "Searching", sg = "Searching",
-  fd = "Listing", fdfind = "Listing", find = "Listing",
-}
-
--- Flags that make a search emit a bare FILE LIST (one path per line) rather than
--- matching lines. fd/find always emit paths.
-local function bash_files_mode(base, cmd)
-  if base == "fd" or base == "fdfind" or base == "find" then return true end
-  return cmd:match("%s%-l%f[%s]") ~= nil
-    or cmd:match("%-%-files%-with%-matches") ~= nil
-    or cmd:match("%-%-files%f[%s]") ~= nil
-end
-
 -- Descriptor for a search tool_use, or nil if it isn't a search. Covers the Grep/
--- Glob TOOLS (clean output) and search-shaped Bash COMMANDS (headless reality).
--- { verb, pattern, files } — `files` gates the count-header + `└ file` list form.
-local function search_descriptor(name, input)
+-- Glob TOOLS (clean output) and search-shaped Bash COMMANDS (headless reality: the
+-- panel's claude has NO Grep/Glob tool, so it searches via Bash). { verb, pattern,
+-- files } — `files` (clean path-list output) gates the count-header + `└ file` list.
+-- Scoped in a do-block so its lookup table + helper stay off the main local budget.
+do
+  -- Search-shaped shell commands → the verb they read as.
+  local SEARCH_CMDS = {
+    rg = "Searching", grep = "Searching", egrep = "Searching", fgrep = "Searching",
+    ["ast-grep"] = "Searching", sg = "Searching",
+    fd = "Listing", fdfind = "Listing", find = "Listing",
+  }
+  -- Flags that make a search emit a bare FILE LIST rather than match lines.
+  local function files_mode(base, cmd)
+    if base == "fd" or base == "fdfind" or base == "find" then return true end
+    return cmd:match("%s%-l%f[%s]") ~= nil
+      or cmd:match("%-%-files%-with%-matches") ~= nil
+      or cmd:match("%-%-files%f[%s]") ~= nil
+  end
+  function W.search_descriptor(name, input)
   if name == "Grep" then
     return { verb = "Searching", pattern = input.pattern, files = true }
   elseif name == "Glob" then
@@ -2102,16 +2109,17 @@ local function search_descriptor(name, input)
       end
       if pat then pat = pat:gsub("^[\"']", ""):gsub("[\"']$", "") end
     end
-    return { verb = verb, pattern = pat or c, files = bash_files_mode(base, c) }
+    return { verb = verb, pattern = pat or c, files = files_mode(base, c) }
   end
   return nil
+  end
 end
 
 -- Render the PROVISIONAL search header at tool_use time and register the block so
 -- the matching tool_result can rewrite the header + attach the results. The header
 -- row is tracked by extmark (not position) so interleaved output can't desync the
 -- later rewrite.
-local function render_search(sd, id)
+function W.render_search(sd, id)
   local buf = state.panel_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   state.search_ns = state.search_ns
@@ -2132,7 +2140,7 @@ end
 -- Parse a file-list search body into (file_count, file_list). Handles the Grep
 -- TOOL's "Found N files\n<paths>" summary, the empty "No files/matches" form, and
 -- a bare path list (Bash rg -l / fd / find; count = #lines).
-local function parse_search_result(body)
+function W.parse_search_result(body)
   if #body == 0 then return 0, {} end
   local n = body[1]:match("^Found%s+(%d+)")
   if n then
@@ -2151,7 +2159,7 @@ end
 -- header + a `└`-per-line collapsible file list. A match-line search (rg/grep/
 -- ast-grep default) shows "● <Verb>  <pattern>" + the match body. Errors keep a
 -- plain header + the generic red body.
-local function render_search_result(sb, content, is_error, meta)
+function W.render_search_result(sb, content, is_error, meta)
   local buf = state.panel_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   local sd   = sb.sd
@@ -2181,7 +2189,7 @@ local function render_search_result(sb, content, is_error, meta)
   end
 
   local body = tool_result_lines(content)
-  local m, files = parse_search_result(body)
+  local m, files = W.parse_search_result(body)
   if m == 0 then
     set_header("● " .. sd.verb .. " — no matches")
     return
@@ -2228,6 +2236,79 @@ local function render_search_result(sb, content, is_error, meta)
     first + #lines - 1, 0, {})
   buf_append({ "" })
   state.tool_results[#state.tool_results + 1] = entry
+end
+
+-- ─── TodoWrite task-list widget (bottom-pinned float) ────────────────────────
+
+-- Render the task list to (lines, hls): a dim "N tasks (X done, Y in progress,
+-- Z open)" header, then one row per task (✔ done strikethrough / ▦ in-progress
+-- orange / □ pending), capped at CAP with a "… +N more" tail. hls[i] is a list of
+-- {b0, b1, group} spans. Pure — unit-tested directly. Scoped in a do-block (its
+-- constants + helper stay off the main chunk's local budget — 200-local limit).
+do
+  local CAP    = 8
+  local GLYPH  = { completed = "✔", in_progress = "▦", pending = "□" }
+  local TEXTHL = {
+    completed   = "ClaudeTodoDone",
+    in_progress = "ClaudeTodoActive",
+    pending     = "ClaudeTodoPending",
+  }
+  -- Count tasks by status. Anything not completed/in_progress counts as open.
+  local function counts(todos)
+    local done, active, open = 0, 0, 0
+    for _, t in ipairs(todos) do
+      local s = t.status
+      if s == "completed" then done = done + 1
+      elseif s == "in_progress" then active = active + 1
+      else open = open + 1 end
+    end
+    return done, active, open
+  end
+  function W.render_todo_lines(todos)
+    local done, active, open = counts(todos)
+    local n = #todos
+    local header = string.format("%d task%s (%d done, %d in progress, %d open)",
+      n, n == 1 and "" or "s", done, active, open)
+    local lines, hls = { header }, { { { 0, -1, "ClaudeTodoHeader" } } }
+
+    local shown, more = n, 0
+    if n > CAP then shown, more = CAP - 1, n - (CAP - 1) end
+    for i = 1, shown do
+      local t      = todos[i]
+      local status = t.status or "pending"
+      local glyph  = GLYPH[status] or GLYPH.pending
+      -- In-progress tasks read better in their gerund activeForm ("Applying …").
+      local text   = (status == "in_progress" and t.activeForm and t.activeForm ~= "")
+        and t.activeForm or (t.content or "")
+      lines[#lines + 1] = glyph .. " " .. text
+      local glyph_hl = status == "completed" and "ClaudeTodoCheck"
+        or (TEXTHL[status] or "ClaudeTodoPending")
+      hls[#hls + 1] = {
+        { 0, #glyph, glyph_hl },                              -- status glyph
+        { #glyph, -1, TEXTHL[status] or "ClaudeTodoPending" }, -- task text
+      }
+    end
+    if more > 0 then
+      lines[#lines + 1] = string.format("… +%d more", more)
+      hls[#hls + 1] = { { 0, -1, "ClaudeTodoHeader" } }
+    end
+    return lines, hls
+  end
+end
+mod._render_todo_lines = W.render_todo_lines   -- test hook
+
+-- Rows the widget currently occupies (0 when hidden). Other bottom floats + the
+-- chat pad add this so they stack ABOVE the task list. Assigns the forward-declared
+-- local so the early pad math can see it.
+function W.todo_height()
+  return (state.todos and #state.todos > 0) and (state.todo_h or 0) or 0
+end
+
+-- SW `row` for a bottom float (chat bar / permission / question / diff): the
+-- panel bottom, lifted above the task widget when it is visible. Single source so
+-- every float + the resize handler stack consistently.
+function W.float_bottom_row()
+  return vim.o.lines - 2 - W.todo_height()
 end
 
 -- Toggle the tool_result block at (or nearest to) the cursor between its collapsed
@@ -2724,12 +2805,103 @@ local function attach_panel_float_resize(win, group_name, on_resize)
       if not vim.api.nvim_win_is_valid(win) then return true end  -- gone → self-remove
       local col, w = panel_float_geom()
       local c = vim.api.nvim_win_get_config(win)
-      c.col, c.row, c.width = col, vim.o.lines - 2, w
+      c.col, c.row, c.width = col, W.float_bottom_row(), w
       pcall(vim.api.nvim_win_set_config, win, c)
       if on_resize then on_resize(win, col, w) end
     end,
   })
   return function() pcall(vim.api.nvim_del_augroup_by_name, group_name) end
+end
+
+-- Close the task-list widget float (kept buffer is reused on next open).
+function W.close_todo_widget()
+  if state.todo_resize_teardown then state.todo_resize_teardown(); state.todo_resize_teardown = nil end
+  if state.todo_win and vim.api.nvim_win_is_valid(state.todo_win) then
+    pcall(vim.api.nvim_win_close, state.todo_win, true)
+  end
+  state.todo_win = nil
+  state.todo_h   = 0
+end
+
+-- Lift every currently-open bottom float above the task widget and re-reserve
+-- transcript space. Called when the widget appears / changes height while floats
+-- are already open (their open-time row is otherwise stale).
+function W.reflow_bottom_floats()
+  local row = W.float_bottom_row()
+  local function move(win)
+    if win and vim.api.nvim_win_is_valid(win) then
+      local c = vim.api.nvim_win_get_config(win)
+      if c.relative and c.relative ~= "" then
+        c.row = row
+        pcall(vim.api.nvim_win_set_config, win, c)
+      end
+    end
+  end
+  move(state.perm and state.perm.win)
+  move(state.qask and state.qask.win)
+  move(state.diff_card and state.diff_card.win)
+  move(state.chat_win)
+  set_bottom_pad(state.chat_pad or 0)   -- recompute total (chat base + widget)
+end
+
+-- Open or update the bottom-pinned TodoWrite widget from state.todos. A borderless,
+-- non-focusable SW float at the very bottom of the panel column; the other bottom
+-- floats + the chat pad read todo_height() to stack ABOVE it. Hidden (closed) when
+-- the list is empty. The caller reflows the other floats after this returns.
+function W.update_todo_widget()
+  local todos = state.todos
+  if not (todos and #todos > 0) then W.close_todo_widget(); return end
+  if not (state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)) then return end
+
+  local lines, hls = W.render_todo_lines(todos)
+  local buf = state.todo_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    buf = vim.api.nvim_create_buf(false, true)
+    state.todo_buf = buf
+  end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  state.todo_ns = state.todo_ns or vim.api.nvim_create_namespace("claude_todo")
+  vim.api.nvim_buf_clear_namespace(buf, state.todo_ns, 0, -1)
+  for i, spans in ipairs(hls) do
+    for _, h in ipairs(spans) do
+      vim.api.nvim_buf_add_highlight(buf, state.todo_ns, h[3], i - 1, h[1], h[2])
+    end
+  end
+  state.todo_h = #lines
+
+  local col, w = panel_float_geom()
+  local cfg = {
+    relative = "editor", anchor = "SW",
+    row = vim.o.lines - 2, col = col, width = w, height = #lines,
+    style = "minimal", focusable = false, zindex = 30,   -- below modals (default 50)
+  }
+  if state.todo_win and vim.api.nvim_win_is_valid(state.todo_win) then
+    pcall(vim.api.nvim_win_set_config, state.todo_win, cfg)
+  else
+    state.todo_win = vim.api.nvim_open_win(buf, false, cfg)
+    vim.wo[state.todo_win].winhl = "Normal:ClaudeNormal,NormalNC:ClaudeNormal"
+    harden_float_scroll(state.todo_win)
+    -- The widget pins to the panel BOTTOM (not float_bottom_row), so it needs its
+    -- own resize path: re-render at lines-2 + re-fit width, then reflow the floats
+    -- above it. (The shared attach_panel_float_resize would lift it by its own
+    -- height.)
+    vim.api.nvim_create_augroup("ClaudeTodoResize", { clear = true })
+    vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
+      group = "ClaudeTodoResize",
+      callback = function()
+        if not (state.todo_win and vim.api.nvim_win_is_valid(state.todo_win)) then
+          return true   -- gone → self-remove
+        end
+        W.update_todo_widget()
+        W.reflow_bottom_floats()
+      end,
+    })
+    state.todo_resize_teardown = function()
+      pcall(vim.api.nvim_del_augroup_by_name, "ClaudeTodoResize")
+    end
+  end
 end
 
 -- Build + open the focused, bordered permission float and bind its keymaps. The
@@ -2795,7 +2967,7 @@ local function open_permission_float(p)
   local win = vim.api.nvim_open_win(buf, true, {
     relative  = "editor",
     anchor    = "SW",
-    row       = vim.o.lines - 2,
+    row       = W.float_bottom_row(),
     col       = float_col,
     width     = float_w,
     height    = float_h,
@@ -3004,7 +3176,7 @@ local function open_diff_card_float(d)
   local win = vim.api.nvim_open_win(buf, true, {
     relative  = "editor",
     anchor    = "SW",
-    row       = vim.o.lines - 2,
+    row       = W.float_bottom_row(),
     col       = float_col,
     width     = float_w,
     height    = float_h,
@@ -3443,7 +3615,7 @@ local function prompt_question_custom()
   local win = vim.api.nvim_open_win(buf, true, {
     relative  = "editor",
     anchor    = "SW",
-    row       = vim.o.lines - 2,
+    row       = W.float_bottom_row(),
     col       = float_col,
     width     = float_w,
     height    = 1,
@@ -3534,7 +3706,7 @@ local function open_question_float(q)
   local win = vim.api.nvim_open_win(buf, true, {
     relative  = "editor",
     anchor    = "SW",
-    row       = vim.o.lines - 2,
+    row       = W.float_bottom_row(),
     col       = float_col,
     width     = float_w,
     height    = 1,                                   -- render_question_card resizes
@@ -3704,16 +3876,17 @@ local function dispatch(event)
     remove_typing_ph()
     for _, block in ipairs((event.message or {}).content or {}) do
       if (block.type or "") == "tool_result" then
-        -- A registered count-search (Grep) rewrites its own header + renders the
-        -- file list; everything else renders the generic tool_result body.
-        local sb = state.search_blocks and state.search_blocks[block.tool_use_id]
-        if sb then
-          render_search_result(sb, block.content, block.is_error == true,
-            state.tool_meta and state.tool_meta[block.tool_use_id])
+        local meta = state.tool_meta and state.tool_meta[block.tool_use_id]
+        local sb   = state.search_blocks and state.search_blocks[block.tool_use_id]
+        if meta and meta.name == "TodoWrite" then
+          -- Noisy "Todos have been modified" ack — the widget already reflects it.
+        elseif sb then
+          -- A registered search (Grep/Glob tool, or search-shaped Bash) rewrites
+          -- its own header + renders the file list.
+          W.render_search_result(sb, block.content, block.is_error == true, meta)
           state.search_blocks[block.tool_use_id] = nil
         else
-          render_tool_result(block.content, block.is_error == true,
-            state.tool_meta and state.tool_meta[block.tool_use_id])
+          render_tool_result(block.content, block.is_error == true, meta)
         end
       end
     end
@@ -3747,12 +3920,18 @@ local function dispatch(event)
       elseif btype == "tool_use" then
         local name  = block.name or ""
         local input = block.input or {}
-        -- A search (Grep/Glob tool, or a search-shaped Bash command like
-        -- `rg`/`ast-grep`/`fd`) renders a provisional header that its result
-        -- rewrites; everything else renders inline now.
-        local sd = block.id and search_descriptor(name, input)
-        if sd then
-          render_search(sd, block.id)
+        -- TodoWrite drives the bottom-pinned task widget, not an inline block:
+        -- capture the full list (each call replaces it) and re-render the float.
+        local sd = block.id and W.search_descriptor(name, input)
+        if name == "TodoWrite" then
+          state.todos = input.todos or {}
+          W.update_todo_widget()
+          W.reflow_bottom_floats()
+        elseif sd then
+          -- A search (Grep/Glob tool, or a search-shaped Bash command like
+          -- `rg`/`ast-grep`/`fd`) renders a provisional header that its result
+          -- rewrites; everything else renders inline now.
+          W.render_search(sd, block.id)
         else
           render_tool(name, input)
         end
@@ -4412,7 +4591,7 @@ local function open_chat_float(title, callback, opts)
   local win = vim.api.nvim_open_win(ibuf, true, {
     relative  = "editor",
     anchor    = "SW",
-    row       = vim.o.lines - 2,
+    row       = W.float_bottom_row(),
     col       = float_col,
     width     = float_w,
     height    = 1,                 -- grown to input rows + meter row below
@@ -5021,6 +5200,7 @@ function mod.toggle(root_override)
   if state.claude_active and state.panel_win
       and vim.api.nvim_win_is_valid(state.panel_win) then
     stop_process()
+    W.close_todo_widget()
     vim.api.nvim_win_close(state.panel_win, true)
     state.panel_win    = nil
     state.claude_active = false
@@ -5100,6 +5280,8 @@ function mod.reset()
   state.tool_results  = {}
   state.tool_meta     = {}
   state.search_blocks = {}
+  state.todos         = nil
+  W.close_todo_widget()
   if state.perm and state.perm.win and vim.api.nvim_win_is_valid(state.perm.win) then
     pcall(vim.api.nvim_win_close, state.perm.win, true)
   end

@@ -1877,13 +1877,23 @@ local function tool_lines(name, input)
     -- lands in the model's surrounding prose, so we don't multi-line it here).
     return "● Plan", corner_one_line(input.plan or "")
   end
-  local tgt = tool_target(input)
-  -- MCP tools arrive as `mcp__<server>__<tool>`; strip the prefix and swap the
-  -- `__` separator for `:` so the header reads `● <server>:<tool>` instead of the
-  -- raw underscored name. Body renders generically via the tool_result foundation.
+  -- MCP tools arrive as `mcp__<server>__<tool>`. Render them Skill-style: the SHORT
+  -- tool name wrapped in `● MCP(<tool>)` (server prefix dropped — it's noise at a
+  -- glance), with the `└` corner pointing at the one-line JSON of the call params.
+  -- The MCP server's response still renders as the body via the tool_result
+  -- foundation. (`<tool>` = the last `__`-delimited segment; the server may itself
+  -- contain single underscores, so we split on the double-underscore separator.)
   if not TOOL_VERB[name] and name:match("^mcp__") then
-    return "● " .. (name:gsub("^mcp__", ""):gsub("__", ":")), (tgt ~= "" and tgt or nil)
+    local rest = name:gsub("^mcp__", "")
+    local tool = rest:match(".*__(.-)$") or rest
+    local params
+    if next(input) ~= nil then
+      local ok, js = pcall(vim.fn.json_encode, input)
+      if ok then params = corner_one_line(js) end
+    end
+    return "● MCP(" .. corner_one_line(tool) .. ")", params
   end
+  local tgt = tool_target(input)
   return "● " .. (TOOL_VERB[name] or name), (tgt ~= "" and tgt or nil)
 end
 

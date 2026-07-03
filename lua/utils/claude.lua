@@ -2264,12 +2264,16 @@ do
     end
     return done, active, open
   end
+  -- One-space left gutter so rows don't sit flush against the card border. Every
+  -- rendered line carries it; every highlight column offset is shifted by #PAD to
+  -- stay in sync with the padded text (tests S17/S18 encode the shifted offsets).
+  local PAD = " "
   function W.render_todo_lines(todos)
     local done, active, open = counts(todos)
     local n = #todos
     local header = string.format("%d task%s (%d done, %d in progress, %d open)",
       n, n == 1 and "" or "s", done, active, open)
-    local lines, hls = { header }, { { { 0, -1, "ClaudeTodoHeader" } } }
+    local lines, hls = { PAD .. header }, { { { 0, -1, "ClaudeTodoHeader" } } }
 
     local shown, more = n, 0
     if n > CAP then shown, more = CAP - 1, n - (CAP - 1) end
@@ -2280,19 +2284,19 @@ do
       -- In-progress tasks read better in their gerund activeForm ("Applying …").
       local text   = (status == "in_progress" and t.activeForm and t.activeForm ~= "")
         and t.activeForm or (t.content or "")
-      lines[#lines + 1] = glyph .. " " .. text
+      lines[#lines + 1] = PAD .. glyph .. " " .. text
       local glyph_hl = status == "completed" and "ClaudeTodoCheck"
         or (TEXTHL[status] or "ClaudeTodoPending")
       hls[#hls + 1] = {
-        { 0, #glyph, glyph_hl },                                   -- status glyph
-        -- Start the text span AFTER the separator space (#glyph + 1), not at
-        -- #glyph: a completed row's strikethrough (ClaudeTodoDone) would otherwise
-        -- cover the space touching the ✔ and bleed a line into the glyph.
-        { #glyph + 1, -1, TEXTHL[status] or "ClaudeTodoPending" }, -- task text
+        { #PAD, #PAD + #glyph, glyph_hl },                          -- status glyph
+        -- Start the text span AFTER the pad + separator space (#PAD + #glyph + 1),
+        -- not at the glyph: a completed row's strikethrough (ClaudeTodoDone) would
+        -- otherwise cover the space touching the ✔ and bleed a line into the glyph.
+        { #PAD + #glyph + 1, -1, TEXTHL[status] or "ClaudeTodoPending" }, -- task text
       }
     end
     if more > 0 then
-      lines[#lines + 1] = string.format("… +%d more", more)
+      lines[#lines + 1] = PAD .. string.format("… +%d more", more)
       hls[#hls + 1] = { { 0, -1, "ClaudeTodoHeader" } }
     end
     return lines, hls

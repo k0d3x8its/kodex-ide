@@ -5258,6 +5258,14 @@ end
 -- process and clears the panel buffer so the next send spawns a brand-new
 -- session with an empty scrollback. Model + permission-mode choices persist.
 function mod.reset()
+  -- Capture the live panel window BEFORE state is cleared. reset() re-opens via
+  -- toggle()→open_panel_window, which always `vsplit`s a NEW window. Deleting the
+  -- old panel buffer below does NOT close its window when the panel is the only
+  -- window (Neovim keeps one window alive, showing a blank buffer), so without
+  -- closing it the vsplit leaves a stray blank pane beside the fresh panel
+  -- (live-reproduced 2026-07-03). Closed after toggle(), once a 2nd window exists.
+  local old_win = state.panel_win
+
   -- Kill the persistent process if running. on_exit fires asynchronously but
   -- stop_process nulls job_id now so it becomes a no-op when it arrives.
   stop_process()
@@ -5303,6 +5311,15 @@ function mod.reset()
 
   require("utils.claude_diff").on_panel_close()
   mod.toggle()
+
+  -- Close the stale pre-reset panel window if it survived (it does when the panel
+  -- was the only window — see old_win comment above). toggle() has now opened the
+  -- fresh panel, so a second window exists and closing the old one is safe.
+  if old_win and old_win ~= state.panel_win
+      and vim.api.nvim_win_is_valid(old_win)
+      and #vim.api.nvim_tabpage_list_wins(0) > 1 then
+    pcall(vim.api.nvim_win_close, old_win, true)
+  end
 end
 
 -- ─── Model picker + plan-mode toggle ─────────────────────────────────────────

@@ -556,11 +556,14 @@ feed({ type = "user", message = { content = { {
 H.check("S18 TaskCreate result ack is not rendered",
   panel_text():find("created successfully", 1, true) == nil, panel_text())
 
--- A fresh session (system/init) drops the list + resets the id counter.
+-- REGRESSION: system/init fires once per TURN in stream-json mode, so it must
+-- NOT clear the task list (that wiped the widget on the next turn). The reset
+-- lives in ensure_process (once per spawn) instead.
+local before_n = #claude.state.todos
 feed({ type = "system", subtype = "init", model = "claude-haiku",
   claude_code_version = "2.1.195" })
-H.check("S18 system/init clears the task list + counter",
-  claude.state.todos == nil and claude.state.todo_seq == nil,
+H.check("S18 system/init preserves the task list (per-turn event)",
+  claude.state.todos and #claude.state.todos == before_n and before_n == 3,
   vim.inspect(claude.state.todos))
 
 H.summary("claude_stream")

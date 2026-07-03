@@ -374,6 +374,7 @@ local function tool_target(input)
     or input.path
     or input.pattern
     or input.query
+    or input.url                                          -- WebFetch target
     or (input.command and tostring(input.command):sub(1, 70))
     or ""
   -- This value renders as ONE line (the "⚙ Verb: target" entry). A multi-line
@@ -1870,8 +1871,19 @@ local function tool_lines(name, input)
     local sub  = input.subagent_type
     return "● Task(" .. corner_one_line(desc) .. ")",
            sub and (sub .. " agent") or nil
+  elseif name == "ExitPlanMode" then
+    -- The proposed plan rides the tool INPUT (input.plan), not the result body;
+    -- render a clean "● Plan" header + a one-line preview (the full plan text also
+    -- lands in the model's surrounding prose, so we don't multi-line it here).
+    return "● Plan", corner_one_line(input.plan or "")
   end
   local tgt = tool_target(input)
+  -- MCP tools arrive as `mcp__<server>__<tool>`; strip the prefix and swap the
+  -- `__` separator for `:` so the header reads `● <server>:<tool>` instead of the
+  -- raw underscored name. Body renders generically via the tool_result foundation.
+  if not TOOL_VERB[name] and name:match("^mcp__") then
+    return "● " .. (name:gsub("^mcp__", ""):gsub("__", ":")), (tgt ~= "" and tgt or nil)
+  end
   return "● " .. (TOOL_VERB[name] or name), (tgt ~= "" and tgt or nil)
 end
 

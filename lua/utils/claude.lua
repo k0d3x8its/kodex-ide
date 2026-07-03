@@ -2284,8 +2284,11 @@ do
       local glyph_hl = status == "completed" and "ClaudeTodoCheck"
         or (TEXTHL[status] or "ClaudeTodoPending")
       hls[#hls + 1] = {
-        { 0, #glyph, glyph_hl },                              -- status glyph
-        { #glyph, -1, TEXTHL[status] or "ClaudeTodoPending" }, -- task text
+        { 0, #glyph, glyph_hl },                                   -- status glyph
+        -- Start the text span AFTER the separator space (#glyph + 1), not at
+        -- #glyph: a completed row's strikethrough (ClaudeTodoDone) would otherwise
+        -- cover the space touching the ✔ and bleed a line into the glyph.
+        { #glyph + 1, -1, TEXTHL[status] or "ClaudeTodoPending" }, -- task text
       }
     end
     if more > 0 then
@@ -2821,6 +2824,7 @@ function W.close_todo_widget()
   end
   state.todo_win = nil
   state.todo_h   = 0
+  state.todo_done_pending = false
 end
 
 -- Lift every currently-open bottom float above the task widget and re-reserve
@@ -2879,8 +2883,13 @@ function W.apply_task_tool(name, input)
   else
     return false
   end
+  -- Only reflow (which recomputes the bottom pad and re-anchors the transcript) when
+  -- the card's HEIGHT actually changes — i.e. a create/delete adds/removes a row. A
+  -- status-only TaskUpdate keeps the same line count, and reflowing on every one of
+  -- those nudged the view → the "slight jitter" while Claude ticks tasks off.
+  local old_h = state.todo_h or 0
   W.update_todo_widget()
-  W.reflow_bottom_floats()
+  if (state.todo_h or 0) ~= old_h then W.reflow_bottom_floats() end
   return true
 end
 mod._apply_task_tool = W.apply_task_tool   -- test hook
@@ -2953,6 +2962,33 @@ function W.update_todo_widget()
     state.todo_resize_teardown = function()
       pcall(vim.api.nvim_del_augroup_by_name, "ClaudeTodoResize")
     end
+  end
+
+  -- Auto-dismiss once every task is completed: the card shows the all-✔ state
+  -- (rendered above), then fades after a short beat so a finished plan doesn't
+  -- linger. Guarded by todo_done_pending so repeated updates don't stack timers;
+  -- the deferred close re-checks (a new TaskCreate within the window cancels it by
+  -- flipping a task back to non-completed → all_done false → flag reset below).
+  local all_done = true
+  for _, t in ipairs(todos) do
+    if t.status ~= "completed" then all_done = false break end
+  end
+  if all_done then
+    if not state.todo_done_pending then
+      state.todo_done_pending = true
+      vim.defer_fn(function()
+        state.todo_done_pending = false
+        local td = state.todos
+        if not (td and #td > 0) then return end
+        for _, t in ipairs(td) do
+          if t.status ~= "completed" then return end   -- plan changed → keep it
+        end
+        W.close_todo_widget()
+        W.reflow_bottom_floats()
+      end, 2500)
+    end
+  else
+    state.todo_done_pending = false
   end
 end
 

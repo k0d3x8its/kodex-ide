@@ -497,4 +497,70 @@ feed({ type = "user", message = { content = { {
 H.check("S17 TodoWrite result ack is not rendered",
   panel_text():find("have been modified", 1, true) == nil, panel_text())
 
+-- ── S18: Task* orchestration tools drive the same widget (headless SDK) ─────────
+-- The panel's headless claude has NO TodoWrite tool; it tracks a plan via the
+-- Task* family. TaskCreate appends one item (id from a running counter matching
+-- the CLI's "Task #N"); TaskUpdate mutates one by taskId; deleted removes it.
+-- Mirrors the TodoWrite path: no inline block, result ack suppressed.
+claude.state.todos    = nil
+claude.state.todo_seq = nil
+claude.state.think_start, claude.state.tool_run = nil, nil
+
+local function task_create(id, subject, activeForm)
+  feed({ type = "assistant", message = { content = { {
+    type = "tool_use", id = id, name = "TaskCreate",
+    input = { subject = subject, activeForm = activeForm },
+  } } } })
+end
+local function task_update(id, taskId, status)
+  feed({ type = "assistant", message = { content = { {
+    type = "tool_use", id = id, name = "TaskUpdate",
+    input = { taskId = taskId, status = status },
+  } } } })
+end
+
+task_create("tc1", "Define endpoint",  "Defining endpoint")
+task_create("tc2", "Implement handler", "Implementing handler")
+task_create("tc3", "Register route")
+task_create("tc4", "Write tests")
+H.check("S18 TaskCreate appends items with sequential ids",
+  claude.state.todos and #claude.state.todos == 4
+    and claude.state.todos[1].id == 1 and claude.state.todos[4].id == 4,
+  vim.inspect(claude.state.todos))
+H.check("S18 created items are pending with subject as content",
+  claude.state.todos[3].status == "pending"
+    and claude.state.todos[3].content == "Register route",
+  vim.inspect(claude.state.todos[3]))
+H.check("S18 TaskCreate renders no inline tool block",
+  panel_text():find("● TaskCreate", 1, true) == nil
+    and panel_text():find("TaskCreate", 1, true) == nil, panel_text())
+
+task_update("tu1", "1", "in_progress")
+task_update("tu2", "2", "completed")
+H.check("S18 TaskUpdate mutates the task by id",
+  claude.state.todos[1].status == "in_progress"
+    and claude.state.todos[2].status == "completed",
+  vim.inspect(claude.state.todos))
+
+task_update("tu3", "3", "deleted")
+H.check("S18 TaskUpdate deleted removes the task",
+  #claude.state.todos == 3
+    and claude.state.todos[3].content == "Write tests",  -- id 4 shifts down
+  vim.inspect(claude.state.todos))
+
+-- The "Task #N created successfully" ack is suppressed (widget already reflects it).
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "tc1",
+  content = "Task #1 created successfully: Define endpoint",
+} } } })
+H.check("S18 TaskCreate result ack is not rendered",
+  panel_text():find("created successfully", 1, true) == nil, panel_text())
+
+-- A fresh session (system/init) drops the list + resets the id counter.
+feed({ type = "system", subtype = "init", model = "claude-haiku",
+  claude_code_version = "2.1.195" })
+H.check("S18 system/init clears the task list + counter",
+  claude.state.todos == nil and claude.state.todo_seq == nil,
+  vim.inspect(claude.state.todos))
+
 H.summary("claude_stream")

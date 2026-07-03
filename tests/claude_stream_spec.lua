@@ -314,4 +314,109 @@ feed({ type = "assistant", message = { content = { {
 H.check("S10 Skill header names the skill",
   panel_text():find("● Skill(diagnose)", 1, true) ~= nil, panel_text())
 
+-- ── S11: Grep renders a count header + `└` file list, rewritten from the result ──
+-- A Grep tool_use draws a provisional "● Searching…" header; the later tool_result
+-- rewrites it to the CC-TUI count form and attaches the matched files (one per `└`
+-- corner). The "Found N files" summary line is consumed into the count, not listed.
+claude.state.think_start = nil
+claude.state.tool_run    = nil
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "s1", name = "Grep",
+  input = { pattern = "tool_run", path = "lua" },
+} } } })
+H.check("S11 provisional Searching header drawn at tool_use",
+  panel_text():find("● Searching", 1, true) ~= nil, panel_text())
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "s1",
+  content = "Found 3 files\n/tmp/lua/a.lua\n/tmp/lua/b.lua\n/tmp/lua/c.lua",
+} } } })
+H.check("S11 header rewritten to the count form",
+  panel_text():find("● Searching for 1 pattern, reading 3 files", 1, true) ~= nil, panel_text())
+H.check("S11 matched files listed under the header",
+  panel_text():find("a.lua", 1, true) ~= nil
+    and panel_text():find("c.lua", 1, true) ~= nil, panel_text())
+H.check("S11 'Found N files' summary line is not listed",
+  panel_text():find("Found 3 files", 1, true) == nil, panel_text())
+H.check("S11 provisional header replaced (no lingering ellipsis header)",
+  panel_text():find("● Searching…", 1, true) == nil, panel_text())
+
+-- Overflow: > K files → header carries the expand affordance, preview caps at K.
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "s2", name = "Grep", input = { pattern = "x" },
+} } } })
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "s2",
+  content = "Found 7 files\nf1.lua\nf2.lua\nf3.lua\nf4.lua\nf5.lua\nf6.lua\nf7.lua",
+} } } })
+H.check("S11 overflow header carries the expand affordance",
+  panel_text():find("reading 7 files (ctrl+o to expand)", 1, true) ~= nil, panel_text())
+H.check("S11 overflow preview hides files past K=5",
+  panel_text():find("f7.lua", 1, true) == nil, panel_text())
+
+-- No matches: header says so, no file list.
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "s3", name = "Grep", input = { pattern = "zzz" },
+} } } })
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "s3", content = "No files found",
+} } } })
+H.check("S11 empty result → 'no matches' header",
+  panel_text():find("● Searching — no matches", 1, true) ~= nil, panel_text())
+
+-- ── S12: a search-shaped Bash command renders as a Search block ─────────────────
+-- Headless claude has no Grep tool, so it searches via Bash. `rg -l` emits a bare
+-- file list → count header + `└ file` list (same treatment as the Grep tool).
+claude.state.think_start = nil
+claude.state.tool_run    = nil
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "b1", name = "Bash",
+  input = { command = "rg -l render_tool lua/" },
+} } } })
+H.check("S12 rg draws a Searching header, not Running bash",
+  panel_text():find("● Searching", 1, true) ~= nil, panel_text())
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "b1",
+  content = "lua/utils/claude.lua\nlua/plugins/claude.lua",
+} } } })
+H.check("S12 rg -l file list → count header",
+  panel_text():find("● Searching for 1 pattern, reading 2 files", 1, true) ~= nil, panel_text())
+H.check("S12 rg -l lists the files",
+  panel_text():find("claude.lua", 1, true) ~= nil, panel_text())
+
+-- ── S13: match-line search (rg without -l) → pattern header + match body ────────
+claude.state.tool_run = nil
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "b2", name = "Bash",
+  input = { command = "rg render_tool lua/utils/claude.lua" },
+} } } })
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "b2",
+  content = "lua/utils/claude.lua:1857:local function render_tool(name, input)",
+} } } })
+H.check("S13 match-line search names the pattern in the header",
+  panel_text():find("● Searching  render_tool", 1, true) ~= nil, panel_text())
+-- Body truncates to one row in the narrow headless panel, so assert on the
+-- surviving leading prefix of the match line (the tail is ellipsized).
+H.check("S13 match-line body rendered",
+  panel_text():find("claude.lua:1857", 1, true) ~= nil, panel_text())
+
+-- ── S14: fd/find → "● Listing M files" ─────────────────────────────────────────
+claude.state.tool_run = nil
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "b3", name = "Bash", input = { command = "fd -e lua" },
+} } } })
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "b3", content = "a.lua\nb.lua\nc.lua",
+} } } })
+H.check("S14 fd renders a Listing count header",
+  panel_text():find("● Listing 3 files", 1, true) ~= nil, panel_text())
+
+-- ── S15: a non-search Bash command still renders "● Running bash" ───────────────
+claude.state.tool_run = nil
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "b4", name = "Bash", input = { command = "npm run build" },
+} } } })
+H.check("S15 non-search Bash is unchanged",
+  panel_text():find("● Running bash", 1, true) ~= nil, panel_text())
+
 H.summary("claude_stream")

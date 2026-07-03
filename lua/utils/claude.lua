@@ -1850,6 +1850,15 @@ local function tool_lines(name, input)
     -- skill …" result body renders via the shared tool_result-body foundation.
     local skill = input.skill or input.name or input.command
     return "● Skill(" .. corner_one_line(skill or "") .. ")", nil
+  elseif name == "Task" or name == "Agent" then
+    -- Subagent spawn (headless build names the tool "Agent"; classic CC "Task").
+    -- Header names the short description; the corner names the agent type. The
+    -- subagent's final result renders as the body (foundation); a background
+    -- agent returns only a "launched" ack now and its output arrives later.
+    local desc = input.description or input.subagent_type or "subagent"
+    local sub  = input.subagent_type
+    return "● Task(" .. corner_one_line(desc) .. ")",
+           sub and (sub .. " agent") or nil
   end
   local tgt = tool_target(input)
   return "● " .. (TOOL_VERB[name] or name), (tgt ~= "" and tgt or nil)

@@ -566,4 +566,11 @@ H.check("S18 system/init preserves the task list (per-turn event)",
   claude.state.todos and #claude.state.todos == before_n and before_n == 3,
   vim.inspect(claude.state.todos))
 
+-- Completed-row text span must start AFTER the glyph + separator space, else the
+-- strikethrough covers the space and bleeds a line into the ✔ (live-observed).
+local _, chls = claude._render_todo_lines({ { content = "done", status = "completed" } })
+H.check("S18 completed text span skips the glyph+space (no strike bleed)",
+  chls[2] and chls[2][2] and chls[2][2][1] == #"✔" + 1,
+  vim.inspect(chls[2]))
+
 H.summary("claude_stream")

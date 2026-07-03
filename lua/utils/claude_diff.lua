@@ -47,6 +47,14 @@ M.state = {
   -- (whose loaded buffer FCS-reloads), a new file has no buffer to repaint, so
   -- poll() opens it in an editor window once the CLI's write lands. Single-shot.
   reveal_new = nil,
+  -- Pre-write NEW-file teardown bookkeeping (set in mount_diff, consumed in
+  -- close_diff). The throwaway orig scratch has no file worth keeping, so the
+  -- window it lives in must be returned to its pre-diff state WITHOUT relying on
+  -- `buffer #`: when the panel was the only window, mount_diff splits off the
+  -- panel, making the panel buffer that window's alternate — `buffer #` then
+  -- resurrects the panel (a phantom 2nd panel column, live-observed 2026-07-03).
+  orig_win_created = nil, -- win id we created via `topleft vsplit` (panel-only), else nil
+  orig_prev_buf    = nil, -- buffer a REUSED editor window showed before the diff
 }
 
 local function log(msg)
@@ -153,16 +161,24 @@ local function close_diff()
   -- The window must be MOVED OFF the scratch first: when it's the only normal
   -- window and a float (the review card) is focused, nvim_buf_delete silently
   -- no-ops — it returns success but the buffer stays valid (live-reproduced).
-  -- `buffer #` restores whatever the window showed before mount_diff replaced it;
-  -- a fresh empty buffer is the fallback when no alternate exists.
+  -- Do NOT use `buffer #` here: when the panel was the only window at mount time,
+  -- mount_diff split off the panel, so this window's alternate IS the panel buffer
+  -- → `buffer #` resurrects the panel (phantom 2nd panel column, live-observed
+  -- 2026-07-03). Instead: close a window we created; restore the tracked prior
+  -- buffer for a reused window; fresh empty buffer as the last resort.
   if s.prewrite and s.kind == "new"
       and s.orig_buf and vim.api.nvim_buf_is_valid(s.orig_buf) then
     local w = vim.fn.bufwinid(s.orig_buf)
-    if w ~= -1 then
-      local restored = pcall(vim.api.nvim_win_call, w, function()
-        vim.cmd("buffer #")
-      end)
-      if not restored then
+    if s.orig_win_created and vim.api.nvim_win_is_valid(s.orig_win_created)
+        and #vim.api.nvim_tabpage_list_wins(0) > 1 then
+      -- We opened this window by splitting off the panel; remove it entirely.
+      pcall(vim.api.nvim_win_close, s.orig_win_created, true)
+    elseif w ~= -1 then
+      local prev = s.orig_prev_buf
+      if prev and vim.api.nvim_buf_is_valid(prev)
+          and prev ~= claude.state.panel_buf then
+        pcall(vim.api.nvim_win_set_buf, w, prev)
+      else
         pcall(vim.api.nvim_win_set_buf, w, vim.api.nvim_create_buf(true, false))
       end
     end
@@ -170,6 +186,7 @@ local function close_diff()
   end
   if s.current then M.state.new_files[s.current] = nil end
   s.current, s.scratch, s.orig_buf = nil, nil, nil
+  s.orig_win_created, s.orig_prev_buf = nil, nil
   s.kind = "edit"
   s.prewrite = false
   -- Notify the Claude panel that the diff is resolved so it can unlock the
@@ -326,7 +343,11 @@ end
 -- open_prewrite): host the orig buffer in a real editor window, split the scratch
 -- (proposed) to its right, diffthis both, wrap, lenses, winbar, keymaps.
 local function mount_diff(buf, scratch, is_new, prewrite)
+  -- Reset teardown bookkeeping for this mount (see M.state field docs).
+  M.state.orig_win_created = nil
+  M.state.orig_prev_buf    = nil
   local win = vim.fn.bufwinid(buf)
+  local created_win = false
   if win ~= -1 then
     -- Orig buffer already on screen: focus its window.
     vim.api.nvim_set_current_win(win)
@@ -337,15 +358,22 @@ local function mount_diff(buf, scratch, is_new, prewrite)
     local target = editor_win()
     if target then
       vim.api.nvim_set_current_win(target)
+      -- Record the buffer this reused window showed so close_diff can restore it
+      -- exactly (the throwaway new-file orig gets wiped; `buffer #` is unreliable).
+      M.state.orig_prev_buf = vim.api.nvim_win_get_buf(target)
     else
       -- Panel is the only window: open an editor split to its LEFT so the panel
       -- stays put on the right where it lives.
       vim.cmd("topleft vsplit")
+      created_win = true
     end
     vim.cmd("buffer " .. buf)
   end
   vim.cmd("diffthis")
   local orig_win = vim.api.nvim_get_current_win()
+  -- A window WE created off the panel must be CLOSED on teardown, not have a
+  -- buffer restored into it (its alternate is the panel buffer → phantom panel).
+  if created_win then M.state.orig_win_created = orig_win end
   vim.cmd("rightbelow vsplit")
   vim.api.nvim_win_set_buf(0, scratch)
   vim.cmd("diffthis")

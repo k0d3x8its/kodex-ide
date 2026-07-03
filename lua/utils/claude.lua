@@ -1845,6 +1845,11 @@ local function tool_lines(name, input)
       .. (input.path and ("  ·  " .. rel_path(input.path)) or "")
   elseif name == "Glob" then
     return "● Listing", corner_one_line(input.pattern)
+  elseif name == "Skill" then
+    -- Name the skill in the header (CC-TUI shape); the "Successfully loaded
+    -- skill …" result body renders via the shared tool_result-body foundation.
+    local skill = input.skill or input.name or input.command
+    return "● Skill(" .. corner_one_line(skill or "") .. ")", nil
   end
   local tgt = tool_target(input)
   return "● " .. (TOOL_VERB[name] or name), (tgt ~= "" and tgt or nil)

@@ -2844,6 +2844,47 @@ function W.reflow_bottom_floats()
   set_bottom_pad(state.chat_pad or 0)   -- recompute total (chat base + widget)
 end
 
+-- Apply a headless-SDK Task* tool call to state.todos + refresh the widget.
+-- The panel's claude runs the headless toolset, which has NO TodoWrite tool; it
+-- tracks a plan via the Task* orchestration family instead (RE'd live 2026-07-03,
+-- FINDINGS § Q-TODO-TRIGGER). Unlike TodoWrite (one call carries the whole array),
+-- Task* is incremental: TaskCreate adds one item, TaskUpdate mutates one by id.
+-- The CLI numbers tasks with a global running counter ("Task #N created"), and
+-- TaskUpdate.taskId is that N — so we mint ids from our own todo_seq in creation
+-- order to match. We rebuild the same {content,status,activeForm} rows the widget
+-- already renders. Returns true when it handled the tool.
+function W.apply_task_tool(name, input)
+  input = input or {}
+  if name == "TaskCreate" then
+    state.todos    = state.todos or {}
+    state.todo_seq = (state.todo_seq or 0) + 1
+    state.todos[#state.todos + 1] = {
+      id         = state.todo_seq,
+      content    = input.subject or "",
+      activeForm = input.activeForm,
+      status     = "pending",
+    }
+  elseif name == "TaskUpdate" then
+    local id    = tonumber(input.taskId)
+    local todos = state.todos or {}
+    if input.status == "deleted" then
+      for i, t in ipairs(todos) do
+        if t.id == id then table.remove(todos, i); break end
+      end
+    else
+      for _, t in ipairs(todos) do
+        if t.id == id then t.status = input.status or t.status; break end
+      end
+    end
+  else
+    return false
+  end
+  W.update_todo_widget()
+  W.reflow_bottom_floats()
+  return true
+end
+mod._apply_task_tool = W.apply_task_tool   -- test hook
+
 -- Open or update the bottom-pinned TodoWrite widget from state.todos. A borderless,
 -- non-focusable SW float at the very bottom of the panel column; the other bottom
 -- floats + the chat pad read todo_height() to stack ABOVE it. Hidden (closed) when
@@ -3797,6 +3838,14 @@ local function dispatch(event)
   local ev_type = event.type or ""
 
   if ev_type == "system" and event.subtype == "init" then
+    -- A fresh session restarts the CLI's "Task #N" counter at 1, so drop any
+    -- prior task list + our matching id counter to stay aligned (Task* widget,
+    -- FINDINGS § Q-TODO-TRIGGER). system/init fires once per session spawn.
+    if state.todos then
+      state.todos, state.todo_seq = nil, nil
+      W.close_todo_widget()
+      W.reflow_bottom_floats()
+    end
     -- Fill the banner's version (line 0) and model (line 1) now that they're
     -- known. The banner was pre-rendered at panel open with the cwd but no model
     -- or version (those only arrive in system/init). The process is persistent
@@ -3878,8 +3927,10 @@ local function dispatch(event)
       if (block.type or "") == "tool_result" then
         local meta = state.tool_meta and state.tool_meta[block.tool_use_id]
         local sb   = state.search_blocks and state.search_blocks[block.tool_use_id]
-        if meta and meta.name == "TodoWrite" then
-          -- Noisy "Todos have been modified" ack — the widget already reflects it.
+        if meta and (meta.name == "TodoWrite"
+            or meta.name == "TaskCreate" or meta.name == "TaskUpdate") then
+          -- Noisy "Todos modified" / "Task #N created" ack — the bottom widget
+          -- already reflects it, so drop the body (don't render it inline).
         elseif sb then
           -- A registered search (Grep/Glob tool, or search-shaped Bash) rewrites
           -- its own header + renders the file list.
@@ -3927,6 +3978,10 @@ local function dispatch(event)
           state.todos = input.todos or {}
           W.update_todo_widget()
           W.reflow_bottom_floats()
+        elseif name == "TaskCreate" or name == "TaskUpdate" then
+          -- Headless toolset has no TodoWrite; the plan rides the Task* family.
+          -- Drives the same bottom-pinned widget, not an inline tool block.
+          W.apply_task_tool(name, input)
         elseif sd then
           -- A search (Grep/Glob tool, or a search-shaped Bash command like
           -- `rg`/`ast-grep`/`fd`) renders a provisional header that its result
@@ -5289,6 +5344,7 @@ function mod.reset()
   state.tool_meta     = {}
   state.search_blocks = {}
   state.todos         = nil
+  state.todo_seq      = nil
   W.close_todo_widget()
   if state.perm and state.perm.win and vim.api.nvim_win_is_valid(state.perm.win) then
     pcall(vim.api.nvim_win_close, state.perm.win, true)

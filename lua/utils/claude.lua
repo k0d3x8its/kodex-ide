@@ -1943,8 +1943,11 @@ local function build_collapsed(entry)
   local avail   = math.max(panel_width() - 6, 20)   -- one-row budget after the prefix
   local lines, hls = {}, {}
   for i = 1, n_shown do
-    lines[i] = (i == 1 and RES_CORNER or RES_INDENT) .. result_row(entry.body[i], avail)
-    hls[i]   = (i == 1)
+    -- corner_each: every line gets its own `└` (a file list reads best that way);
+    -- otherwise only the first line is cornered and the rest hang indented.
+    local corner = (i == 1 or entry.corner_each)
+    lines[i] = (corner and RES_CORNER or RES_INDENT) .. result_row(entry.body[i], avail)
+    hls[i]   = corner
       and { { 0, #RES_CORNER, "ClaudeDim" }, { #RES_CORNER, -1, group } }
       or  { { 0, -1, group } }
   end
@@ -1966,8 +1969,9 @@ local function build_expanded(entry)
   local group = entry.is_error and "ClaudeError" or "ClaudeDim"
   local lines, hls = {}, {}
   for i, l in ipairs(entry.body) do
-    lines[i] = (i == 1 and RES_CORNER or RES_INDENT) .. l
-    hls[i]   = (i == 1)
+    local corner = (i == 1 or entry.corner_each)
+    lines[i] = (corner and RES_CORNER or RES_INDENT) .. l
+    hls[i]   = corner
       and { { 0, #RES_CORNER, "ClaudeDim" }, { #RES_CORNER, -1, group } }
       or  { { 0, -1, group } }
   end
@@ -2040,6 +2044,180 @@ local function render_tool_result(content, is_error, meta)
     first + #lines - 1, 0, {})
 
   buf_append({ "" })   -- trailing blank so the eol randomizer / next block clears the body
+  state.tool_results[#state.tool_results + 1] = entry
+end
+
+-- Search-shaped shell commands → the verb they read as. In headless SDK mode the
+-- panel's claude has NO Grep/Glob tool — it searches via Bash (rg/grep/ast-grep/
+-- fd/find). Detecting those lets a Bash search render as a "● Searching" block
+-- instead of a generic "● Running bash". `files` = the command's output is a
+-- clean path list (→ count header + `└ file` list); else the body is match lines.
+local SEARCH_CMDS = {
+  rg = "Searching", grep = "Searching", egrep = "Searching", fgrep = "Searching",
+  ["ast-grep"] = "Searching", sg = "Searching",
+  fd = "Listing", fdfind = "Listing", find = "Listing",
+}
+
+-- Flags that make a search emit a bare FILE LIST (one path per line) rather than
+-- matching lines. fd/find always emit paths.
+local function bash_files_mode(base, cmd)
+  if base == "fd" or base == "fdfind" or base == "find" then return true end
+  return cmd:match("%s%-l%f[%s]") ~= nil
+    or cmd:match("%-%-files%-with%-matches") ~= nil
+    or cmd:match("%-%-files%f[%s]") ~= nil
+end
+
+-- Descriptor for a search tool_use, or nil if it isn't a search. Covers the Grep/
+-- Glob TOOLS (clean output) and search-shaped Bash COMMANDS (headless reality).
+-- { verb, pattern, files } — `files` gates the count-header + `└ file` list form.
+local function search_descriptor(name, input)
+  if name == "Grep" then
+    return { verb = "Searching", pattern = input.pattern, files = true }
+  elseif name == "Glob" then
+    return { verb = "Listing", pattern = input.pattern, files = true }
+  elseif name == "Bash" then
+    local cmd = input.command
+    if type(cmd) ~= "string" or cmd == "" then return nil end
+    -- Leading command word, past any "cd X &&" prefix; basename if a path.
+    local c    = (cmd:match("&&%s*(.+)$") or cmd):gsub("^%s+", "")
+    local word = c:match("^([%w%-%._/]+)")
+    local base = word and (word:match("([^/]+)$") or word)
+    local verb = base and SEARCH_CMDS[base]
+    if not verb then return nil end
+    -- Pattern: prefer the first quoted string (keeps multi-word patterns whole),
+    -- else the first non-flag token. Strip any surrounding quotes either way.
+    local pat = c:match('"([^"]*)"') or c:match("'([^']*)'")
+    if not pat then
+      for tok in c:gmatch("%S+") do
+        if tok ~= base and not tok:match("^%-") then pat = tok; break end
+      end
+      if pat then pat = pat:gsub("^[\"']", ""):gsub("[\"']$", "") end
+    end
+    return { verb = verb, pattern = pat or c, files = bash_files_mode(base, c) }
+  end
+  return nil
+end
+
+-- Render the PROVISIONAL search header at tool_use time and register the block so
+-- the matching tool_result can rewrite the header + attach the results. The header
+-- row is tracked by extmark (not position) so interleaved output can't desync the
+-- later rewrite.
+local function render_search(sd, id)
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  state.search_ns = state.search_ns
+    or vim.api.nvim_create_namespace("claude_search")
+  state.search_blocks = state.search_blocks or {}
+
+  local first = vim.api.nvim_buf_line_count(buf)
+  buf_append({ "● " .. sd.verb .. "…" })
+  hl_lines(first, first, "ClaudeTool")
+  buf_append({ "" })   -- randomizer row; render_search_result drops it before the body
+  state.search_blocks[id] = {
+    header_mark = vim.api.nvim_buf_set_extmark(buf, state.search_ns, first, 0, {}),
+    sd          = sd,
+  }
+  state.tool_run = { t0 = vim.loop.now() }
+end
+
+-- Parse a file-list search body into (file_count, file_list). Handles the Grep
+-- TOOL's "Found N files\n<paths>" summary, the empty "No files/matches" form, and
+-- a bare path list (Bash rg -l / fd / find; count = #lines).
+local function parse_search_result(body)
+  if #body == 0 then return 0, {} end
+  local n = body[1]:match("^Found%s+(%d+)")
+  if n then
+    local files = {}
+    for i = 2, #body do files[#files + 1] = body[i] end
+    return tonumber(n), files
+  end
+  if body[1]:match("^No files") or body[1]:match("^No matches") then
+    return 0, {}
+  end
+  return #body, body
+end
+
+-- Rewrite a registered search header to the CC-TUI form and attach results. A
+-- file-list search (Grep/Glob tool, or rg -l / fd / find via Bash) gets the count
+-- header + a `└`-per-line collapsible file list. A match-line search (rg/grep/
+-- ast-grep default) shows "● <Verb>  <pattern>" + the match body. Errors keep a
+-- plain header + the generic red body.
+local function render_search_result(sb, content, is_error, meta)
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  local sd   = sb.sd
+  local pos  = vim.api.nvim_buf_get_extmark_by_id(buf, state.search_ns, sb.header_mark, {})
+  local hrow = pos and pos[1]
+
+  local function set_header(text)
+    if not hrow then return end
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, hrow, hrow + 1, false, { text })
+    vim.bo[buf].modifiable = false
+    hl_lines(hrow, hrow, "ClaudeTool")
+  end
+
+  if is_error then
+    set_header("● " .. sd.verb .. " — failed")
+    render_tool_result(content, true, meta)   -- generic red body under the header
+    return
+  end
+
+  -- Match-line search (rg/grep/ast-grep default): header names the pattern, the
+  -- match lines render as the generic (foundation) body — truncate/expand intact.
+  if not sd.files then
+    set_header("● " .. sd.verb .. "  " .. corner_one_line(sd.pattern or ""))
+    render_tool_result(content, false, meta)
+    return
+  end
+
+  local body = tool_result_lines(content)
+  local m, files = parse_search_result(body)
+  if m == 0 then
+    set_header("● " .. sd.verb .. " — no matches")
+    return
+  end
+
+  local overflow = m > RESULT_HEAD_K
+  local expand   = overflow and " (ctrl+o to expand)" or ""
+  if sd.verb == "Listing" then
+    set_header(string.format("● Listing %d %s%s", m, m == 1 and "file" or "files", expand))
+  else
+    set_header(string.format("● Searching for 1 pattern, reading %d %s%s",
+      m, m == 1 and "file" or "files", expand))
+  end
+
+  -- Show paths relative to cwd; each on its own `└` corner (corner_each).
+  local rel = {}
+  for i, f in ipairs(files) do rel[i] = rel_path(f) end
+
+  -- Drop the header's trailing randomizer blank so the list attaches directly
+  -- under it (mirrors render_tool_result).
+  local last = vim.api.nvim_buf_line_count(buf)
+  if last > 0 and vim.api.nvim_buf_get_lines(buf, last - 1, last, false)[1] == "" then
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, last - 1, last, false, {})
+    vim.bo[buf].modifiable = false
+  end
+
+  state.tool_result_ns = state.tool_result_ns
+    or vim.api.nvim_create_namespace("claude_tool_result")
+  state.tool_results = state.tool_results or {}
+  local entry = {
+    body        = rel,
+    is_error    = false,
+    corner_each = true,                    -- a file list reads best with a `└` each
+    toggleable  = #rel > RESULT_HEAD_K,
+    expanded    = false,
+  }
+  local lines, hls = build_collapsed(entry)
+  local first = vim.api.nvim_buf_line_count(buf)
+  buf_append(lines)
+  apply_line_hls(buf, first, hls)
+  entry.start_mark = vim.api.nvim_buf_set_extmark(buf, state.tool_result_ns, first, 0, {})
+  entry.end_mark   = vim.api.nvim_buf_set_extmark(buf, state.tool_result_ns,
+    first + #lines - 1, 0, {})
+  buf_append({ "" })
   state.tool_results[#state.tool_results + 1] = entry
 end
 
@@ -3517,8 +3695,17 @@ local function dispatch(event)
     remove_typing_ph()
     for _, block in ipairs((event.message or {}).content or {}) do
       if (block.type or "") == "tool_result" then
-        render_tool_result(block.content, block.is_error == true,
-          state.tool_meta and state.tool_meta[block.tool_use_id])
+        -- A registered count-search (Grep) rewrites its own header + renders the
+        -- file list; everything else renders the generic tool_result body.
+        local sb = state.search_blocks and state.search_blocks[block.tool_use_id]
+        if sb then
+          render_search_result(sb, block.content, block.is_error == true,
+            state.tool_meta and state.tool_meta[block.tool_use_id])
+          state.search_blocks[block.tool_use_id] = nil
+        else
+          render_tool_result(block.content, block.is_error == true,
+            state.tool_meta and state.tool_meta[block.tool_use_id])
+        end
       end
     end
     -- MG 14.2 RC1: a tool_result means the CLI finished executing — including any
@@ -3551,7 +3738,15 @@ local function dispatch(event)
       elseif btype == "tool_use" then
         local name  = block.name or ""
         local input = block.input or {}
-        render_tool(name, input)
+        -- A search (Grep/Glob tool, or a search-shaped Bash command like
+        -- `rg`/`ast-grep`/`fd`) renders a provisional header that its result
+        -- rewrites; everything else renders inline now.
+        local sd = block.id and search_descriptor(name, input)
+        if sd then
+          render_search(sd, block.id)
+        else
+          render_tool(name, input)
+        end
         -- Correlate this tool_use with its later tool_result (by id) so the
         -- result render knows the tool + file path (e.g. a Read → code block).
         if block.id then
@@ -3867,6 +4062,35 @@ end
 --   panel run slash commands, skills, and plan mode like the terminal does:
 --   those are just message text (e.g. "/kos-ingest") the same way KOS sends them.
 
+-- Standing guidance appended to the panel session's system prompt. In headless
+-- SDK mode claude has no Grep/Glob tool, so it searches via Bash — steer it to
+-- `ast-grep`/`rg` as the LEADING command (not piped through cat/grep) so the
+-- Search-block renderer fires and search is structural. `sg` is off-limits: on
+-- this machine it resolves to the system group tool, not ast-grep.
+local SEARCH_NUDGE = table.concat({
+  "For code search, prefer `ast-grep` for structural/AST queries and `rg` ",
+  "(ripgrep) for plain-text search. Run the search tool as the leading shell ",
+  "command — do not pipe through `cat` or `grep`. Never invoke `sg`: on this ",
+  "system that is the group-management tool, not ast-grep — always spell it ",
+  "`ast-grep`.",
+}, "")
+
+-- Directories to guarantee on the panel process's PATH. GNOME launches nvim
+-- without sourcing shell rc, so nvm/npm-global/linuxbrew bins (where ast-grep
+-- lives) are missing — the Bash search tools would then not resolve. Globbed so
+-- a node upgrade doesn't break it; nonexistent dirs are dropped.
+local function panel_path()
+  local dirs = {}
+  local function add(d) if d ~= "" and vim.fn.isdirectory(d) == 1 then dirs[#dirs + 1] = d end end
+  add(vim.fn.expand("~/.local/bin"))
+  add(vim.fn.expand("~/.npm-global/bin"))
+  add("/home/linuxbrew/.linuxbrew/bin")
+  for _, d in ipairs(vim.fn.glob(vim.fn.expand("~/.nvm/versions/node/*/bin"), true, true)) do
+    add(d)
+  end
+  return table.concat(dirs, ":") .. ":" .. (vim.env.PATH or "")
+end
+
 -- Build the argv for the persistent process from current session settings
 -- (model + permission mode). Separated out so respawns (model/plan changes)
 -- reuse the exact same construction.
@@ -3892,6 +4116,9 @@ local function build_args()
     -- --permission-mode, never drops this flag) — full protocol in
     -- .work/FINDINGS.md § Q-PERM.
     "--permission-prompt-tool", "stdio",
+    -- Steer search toward ast-grep/rg so the Search-block renderer fires (headless
+    -- claude has no Grep tool). Persists across model/plan respawns.
+    "--append-system-prompt", SEARCH_NUDGE,
   }
   -- --model accepts an alias (opus/sonnet/haiku) or a full id. nil = CLI default.
   if state.model and state.model ~= "" then
@@ -3909,11 +4136,15 @@ local function ensure_process()
   stdout_buf = ""
   local job = vim.fn.jobstart(build_args(), {
     cwd = state.stored_root or vim.fn.getcwd(),
-    -- Disable caveman for the panel's claude by default (opts.caveman_mode):
-    -- CAVEMAN_DEFAULT_MODE is the caveman plugin's env override, so the panel
-    -- speaks normally even when interactive sessions default to caveman. env
-    -- extends (not replaces) the inherited environment.
-    env       = opts.caveman_mode and { CAVEMAN_DEFAULT_MODE = opts.caveman_mode } or nil,
+    -- PATH: prepend nvm/npm-global/linuxbrew/~/.local/bin so the Bash search
+    -- tools (ast-grep/rg) resolve — GNOME launches nvim without shell rc, so
+    -- those dirs are otherwise absent. CAVEMAN_DEFAULT_MODE disables caveman for
+    -- the panel's claude (the plugin's env override) so it speaks normally even
+    -- when interactive sessions default to caveman. env EXTENDS the inherited
+    -- environment (setting PATH here replaces only PATH in the child).
+    env       = vim.tbl_extend("force",
+      { PATH = panel_path() },
+      opts.caveman_mode and { CAVEMAN_DEFAULT_MODE = opts.caveman_mode } or {}),
     on_stdout = on_stdout,
     on_stderr = function() end,
     on_exit   = on_exit,
@@ -4858,6 +5089,7 @@ function mod.reset()
   state.host_ctx_sent = false
   state.tool_results  = {}
   state.tool_meta     = {}
+  state.search_blocks = {}
   if state.perm and state.perm.win and vim.api.nvim_win_is_valid(state.perm.win) then
     pcall(vim.api.nvim_win_close, state.perm.win, true)
   end

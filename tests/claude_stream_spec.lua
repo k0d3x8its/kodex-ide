@@ -611,14 +611,17 @@ H.check("S19 ExitPlanMode renders a Plan header",
 H.check("S19 ExitPlanMode collapses the multi-line plan to one corner line",
   panel_text():find("Step 1: refactor Step 2: test", 1, true) ~= nil, panel_text())
 
--- MCP tool `mcp__server__tool` → header stripped to "● server:tool".
+-- MCP tool `mcp__server__tool` → Skill-style "● MCP(<tool>)" (server dropped) +
+-- a `└` corner with the one-line JSON of the call params.
 claude.state.tool_run = nil
 feed({ type = "assistant", message = { content = { {
-  type = "tool_use", id = "mc1", name = "mcp__github__create_issue",
+  type = "tool_use", id = "mc1", name = "mcp__claude_ai_Notion__notion-create-pages",
   input = { title = "bug" },
 } } } })
-H.check("S19 MCP name strips the mcp__ prefix and joins with ':'",
-  panel_text():find("● github:create_issue", 1, true) ~= nil, panel_text())
+H.check("S19 MCP wraps the short tool name in MCP()",
+  panel_text():find("● MCP(notion-create-pages)", 1, true) ~= nil, panel_text())
+H.check("S19 MCP corner shows the one-line param JSON",
+  panel_text():find('"title": "bug"', 1, true) ~= nil, panel_text())
 
 -- WebFetch → "● Fetching" with the url as the corner target (url now in the chain).
 claude.state.tool_run = nil

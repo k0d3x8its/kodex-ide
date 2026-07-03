@@ -596,4 +596,39 @@ task_update("du2", "2", "completed")
 H.check("S18 completing ALL tasks arms the dismiss",
   claude.state.todo_done_pending == true, tostring(claude.state.todo_done_pending))
 
+-- ── S19: taxonomy leftovers — ExitPlanMode, MCP name-strip, WebFetch url ────────
+-- Every tool_use must render a coherent gerund block, no bare underscored name.
+claude.state.think_start = nil
+claude.state.tool_run    = nil
+
+-- ExitPlanMode → "● Plan" header + one-line preview of the proposed plan (input).
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "ep1", name = "ExitPlanMode",
+  input = { plan = "Step 1: refactor\nStep 2: test" },
+} } } })
+H.check("S19 ExitPlanMode renders a Plan header",
+  panel_text():find("● Plan", 1, true) ~= nil, panel_text())
+H.check("S19 ExitPlanMode collapses the multi-line plan to one corner line",
+  panel_text():find("Step 1: refactor Step 2: test", 1, true) ~= nil, panel_text())
+
+-- MCP tool `mcp__server__tool` → header stripped to "● server:tool".
+claude.state.tool_run = nil
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "mc1", name = "mcp__github__create_issue",
+  input = { title = "bug" },
+} } } })
+H.check("S19 MCP name strips the mcp__ prefix and joins with ':'",
+  panel_text():find("● github:create_issue", 1, true) ~= nil, panel_text())
+
+-- WebFetch → "● Fetching" with the url as the corner target (url now in the chain).
+claude.state.tool_run = nil
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "wf1", name = "WebFetch",
+  input = { url = "https://example.com/doc", prompt = "summarize" },
+} } } })
+H.check("S19 WebFetch header is the Fetching gerund",
+  panel_text():find("● Fetching", 1, true) ~= nil, panel_text())
+H.check("S19 WebFetch corner shows the url",
+  panel_text():find("https://example.com/doc", 1, true) ~= nil, panel_text())
+
 H.summary("claude_stream")

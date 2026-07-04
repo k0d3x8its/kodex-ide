@@ -36,7 +36,6 @@ end
 -- Glob TOOLS (clean output) and search-shaped Bash COMMANDS (headless reality: the
 -- panel's claude has NO Grep/Glob tool, so it searches via Bash). { verb, pattern,
 -- files } — `files` (clean path-list output) gates the count-header + `└ file` list.
--- Scoped in a do-block so its lookup table + helper stay off the main local budget.
 -- Search-shaped shell commands → the verb they read as.
 local SEARCH_CMDS = {
   rg = "Searching", grep = "Searching", egrep = "Searching", fgrep = "Searching",
@@ -51,41 +50,39 @@ local function files_mode(base, cmd)
     or cmd:match("%-%-files%f[%s]") ~= nil
 end
 function Widgets.search_descriptor(name, input)
-if name == "Grep" then
-  return { verb = "Searching", pattern = input.pattern, files = true }
-elseif name == "Glob" then
-  return { verb = "Listing", pattern = input.pattern, files = true }
-elseif name == "Bash" then
-  local cmd = input.command
-  if type(cmd) ~= "string" or cmd == "" then return nil end
-  -- Leading command word, past any "cd X &&" prefix; basename if a path.
-  local c    = (cmd:match("&&%s*(.+)$") or cmd):gsub("^%s+", "")
-  local word = c:match("^([%w%-%._/]+)")
-  local base = word and (word:match("([^/]+)$") or word)
-  local verb = base and SEARCH_CMDS[base]
-  if not verb then return nil end
-  -- Pattern: prefer the first quoted string (keeps multi-word patterns whole),
-  -- else the first non-flag token. Strip any surrounding quotes either way.
-  local pat = c:match('"([^"]*)"') or c:match("'([^']*)'")
-  if not pat then
-    for tok in c:gmatch("%S+") do
-      if tok ~= base and not tok:match("^%-") then pat = tok; break end
+  if name == "Grep" then
+    return { verb = "Searching", pattern = input.pattern, files = true }
+  elseif name == "Glob" then
+    return { verb = "Listing", pattern = input.pattern, files = true }
+  elseif name == "Bash" then
+    local cmd = input.command
+    if type(cmd) ~= "string" or cmd == "" then return nil end
+    -- Leading command word, past any "cd X &&" prefix; basename if a path.
+    local c    = (cmd:match("&&%s*(.+)$") or cmd):gsub("^%s+", "")
+    local word = c:match("^([%w%-%._/]+)")
+    local base = word and (word:match("([^/]+)$") or word)
+    local verb = base and SEARCH_CMDS[base]
+    if not verb then return nil end
+    -- Pattern: prefer the first quoted string (keeps multi-word patterns whole),
+    -- else the first non-flag token. Strip any surrounding quotes either way.
+    local pat = c:match('"([^"]*)"') or c:match("'([^']*)'")
+    if not pat then
+      for tok in c:gmatch("%S+") do
+        if tok ~= base and not tok:match("^%-") then pat = tok; break end
+      end
+      if pat then pat = pat:gsub("^[\"']", ""):gsub("[\"']$", "") end
     end
-    if pat then pat = pat:gsub("^[\"']", ""):gsub("[\"']$", "") end
+    return { verb = verb, pattern = pat or c, files = files_mode(base, c) }
   end
-  return { verb = verb, pattern = pat or c, files = files_mode(base, c) }
-end
-return nil
+  return nil
 end
 
--- ─── Task-plan card widget ───────────────────────────────────────────────────
--- ─── TodoWrite task-list widget (bottom-pinned float) ────────────────────────
+-- ─── Task-plan card widget (bottom-pinned float) ─────────────────────────────
 
 -- Render the task list to (lines, hls): a dim "N tasks (X done, Y in progress,
 -- Z open)" header, then one row per task (✔ done strikethrough / ▦ in-progress
 -- orange / □ pending), capped at CAP with a "… +N more" tail. hls[i] is a list of
--- {b0, b1, group} spans. Pure — unit-tested directly. Scoped in a do-block (its
--- constants + helper stay off the main chunk's local budget — 200-local limit).
+-- {b0, b1, group} spans. Pure — unit-tested directly.
 local CAP    = 8
 local GLYPH  = { completed = "✔", in_progress = "▦", pending = "□" }
 local TEXTHL = {
@@ -143,8 +140,7 @@ function Widgets.render_todo_lines(todos)
 end
 
 -- Rows the widget currently occupies (0 when hidden). Other bottom floats + the
--- chat pad add this so they stack ABOVE the task list. Assigns the forward-declared
--- local so the early pad math can see it.
+-- chat pad add this so they stack ABOVE the task list.
 function Widgets.todo_height()
   return (state.todos and #state.todos > 0) and (state.todo_h or 0) or 0
 end
@@ -188,15 +184,6 @@ function Widgets.reflow_bottom_floats()
   set_bottom_pad(state.chat_pad or 0)   -- recompute total (chat base + widget)
 end
 
--- Apply a headless-SDK Task* tool call to state.todos + refresh the widget.
--- The panel's claude runs the headless toolset, which has NO TodoWrite tool; it
--- tracks a plan via the Task* orchestration family instead (RE'd live 2026-07-03,
--- FINDINGS § Q-TODO-TRIGGER). Unlike TodoWrite (one call carries the whole array),
--- Task* is incremental: TaskCreate adds one item, TaskUpdate mutates one by id.
--- The CLI numbers tasks with a global running counter ("Task #N created"), and
--- TaskUpdate.taskId is that N — so we mint ids from our own todo_seq in creation
--- order to match. We rebuild the same {content,status,activeForm} rows the widget
--- already renders. Returns true when it handled the tool.
 -- True only when the plan is non-empty AND every task is completed. Pure — the
 -- auto-dismiss decision is tested through this, not the timer.
 function Widgets.plan_complete(todos)
@@ -207,6 +194,15 @@ function Widgets.plan_complete(todos)
   return true
 end
 
+-- Apply a headless-SDK Task* tool call to state.todos + refresh the widget.
+-- The panel's claude runs the headless toolset, which has NO TodoWrite tool; it
+-- tracks a plan via the Task* orchestration family instead (RE'd live 2026-07-03,
+-- FINDINGS § Q-TODO-TRIGGER). Unlike TodoWrite (one call carries the whole array),
+-- Task* is incremental: TaskCreate adds one item, TaskUpdate mutates one by id.
+-- The CLI numbers tasks with a global running counter ("Task #N created"), and
+-- TaskUpdate.taskId is that N — so we mint ids from our own todo_seq in creation
+-- order to match. We rebuild the same {content,status,activeForm} rows the widget
+-- already renders. Returns true when it handled the tool.
 function Widgets.apply_task_tool(name, input)
   input = input or {}
   if name == "TaskCreate" then

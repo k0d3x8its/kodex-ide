@@ -47,8 +47,6 @@ end
 -- cleaned line. Handles **bold** → ClaudeBold and `code` → ClaudeCode.
 -- Returns: clean_line, { {byte_start0, byte_end, group}, ... }  (byte offsets are
 -- 0-indexed start / end-exclusive, matching nvim_buf_add_highlight).
--- Defined above render_prose because Lua `local function` is only visible to
--- code that follows it.
 local function parse_inline(line)
   local parts, hls, blen, i, n = {}, {}, 0, 1, #line
   while i <= n do

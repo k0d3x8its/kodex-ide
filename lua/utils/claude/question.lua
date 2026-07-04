@@ -22,7 +22,6 @@ local widgets = require(require_prefix .. "widgets")
 local state = core.state
 local buf_append  = core.buf_append
 local hl_lines    = core.hl_lines
-local panel_width = core.panel_width
 
 -- Init-owned helpers, injected by Question.wire{} at load time (see init.lua).
 -- Declared as forward locals so the card functions below close over them.
@@ -391,12 +390,10 @@ Question.set_question_custom = set_question_custom
 -- answer, <Esc> cancels back to the card. Empty/cancelled input just repaints.
 local function prompt_question_custom()
   if not state.qask then return end
-  local panel_w = panel_width()
-  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
-    panel_w = vim.api.nvim_win_get_width(state.panel_win)
-  end
-  local float_w   = math.max(panel_w - 2, 1)
-  local float_col = vim.o.columns - panel_w
+  -- Shared geometry: anchors to the panel's real screen column (same fix
+  -- open_question_float already got — this path was still using columns-panel_w,
+  -- which drifts when the panel isn't flush-right).
+  local float_col, float_w = panel_float_geom()
 
   -- A prompt buffer (not a plain scratch) so it carries the same green "❯" arrow as
   -- the chat bar: prompt_setprompt draws the arrow, matchadd colours it terminal-

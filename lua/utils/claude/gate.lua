@@ -1,0 +1,713 @@
+-- lua/utils/claude/gate.lua
+--
+-- The permission / pre-write gate + diff-review card + the shared SW-anchored
+-- panel-float helpers they all lean on. Everything here answers a can_use_tool
+-- control_request the CLI can't auto-resolve: the interactive permission card
+-- (Bash/WebFetch/out-of-cwd), the Issue-B pre-write diff gate for Edit/Write, and
+-- the Accept/Reject diff-review card. Extracted from the former monolithic
+-- claude.lua (Goal 15.5) to relieve init's main-chunk 200-local ceiling.
+--
+-- Dependencies: core.state + core buffer helpers (state/buf_append/hl_lines/
+-- panel_width) come from a direct require; five init-owned helpers
+-- (start_spinner/stop_spinner/clear_hint, prompt_input as a thunk, and
+-- widgets.float_bottom_row) are injected via Gate.wire{} at load time — they
+-- couple to init's chat-bar/spinner/float machinery, so injection avoids a require
+-- cycle (init and widgets both wire against these helpers). claude_diff is required
+-- inline (verbatim from the pre-move code) at the two sites that bridge to it.
+--
+-- Init re-sources the geometry helpers + send_permission_response back out of here
+-- (local X = gate.X) and feeds them into the existing widgets.wire{} / question.wire{}
+-- calls — the wire indirection is why those two sibling modules stay untouched by
+-- this move. show_permission_card / show_diff_card / try_prewrite_gate are called by
+-- init's event dispatcher; on_prewrite_resolve is re-exported on the public surface
+-- (claude_diff calls it); the mod._* test hooks are re-exported from init.
+
+local Gate = {}
+
+local require_prefix = "utils.claude."
+local core = require(require_prefix .. "core")
+
+local state       = core.state
+local buf_append  = core.buf_append
+local hl_lines    = core.hl_lines
+local panel_width = core.panel_width
+
+-- Init-owned helpers, injected by Gate.wire{} at load time (see init.lua).
+-- Declared as forward locals so the gate functions below close over them.
+local start_spinner
+local stop_spinner
+local clear_hint
+local prompt_input
+local float_bottom_row
+
+--- Inject init's spinner/hint/float helpers. Called once from init after they
+--- are defined (prompt_input arrives as a thunk since it is defined further down
+--- in init; float_bottom_row is widgets' — passed through rather than required
+--- here to keep the gate ↔ widgets coupling one-directional via the wire).
+function Gate.wire(hooks)
+  start_spinner    = hooks.start_spinner
+  stop_spinner     = hooks.stop_spinner
+  clear_hint       = hooks.clear_hint
+  prompt_input     = hooks.prompt_input
+  float_bottom_row = hooks.float_bottom_row
+end
+
+local function send_permission_response(request_id, decision, o)
+  if not state.job_id then return end
+  o = o or {}
+  local response
+  if decision == "deny" then
+    -- The deny reason rides in `message` for BOTH the permission-card "Reject" and
+    -- AskUserQuestion's "Chat about this". The TUI bundle's question component sets an
+    -- internal `feedback` prop, but the wire serializer maps it straight to `message`
+    -- (`{behavior:"deny",message:$.feedback??"User denied permission"}`) — there is NO
+    -- `feedback` field on the wire; sending one is silently dropped. § Q-ASK addendum.
+    response = { behavior = "deny", message = o.message or "User rejected" }
+  else
+    local input = o.input
+    if type(input) ~= "table" or next(input) == nil then input = vim.empty_dict() end
+    response = { behavior = "allow", updatedInput = input }
+    if o.permissions then response.updatedPermissions = o.permissions end
+  end
+  local msg = vim.json.encode({
+    type     = "control_response",
+    response = { subtype = "success", request_id = request_id, response = response },
+  })
+  pcall(vim.fn.chansend, state.job_id, msg .. "\n")
+end
+Gate.send_permission_response = send_permission_response
+
+-- Edit-family tools at the can_use_tool gate. GATED ones (Issue-B prototype:
+-- Write/Edit) hold the request open and show a PRE-write diff reconstructed from
+-- the tool input — accept releases "allow" (the CLI then writes + narrates,
+-- post-approval), reject releases "deny" (nothing touches disk). The rest
+-- (MultiEdit/NotebookEdit) keep the old contract: auto-allow, then the post-write
+-- FileChangedShell+vimdiff flow owns the review.
+local EDIT_TOOLS = { Edit = true, Write = true, MultiEdit = true, NotebookEdit = true }
+local GATED_EDIT_TOOLS = { Edit = true, Write = true }
+Gate.EDIT_TOOLS = EDIT_TOOLS
+Gate.GATED_EDIT_TOOLS = GATED_EDIT_TOOLS
+
+-- Reconstruct the post-edit file content for an Edit tool input WITHOUT the CLI
+-- having written anything: read the (still pristine) file from disk and mirror the
+-- CLI's plain-text old_string→new_string replacement, honouring replace_all.
+-- Returns a lines list, or nil when reconstruction isn't possible (file missing,
+-- old_string absent/empty) — the caller falls back to auto-allow + post-write.
+-- Disk, not buffer: the CLI edits the on-disk content, so unsaved buffer edits
+-- must not leak into the "proposed" side.
+local function reconstruct_edit(path, input)
+  local old_s, new_s = input.old_string, input.new_string
+  if type(old_s) ~= "string" or old_s == "" or type(new_s) ~= "string" then
+    return nil
+  end
+  local ok, lines = pcall(vim.fn.readfile, path)
+  if not ok then return nil end
+  local text = table.concat(lines, "\n")
+  local out
+  if input.replace_all then
+    -- split(plain)+concat replaces every occurrence with no pattern-escaping
+    -- pitfalls (old_s/new_s are literal strings, not Lua patterns).
+    local pieces = vim.split(text, old_s, { plain = true })
+    if #pieces < 2 then return nil end -- old_string not found
+    out = table.concat(pieces, new_s)
+  else
+    local s, e = string.find(text, old_s, 1, true)
+    if not s then return nil end
+    out = text:sub(1, s - 1) .. new_s .. text:sub(e + 1)
+  end
+  return vim.split(out, "\n", { plain = true })
+end
+Gate.reconstruct_edit = reconstruct_edit
+
+-- Try to hold a gated edit's can_use_tool request behind a pre-write diff.
+-- Returns true when the diff is up (request stays open until the user decides);
+-- false → caller must auto-allow (old post-write flow) so the CLI never hangs.
+local function try_prewrite_gate(request_id, tool, input)
+  local path = input.file_path
+  if type(path) ~= "string" or path == "" then return false end
+  local proposed
+  if tool == "Write" then
+    proposed = vim.split(input.content or "", "\n", { plain = true })
+  else -- Edit
+    proposed = reconstruct_edit(path, input)
+  end
+  if not proposed then return false end
+  -- Arm the held request BEFORE opening the diff: the review card can resolve
+  -- synchronously in headless tests, and on_prewrite_resolve needs it set.
+  state.prewrite = { request_id = request_id, input = input }
+  local ok, opened = pcall(require("utils.claude_diff").open_prewrite, path, proposed)
+  if not (ok and opened) then
+    state.prewrite = nil
+    return false
+  end
+  return true
+end
+Gate.try_prewrite_gate = try_prewrite_gate
+
+-- Release the held pre-write request: allow (CLI writes the file, then narrates —
+-- now post-approval) or deny (CLI never writes; the deny message tells it why).
+-- Called by claude_diff.accept_all/reject_all in prewrite mode, which also close
+-- the diff windows; the spinner restart mirrors resolve_permission (the turn is
+-- still in flight — the CLI was blocked on us).
+function Gate.on_prewrite_resolve(accepted)
+  local p = state.prewrite
+  if not p then return end
+  state.prewrite = nil
+  if accepted then
+    send_permission_response(p.request_id, "allow", { input = p.input })
+  else
+    send_permission_response(p.request_id, "deny",
+      { message = "User rejected the proposed change in review" })
+  end
+  if state.working then
+    state.activity_t0 = vim.loop.now()
+    start_spinner()
+  end
+end
+
+-- ─── Permission card (step 4) ─────────────────────────────────────────────────
+-- Interactive bordered FLOAT for a non-edit can_use_tool request (Bash, WebFetch,
+-- out-of-cwd file access, …) the CLI can't auto-resolve. Opens a rounded box in
+-- the panel column titled "⚠ Permission required" (inline on the top border, like
+-- the chat bar) but styled distinctly (ClaudePermBorder amber), FOCUSED so the
+-- keyboard drives it immediately: ←/→ or h/l move, <CR>/number confirm, <Esc>/q
+-- reject. On resolve it replies (send_permission_response), closes the float, and
+-- drops a one-line receipt into the transcript so the scrollback records the
+-- decision. One card at a time (the CLI blocks the turn awaiting our
+-- control_response). Edits never reach here (auto-allowed → vimdiff). Mirrors
+-- OpenCode's card; full protocol in .work/FINDINGS.md § Q-PERM.
+
+-- Repaint the float's button row (p.row, 0-indexed last content line) in place:
+-- the active option pops (ClaudeQuestion), the rest dim (ClaudeDim). Called on
+-- open and on every left/right move.
+local function render_perm_choice_row()
+  local p = state.perm
+  if not (p and p.buf and vim.api.nvim_buf_is_valid(p.buf)) then return end
+  state.perm_ns = state.perm_ns or vim.api.nvim_create_namespace("ClaudePermRow")
+  local segs, line = {}, "  "
+  for i, opt in ipairs(p.options) do
+    if i > 1 then line = line .. "    " end
+    local label = ((i == p.choice) and "❯ " or "  ") .. opt.label
+    local b0 = #line
+    line = line .. label
+    segs[#segs + 1] = { b0 = b0, b1 = #line, active = (i == p.choice) }
+  end
+  vim.bo[p.buf].modifiable = true
+  vim.api.nvim_buf_set_lines(p.buf, p.row, p.row + 1, false, { line })
+  vim.bo[p.buf].modifiable = false
+  vim.api.nvim_buf_clear_namespace(p.buf, state.perm_ns, p.row, p.row + 1)
+  for _, s in ipairs(segs) do
+    vim.api.nvim_buf_add_highlight(p.buf, state.perm_ns,
+      s.active and "ClaudeQuestion" or "ClaudeDim", p.row, s.b0, s.b1)
+  end
+end
+
+-- Move the selection left/right (wraps).
+local function move_perm_choice(delta)
+  local p = state.perm
+  if not p then return end
+  p.choice = (p.choice - 1 + delta) % #p.options + 1
+  render_perm_choice_row()
+end
+Gate.move_perm_choice = move_perm_choice
+
+-- Send the chosen decision, close the float, append a transcript receipt, and
+-- resume the spinner if the turn is still in flight (an allow lets Claude
+-- continue; a deny only denies this tool — the turn may proceed; the eventual
+-- `result` event flips working off + clears the hint).
+local function resolve_permission(kind)
+  local p = state.perm
+  if not p then return end
+  if kind == "deny" then
+    send_permission_response(p.request_id, "deny", { message = "User rejected" })
+  elseif kind == "always" then
+    send_permission_response(p.request_id, "allow",
+      { input = p.input, permissions = p.suggestions })
+  else
+    send_permission_response(p.request_id, "allow", { input = p.input })
+  end
+
+  -- Clear state BEFORE closing so the float's WinClosed guard no-ops (it only
+  -- fires a fallback deny when the window vanishes with state.perm still set).
+  state.perm = nil
+  if p.resize_close then pcall(p.resize_close) end   -- drop the resize-track augroup
+  if p.win and vim.api.nvim_win_is_valid(p.win) then
+    pcall(vim.api.nvim_win_close, p.win, true)
+  end
+
+  -- One-line receipt in the transcript so the scrollback shows what was decided.
+  local mark = (kind == "deny") and "✗" or "✓"
+  local verb = ({ once = "Allowed once", always = "Allowed always",
+                  deny = "Rejected" })[kind] or "Allowed"
+  if state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf) then
+    local recl = vim.api.nvim_buf_line_count(state.panel_buf)
+    buf_append({ mark .. " " .. p.display .. " — " .. verb })
+    hl_lines(recl, recl, kind == "deny" and "ClaudeDim" or "ClaudeQuestion")
+  end
+
+  -- A blank line below the receipt so the resumed spinner anchors to its OWN line
+  -- (set_hint pins EOL virt_text to the last buffer line) instead of trailing the
+  -- "✓ Allowed …" receipt text on the same row. Re-baseline the thinking timer so
+  -- the user's decision time doesn't count toward the next block's "Thought · …".
+  if state.working then
+    state.activity_t0 = vim.loop.now()
+    buf_append({ "" }); start_spinner()
+  else clear_hint() end
+
+  -- Reopen the chat bar we dismissed to show the card, so the user lands back in
+  -- the input (draft restored) and can keep the conversation going. Scheduled so
+  -- the card's window is fully torn down first. state.perm is already nil here, so
+  -- prompt_input() won't bail on the permission guard.
+  if state.perm_reopen_bar then
+    state.perm_reopen_bar = false
+    vim.schedule(function() prompt_input() end)
+  end
+end
+Gate.resolve_permission = resolve_permission
+
+-- Find path-like tokens in a PLAIN card line (the desc / Patterns rows are not
+-- markdown, so parse_inline never touches them). Any run containing a "/" is a
+-- path: trailing-slash → directory (ClaudeDir blue + folder feel), else a file
+-- path (ClaudePath green) — matching how the transcript colours paths everywhere
+-- else. Returns { {byte0, byte_end, group}, … }.
+local function perm_path_ranges(line)
+  local out = {}
+  for s, tok in line:gmatch("()([~%w%._%-/]*/[~%w%._%-/]*)") do
+    local b0 = s - 1
+    out[#out + 1] = { b0, b0 + #tok, (tok:sub(-1) == "/") and "ClaudeDir" or "ClaudePath" }
+  end
+  return out
+end
+
+-- The concrete command / parameters the tool will run, so the user can verify
+-- EXACTLY what executes before allowing (the display + description summarise intent
+-- but hide the real command, e.g. "Display directory tree" never showed the
+-- `tree -L 3 …` that runs). Unlike tool_target (truncated to one transcript line),
+-- the card wraps + spans rows, so show the full value split on newlines
+-- (nvim_buf_set_lines rejects embedded \n). Picks the most meaningful input field.
+local function perm_input_lines(input)
+  if type(input) ~= "table" then return {} end
+  local val = input.command or input.url or input.query or input.pattern
+    or input.file_path or input.path
+  if not val or val == "" then return {} end
+  local out = {}
+  for ln in (tostring(val) .. "\n"):gmatch("([^\n]*)\n") do
+    out[#out + 1] = ln
+  end
+  return out
+end
+
+-- ─── Shared SW-anchored panel-float helpers ──────────────────────────────────
+-- The permission card, question card, and chat bar are all bordered floats anchored
+-- bottom-left to the Claude panel's column. They must behave IDENTICALLY on three
+-- axes, so each routes through these helpers instead of re-deriving the math:
+--   (a) glue to the panel's REAL screen column regardless of window layout,
+--   (b) never over-scroll their content into empty space, and
+--   (c) track the panel's width/column when the terminal or windows resize.
+
+-- Col + inner width for an SW float spanning the panel column. Anchors to the panel
+-- window's actual screen position; (columns - panel_w) only lands right when the
+-- panel is the RIGHTMOST window — with a split beside it (or the panel on the left)
+-- that math drifts the float into the neighbour. Falls back to the subtraction only
+-- when the panel window isn't available.
+local function panel_float_geom()
+  local panel_w   = panel_width()
+  local float_col = vim.o.columns - panel_w
+  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+    panel_w   = vim.api.nvim_win_get_width(state.panel_win)
+    float_col = vim.api.nvim_win_get_position(state.panel_win)[2]
+  end
+  return float_col, math.max(panel_w - 2, 1)
+end
+Gate.panel_float_geom = panel_float_geom
+
+-- Stop a float from scrolling its content off into blank space. A non-zero global
+-- 'scrolloff' leaks into floats: at the last line vim keeps `scrolloff` rows below
+-- the cursor, but there are none, so it over-scrolls the tail upward past EOF (the
+-- permission card's command-tail over-shoot). Zero it (plus sidescrolloff) per-window
+-- so j/k stop with the last line resting at the bottom.
+local function harden_float_scroll(win)
+  vim.wo[win].scrolloff     = 0
+  vim.wo[win].sidescrolloff = 0
+end
+Gate.harden_float_scroll = harden_float_scroll
+
+-- Track the panel column/width on resize for an SW float. The fixed-width panel's
+-- left edge shifts as the editor grows, so a float fixed at open-time col/width
+-- drifts out of the column and clips. Recomputes col/row/width every resize; the
+-- optional on_resize(win, col, width) lets the caller re-fit height / re-render to
+-- the new width AFTER the reposition. The augroup self-removes when the window dies
+-- (autocmd returns true); also returns a teardown fn for explicit close.
+local function attach_panel_float_resize(win, group_name, on_resize)
+  vim.api.nvim_create_augroup(group_name, { clear = true })
+  vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
+    group = group_name,
+    callback = function()
+      if not vim.api.nvim_win_is_valid(win) then return true end  -- gone → self-remove
+      local col, w = panel_float_geom()
+      local c = vim.api.nvim_win_get_config(win)
+      c.col, c.row, c.width = col, float_bottom_row(), w
+      pcall(vim.api.nvim_win_set_config, win, c)
+      if on_resize then on_resize(win, col, w) end
+    end,
+  })
+  return function() pcall(vim.api.nvim_del_augroup_by_name, group_name) end
+end
+Gate.attach_panel_float_resize = attach_panel_float_resize
+
+-- Build + open the focused, bordered permission float and bind its keymaps. The
+-- buffer is dedicated and wiped on close, so the keymaps need no teardown.
+local function open_permission_float(p)
+  -- Body lines (display / desc / command / patterns), a spacer, the button-row
+  -- placeholder, and a dim nav-hint line that wraps inside the box.
+  local lines, body_hl = {}, {}
+  lines[#lines + 1] = "  " .. p.display
+  body_hl[#body_hl + 1] = { #lines - 1, "ClaudeProse" }
+  if p.desc ~= "" and p.desc ~= p.display then
+    lines[#lines + 1] = "  " .. p.desc
+    body_hl[#body_hl + 1] = { #lines - 1, "ClaudeProse" }
+  end
+  -- Button row + nav hint go ABOVE the command, not below it. The float height is
+  -- capped (see geometry) so a long command can't fill the screen; keeping the
+  -- choices at the top means they stay visible while the command scrolls in the
+  -- region beneath them, instead of being pushed off the bottom edge.
+  lines[#lines + 1] = ""                                  -- spacer
+  lines[#lines + 1] = ""                                  -- button-row placeholder
+  p.row = #lines - 1                                      -- 0-indexed button row
+  lines[#lines + 1] = "  ←/→ select · ⏎ confirm · esc reject · j/k scroll"
+  body_hl[#body_hl + 1] = { #lines - 1, "ClaudeDim" }
+  lines[#lines + 1] = ""                                  -- spacer
+  -- The actual command/parameters, rendered as a code block (▎ gutter + cyan) so
+  -- the user sees what will run, not just a paraphrase of it. Rendered LAST so it
+  -- is the scrollable tail of the float.
+  for _, cl in ipairs(perm_input_lines(p.input)) do
+    lines[#lines + 1] = "  ▎ " .. cl
+    body_hl[#body_hl + 1] = { #lines - 1, "ClaudeCode" }
+  end
+  if p.rules and #p.rules > 0 then
+    lines[#lines + 1] = "  Patterns: " .. table.concat(p.rules, ", ")
+    body_hl[#body_hl + 1] = { #lines - 1, "ClaudeDim" }
+  end
+
+  -- Geometry: full panel-column width minus borders, anchored to the panel's real
+  -- screen column (shared helper — same anchoring the question/chat floats use).
+  local float_col, float_w = panel_float_geom()
+
+  -- Height must count WRAPPED display rows, not logical lines: with wrap on, a long
+  -- description (e.g. a Skill blurb) spans several screen rows. Sum ceil(width/float_w)
+  -- per line, then cap at HALF the editor height: a giant command must not swallow
+  -- the screen — the chat above stays visible and the command scrolls (j/k) inside
+  -- the float. Buttons sit at the top (see line order) so they stay visible while
+  -- scrolling, killing the old "I can't see what I'm choosing" bug. Factored into a
+  -- closure so the resize handler can re-fit when the panel width changes.
+  local function perm_height(w)
+    local disp_rows = 0
+    for _, l in ipairs(lines) do
+      disp_rows = disp_rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / w))
+    end
+    return math.min(disp_rows, math.max(math.floor(vim.o.lines / 2), 3))
+  end
+  local float_h = perm_height(float_w)
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile  = false
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  p.buf = buf
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative  = "editor",
+    anchor    = "SW",
+    row       = float_bottom_row(),
+    col       = float_col,
+    width     = float_w,
+    height    = float_h,
+    border    = "rounded",
+    style     = "minimal",
+    title     = " ⚠ Permission required ",
+    title_pos = "left",
+    zindex    = 60,
+  })
+  p.win = win
+  -- Amber outline so the card is clearly NOT the clay chat bar; interior shares
+  -- ClaudeBarBg so the box reads flush, only the outline pops.
+  vim.wo[win].winhighlight =
+    "FloatBorder:ClaudePermBorder,FloatTitle:ClaudePermBorder,NormalFloat:ClaudeBarBg"
+  vim.wo[win].wrap        = true
+  vim.wo[win].linebreak   = true   -- wrap at word boundaries, not mid-word
+  vim.wo[win].breakindent = true   -- align wrapped continuation under the line's indent
+  vim.wo[win].cursorline  = false
+  harden_float_scroll(win)         -- BUG A: no over-scroll past the command tail
+  -- BUG B: track the panel column/width on resize, re-fitting the wrapped height.
+  p.resize_close = attach_panel_float_resize(win, "ClaudePermFloat", function(_, _, w)
+    pcall(vim.api.nvim_win_set_height, win, perm_height(w))
+  end)
+
+  for _, h in ipairs(body_hl) do
+    -- Base group over the whole line, then layer path/dir colours on top so the
+    -- directories + file paths in the desc/Patterns rows pop (later add_highlight
+    -- wins on the overlapping cells).
+    vim.api.nvim_buf_add_highlight(buf, -1, h[2], h[1], 0, -1)
+    for _, r in ipairs(perm_path_ranges(lines[h[1] + 1] or "")) do
+      vim.api.nvim_buf_add_highlight(buf, -1, r[3], h[1], r[1], r[2])
+    end
+  end
+  vim.bo[buf].modifiable = false
+
+  local function map(k, fn)
+    vim.keymap.set("n", k, fn, { buffer = buf, nowait = true, silent = true })
+  end
+  map("<Left>",  function() move_perm_choice(-1) end)
+  map("h",       function() move_perm_choice(-1) end)
+  map("<Right>", function() move_perm_choice(1) end)
+  map("l",       function() move_perm_choice(1) end)
+  map("<CR>", function()
+    local q = state.perm
+    if q then resolve_permission(q.options[q.choice].kind) end
+  end)
+  map("<Esc>", function() resolve_permission("deny") end)
+  map("q",     function() resolve_permission("deny") end)
+  for i = 1, 3 do
+    map(tostring(i), function()
+      local q = state.perm
+      if q and q.options[i] then q.choice = i; resolve_permission(q.options[i].kind) end
+    end)
+  end
+
+  -- If the float vanishes by any path OTHER than resolve_permission (which nils
+  -- state.perm first), fall back to a reject so the CLI isn't left waiting.
+  vim.api.nvim_create_autocmd("WinClosed", {
+    pattern = tostring(win),
+    once    = true,
+    callback = function()
+      if state.perm and state.perm.win == win then resolve_permission("deny") end
+    end,
+  })
+end
+
+-- Render a permission card from an inbound can_use_tool control_request and arm
+-- the lock. Pauses the spinner (Claude is genuinely blocked on us, so a spinner
+-- would lie); resolve_permission restarts it.
+local function show_permission_card(event)
+  local req = event.request or {}
+  local p = {
+    request_id  = event.request_id,
+    tool        = req.tool_name or "",
+    display     = req.display_name or req.tool_name or "tool",
+    desc        = req.description or "",
+    input       = req.input,
+    suggestions = req.permission_suggestions,
+    choice      = 1,
+  }
+  -- Collect rule strings (suggestions[].rules[].ruleContent) for the Patterns
+  -- line and to decide whether "Allow always" is offered — only when the CLI gave
+  -- us rules to persist.
+  local rules = {}
+  for _, sug in ipairs(p.suggestions or {}) do
+    for _, r in ipairs(sug.rules or {}) do
+      if r.ruleContent then rules[#rules + 1] = r.ruleContent end
+    end
+  end
+  p.rules   = rules
+  p.options = { { label = "Allow once", kind = "once" } }
+  if #rules > 0 then p.options[#p.options + 1] = { label = "Allow always", kind = "always" } end
+  p.options[#p.options + 1] = { label = "Reject", kind = "deny" }
+
+  stop_spinner()
+  clear_hint()   -- drop any stale "Working…" hint so nothing peeks behind the float
+
+  -- Dismiss any open chat bar BEFORE opening the card. The bar anchors SW at the
+  -- same panel column as the card, so leaving it open overlaps the card and steals
+  -- focus/draw order — the card then can't be driven and falls through to a reject.
+  -- Closing via the bar's own close() saves the draft; we reopen it on resolve.
+  state.perm_reopen_bar = false
+  if state.chat_win and vim.api.nvim_win_is_valid(state.chat_win) then
+    state.perm_reopen_bar = true
+    if state.chat_close then pcall(state.chat_close) end
+  end
+
+  state.perm = p
+  open_permission_float(p)
+  render_perm_choice_row()
+end
+Gate.show_permission_card = show_permission_card
+
+-- ─── Diff-review card (Goal 14.3) ─────────────────────────────────────────────
+-- Reuses the permission card's floating-panel mechanism (SW geometry, scroll
+-- hardening, resize tracking, choice-row highlight paint) for the Accept/Reject
+-- decision on a proposed file diff, so resolving an edit feels like every other
+-- panel decision instead of requiring a jump to the diff window's winbar. The
+-- winbar + <leader>ca/cx keymaps (claude_diff.lua) stay wired as a fallback —
+-- this card is additive, not a replacement path for either.
+
+local function render_diff_card_choice_row()
+  local d = state.diff_card
+  if not (d and d.buf and vim.api.nvim_buf_is_valid(d.buf)) then return end
+  state.diff_card_ns = state.diff_card_ns or vim.api.nvim_create_namespace("ClaudeDiffCardRow")
+  local segs, line = {}, "  "
+  for i, opt in ipairs(d.options) do
+    if i > 1 then line = line .. "    " end
+    local label = ((i == d.choice) and "❯ " or "  ") .. opt.label
+    local b0 = #line
+    line = line .. label
+    segs[#segs + 1] = { b0 = b0, b1 = #line, active = (i == d.choice) }
+  end
+  vim.bo[d.buf].modifiable = true
+  vim.api.nvim_buf_set_lines(d.buf, d.row, d.row + 1, false, { line })
+  vim.bo[d.buf].modifiable = false
+  vim.api.nvim_buf_clear_namespace(d.buf, state.diff_card_ns, d.row, d.row + 1)
+  for _, s in ipairs(segs) do
+    vim.api.nvim_buf_add_highlight(d.buf, state.diff_card_ns,
+      s.active and "ClaudeQuestion" or "ClaudeDim", d.row, s.b0, s.b1)
+  end
+end
+
+local function move_diff_card_choice(delta)
+  local d = state.diff_card
+  if not d then return end
+  d.choice = (d.choice - 1 + delta) % #d.options + 1
+  render_diff_card_choice_row()
+end
+
+-- Close the card float WITHOUT touching the diff itself. Used both when a
+-- choice resolves it and when the diff resolves some other way (the winbar
+-- <leader>ca/cx fallback, or the diff window simply being closed) and the
+-- now-stale card needs to go away.
+local function close_diff_card()
+  local d = state.diff_card
+  if not d then return end
+  state.diff_card = nil
+  if d.resize_close then pcall(d.resize_close) end
+  if d.win and vim.api.nvim_win_is_valid(d.win) then
+    pcall(vim.api.nvim_win_close, d.win, true)
+  end
+end
+Gate.close_diff_card = close_diff_card
+
+-- kind is "accept" | "reject" — routes straight into claude_diff's existing
+-- accept_all/reject_all (same functions the winbar keymaps call), so a new-file
+-- reject still deletes the file and a write failure still warns + keeps the
+-- diff open exactly as it does via the fallback path.
+local function resolve_diff_card(kind)
+  local d = state.diff_card
+  if not d then return end
+  close_diff_card()
+  local diff = require("utils.claude_diff")
+  if kind == "accept" then diff.accept_all() else diff.reject_all() end
+end
+Gate.resolve_diff_card = resolve_diff_card
+
+local function open_diff_card_float(d)
+  local lines, body_hl = {}, {}
+  lines[#lines + 1] = "  " .. d.display
+  body_hl[#body_hl + 1] = { #lines - 1, "ClaudeProse" }
+  lines[#lines + 1] = ""                                  -- spacer
+  lines[#lines + 1] = ""                                  -- button-row placeholder
+  d.row = #lines - 1                                       -- 0-indexed button row
+  lines[#lines + 1] = "  ←/→ select · ⏎ confirm · a accept · x reject"
+  body_hl[#body_hl + 1] = { #lines - 1, "ClaudeDim" }
+
+  -- Shared geometry/scroll/resize helpers (panel_float_geom, harden_float_scroll,
+  -- attach_panel_float_resize) — same ones the permission/question/chat floats use.
+  local float_col, float_w = panel_float_geom()
+  local function card_height(w)
+    local disp_rows = 0
+    for _, l in ipairs(lines) do
+      disp_rows = disp_rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / w))
+    end
+    return math.min(disp_rows, math.max(math.floor(vim.o.lines / 2), 3))
+  end
+  local float_h = card_height(float_w)
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile  = false
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  d.buf = buf
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative  = "editor",
+    anchor    = "SW",
+    row       = float_bottom_row(),
+    col       = float_col,
+    width     = float_w,
+    height    = float_h,
+    border    = "rounded",
+    style     = "minimal",
+    title     = " ⚠ Review changes ",
+    title_pos = "left",
+    zindex    = 60,
+  })
+  d.win = win
+  -- Same amber outline as the permission card — both are "your decision needed"
+  -- cards; a distinct colour per card type would read as two different systems.
+  vim.wo[win].winhighlight =
+    "FloatBorder:ClaudePermBorder,FloatTitle:ClaudePermBorder,NormalFloat:ClaudeBarBg"
+  vim.wo[win].wrap        = true
+  vim.wo[win].linebreak   = true
+  vim.wo[win].breakindent = true
+  vim.wo[win].cursorline  = false
+  harden_float_scroll(win)
+  d.resize_close = attach_panel_float_resize(win, "ClaudeDiffCardFloat", function(_, _, w)
+    pcall(vim.api.nvim_win_set_height, win, card_height(w))
+  end)
+
+  for _, h in ipairs(body_hl) do
+    vim.api.nvim_buf_add_highlight(buf, -1, h[2], h[1], 0, -1)
+  end
+  vim.bo[buf].modifiable = false
+
+  local function map(k, fn)
+    vim.keymap.set("n", k, fn, { buffer = buf, nowait = true, silent = true })
+  end
+  map("<Left>",  function() move_diff_card_choice(-1) end)
+  map("h",       function() move_diff_card_choice(-1) end)
+  map("<Right>", function() move_diff_card_choice(1) end)
+  map("l",       function() move_diff_card_choice(1) end)
+  map("<CR>", function()
+    local q = state.diff_card
+    if q then resolve_diff_card(q.options[q.choice].kind) end
+  end)
+  map("a", function() resolve_diff_card("accept") end)
+  map("x", function() resolve_diff_card("reject") end)
+  -- Unlike the permission card, Esc/q only DISMISS the card — the diff itself is
+  -- not blocking a waiting CLI, so there's no reason to force a decision. The
+  -- winbar keymaps remain live on the diff window as the fallback.
+  map("<Esc>", close_diff_card)
+  map("q",     close_diff_card)
+
+  vim.api.nvim_create_autocmd("WinClosed", {
+    pattern = tostring(win),
+    once    = true,
+    callback = function()
+      if state.diff_card and state.diff_card.win == win then
+        state.diff_card = nil -- dismissed some other way; not a decision
+      end
+    end,
+  })
+end
+
+local function show_diff_card(path, kind)
+  local d = {
+    display = (kind == "new")
+      and ("New file: " .. vim.fn.fnamemodify(path, ":t"))
+      or  ("Modified: " .. vim.fn.fnamemodify(path, ":t")),
+    choice  = 1,
+    options = { { label = "Accept", kind = "accept" }, { label = "Reject", kind = "reject" } },
+  }
+
+  -- Dismiss any open chat bar BEFORE opening the card — same SW-column overlap
+  -- the permission card guards against (both anchor to the same panel column).
+  state.diff_card_reopen_bar = false
+  if state.chat_win and vim.api.nvim_win_is_valid(state.chat_win) then
+    state.diff_card_reopen_bar = true
+    if state.chat_close then pcall(state.chat_close) end
+  end
+
+  state.diff_card = d
+  open_diff_card_float(d)
+  render_diff_card_choice_row()
+end
+Gate.show_diff_card = show_diff_card
+
+return Gate

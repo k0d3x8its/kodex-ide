@@ -29,8 +29,8 @@ local mod = {}
 -- Single require-prefix constant for intra-package modules. When the panel is
 -- extracted as a standalone plugin (planned), the move to lua/kodex-claude/ is a
 -- one-line change here per module (Goal 15 packaging rule).
-local P = "utils.claude."
-local core = require(P .. "core")
+local require_prefix = "utils.claude."
+local core = require(require_prefix .. "core")
 
 -- Full path required — ~/.local/bin is only on PATH in interactive bash, never
 -- in Neovim's environment. Matches the OPENCODE_BIN pattern in opencode.lua

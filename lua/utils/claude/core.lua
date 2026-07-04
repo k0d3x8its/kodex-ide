@@ -7,16 +7,16 @@
 -- render modules need. Extracted from the former monolithic claude.lua (Goal 15).
 --
 -- `set_bottom_pad` lives in init.lua (couples to the chat-bar pad logic); buf_append
--- calls it through a wired hook (M.wire_set_bottom_pad) to avoid a require cycle.
+-- calls it through a wired hook (Core.wire_set_bottom_pad) to avoid a require cycle.
 
-local M = {}
+local Core = {}
 
 -- ─── Shared state ─────────────────────────────────────────────────────────────
 --
--- Exposed as M.state; init re-exports it as mod.state so claude_diff.lua and the
+-- Exposed as Core.state; init re-exports it as mod.state so claude_diff.lua and the
 -- other package modules read/mutate the SAME table (identity matters).
 
-M.state = {
+Core.state = {
   -- true while the panel window is visible; gates the FileChangedShell interceptor
   -- in claude_diff.lua so diff events are only captured during claude sessions.
   claude_active = false,
@@ -197,9 +197,9 @@ M.state = {
   -- knows to reopen it (draft restored) once the diff is resolved.
   diff_card_reopen_bar = false,
 }
-local state = M.state
+local state = Core.state
 
-M.opts = {
+Core.opts = {
   width_pct = 0.40,
   -- Caveman intensity for the panel's claude subprocess. Default "off" so the
   -- panel speaks normally even when the user's interactive sessions default to
@@ -207,10 +207,10 @@ M.opts = {
   -- env override). Set to false/nil to inherit the user's global default.
   caveman_mode = "off",
 }
-local opts = M.opts
+local opts = Core.opts
 
 -- set_bottom_pad is defined in init.lua (pad/chat-bar coupling) and wired in
--- via M.wire_set_bottom_pad; buf_append calls it through this forward local.
+-- via Core.wire_set_bottom_pad; buf_append calls it through this forward local.
 local set_bottom_pad
 
 -- Panel width in columns, recomputed on every open so the panel tracks
@@ -324,14 +324,14 @@ end
 
 -- ─── Exports ──────────────────────────────────────────────────────────────────
 
-M.panel_width = panel_width
-M.sep_line    = sep_line
-M.buf_append  = buf_append
-M.hl_lines    = hl_lines
-M.hl_range    = hl_range
-M.free_below  = free_below
+Core.panel_width = panel_width
+Core.sep_line    = sep_line
+Core.buf_append  = buf_append
+Core.hl_lines    = hl_lines
+Core.hl_range    = hl_range
+Core.free_below  = free_below
 
 --- Wire init.lua's set_bottom_pad into buf_append's auto-follow pad path.
-function M.wire_set_bottom_pad(fn) set_bottom_pad = fn end
+function Core.wire_set_bottom_pad(bottom_pad_setter) set_bottom_pad = bottom_pad_setter end
 
-return M
+return Core

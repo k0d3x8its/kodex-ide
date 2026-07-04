@@ -260,6 +260,25 @@ local function question_answered(q, i)
   return q.picks[i] ~= nil
 end
 
+-- The user's recorded answer for question i: an ARRAY of selected labels for a
+-- multiSelect (possibly empty), or the single picked value (custom text / option
+-- label) otherwise, or nil when nothing is picked yet. Callers shape it: the wire
+-- wants the array verbatim, the summary joins it.
+local function recorded_answer(q, i)
+  local question = q.questions[i]
+  if question.multiSelect then
+    local labels, sel = {}, q.sel[i] or {}
+    for oi, opt in ipairs(question.options or {}) do
+      if sel[oi] then labels[#labels + 1] = opt.label end
+    end
+    return labels
+  end
+  local p = q.picks[i]
+  if p and p.kind == "custom" then return p.text
+  elseif p and p.kind == "option" then return p.label end
+  return nil
+end
+
 -- Build the answers map from every question's recorded pick and submit ONE
 -- control_response: allow with updatedInput.answers (the § Q-ASK wire shape; reuses
 -- send_permission_response's allow path, which sends updatedInput verbatim).
@@ -268,20 +287,11 @@ local function submit_question_answers()
   if not q then return end
   local answers = {}
   for i, question in ipairs(q.questions) do
-    local key = question.question
-    if question.multiSelect then
-      local labels, sel = {}, q.sel[i] or {}
-      for oi, opt in ipairs(question.options or {}) do
-        if sel[oi] then labels[#labels + 1] = opt.label end
-      end
-      answers[key] = labels
-    else
-      local p = q.picks[i]
-      if p and p.kind == "custom" then
-        answers[key] = p.text
-      elseif p and p.kind == "option" then
-        answers[key] = p.label
-      end
+    local ans = recorded_answer(q, i)
+    -- multiSelect always records its (possibly empty) array; single-select only
+    -- when actually picked (nil = unanswered, leave the key absent).
+    if question.multiSelect or ans ~= nil then
+      answers[question.question] = ans
     end
   end
   local merged = vim.deepcopy(q.input or {})
@@ -299,17 +309,15 @@ local function advance_or_submit()
   local q = state.qask
   if not q then return end
   local n = #q.questions
-  for i = 1, n do
-    if not question_answered(q, i) then
-      -- Walk forward from the current question to the next unanswered one.
-      for step = 1, n do
-        local cand = (q.qi - 1 + step) % n + 1
-        if not question_answered(q, cand) then
-          q.qi = cand
-          render_question_card()
-          return
-        end
-      end
+  -- Walk forward from the current question to the next still-unanswered one
+  -- (wrapping). The walk visits all n, so if it finds none every question is
+  -- answered → submit.
+  for step = 1, n do
+    local cand = (q.qi - 1 + step) % n + 1
+    if not question_answered(q, cand) then
+      q.qi = cand
+      render_question_card()
+      return
     end
   end
   submit_question_answers()
@@ -333,17 +341,11 @@ local function question_summary(q)
   local parts = {}
   for i, question in ipairs(q.questions) do
     parts[#parts + 1] = '- "' .. (question.question or "") .. '"'
-    local ans
+    local ans = recorded_answer(q, i)
+    -- multiSelect returns an array — join it, or drop to nil when nothing selected
+    -- so it reads "(No answer provided)" like an unpicked single-select.
     if question.multiSelect then
-      local labels, sel = {}, q.sel[i] or {}
-      for oi, opt in ipairs(question.options or {}) do
-        if sel[oi] then labels[#labels + 1] = opt.label end
-      end
-      if #labels > 0 then ans = table.concat(labels, ", ") end
-    else
-      local p = q.picks[i]
-      if p and p.kind == "custom" then ans = p.text
-      elseif p and p.kind == "option" then ans = p.label end
+      ans = #ans > 0 and table.concat(ans, ", ") or nil
     end
     parts[#parts + 1] = ans and ("  Answer: " .. ans) or "  (No answer provided)"
   end

@@ -1040,6 +1040,17 @@ local function dispatch(event)
     if model ~= "" then state.model_display = model end  -- modal statusline model
     local raw_ver = event.claude_code_version or event.version or ""
     patch_banner(model, raw_ver)
+    -- Capture the advertised slash commands (plain-string names) for the chat
+    -- bar's "/" menu. Fires every turn but the list is stable, so only take it
+    -- once (first non-empty wins; a later empty init must not wipe it).
+    if type(event.slash_commands) == "table" and #event.slash_commands > 0
+        and not state.slash_commands then
+      state.slash_commands = event.slash_commands
+      -- Persist for next session so the "/" menu works before the first message
+      -- (the CLI only advertises the list here, AFTER the first turn). Deferred so
+      -- the require doesn't run on every non-init event.
+      require(require_prefix .. "slash").save_cache(event.slash_commands)
+    end
     state.system_ready = true
     -- working hint already set by send(); don't clobber it
 

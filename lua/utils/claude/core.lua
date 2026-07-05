@@ -196,6 +196,12 @@ Core.state = {
   -- True while a diff card is up that dismissed an open chat bar, so on_diff_close
   -- knows to reopen it (draft restored) once the diff is resolved.
   diff_card_reopen_bar = false,
+
+  -- Slash-command names advertised by the CLI in the system/init event
+  -- (`slash_commands[]`, ~200 plain-string names, no descriptions). Captured once
+  -- and reused to drive the chat bar's "/" command menu (see claude/slash.lua).
+  -- Names only — descriptions are resolved separately from skill/command files.
+  slash_commands = nil,
 }
 local state = Core.state
 

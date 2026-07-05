@@ -38,6 +38,7 @@ local gate = require(require_prefix .. "gate")
 local process = require(require_prefix .. "process")
 local render = require(require_prefix .. "render")
 local slash = require(require_prefix .. "slash")
+local effort = require(require_prefix .. "effort")
 
 -- Full path required — ~/.local/bin is only on PATH in interactive bash, never
 -- in Neovim's environment. Matches the OPENCODE_BIN pattern in opencode.lua
@@ -832,6 +833,15 @@ slash.wire({
 })
 mod._slash = slash   -- test hook
 
+-- ─── Effort slider (/effort) ──────────────────────────────────────────────────
+-- The reasoning-effort modal (claude/effort.lua). Same float helpers as the slash
+-- menu; confirming respawns the process with the new --effort (see mod.pick_effort).
+effort.wire({
+  panel_float_geom    = panel_float_geom,
+  harden_float_scroll = harden_float_scroll,
+})
+mod._effort = effort   -- test hook
+
 -- ─── Question card (AskUserQuestion) ──────────────────────────────────────────
 -- The AskUserQuestion card moved to claude/question.lua (Goal 15.4). It reaches
 -- back into init's float/pad/spinner/permission machinery — inject those helpers
@@ -1140,6 +1150,13 @@ mod._stop_process     = process.stop_process
 -- Public submit used by the input float: send immediately when idle, otherwise
 -- queue (type-ahead while Claude is working, like the Claude Code TUI).
 local function submit(text)
+  -- Intercept the panel-local /effort command: "/effort <level>" applies directly,
+  -- a bare "/effort" opens the slider. Never sent to the CLI as a message.
+  local level = text:match("^/effort%s*(%S*)$")
+  if level ~= nil then
+    mod.pick_effort(level ~= "" and level or nil)
+    return
+  end
   if state.working then
     enqueue(text)
   else
@@ -2076,6 +2093,42 @@ function mod.pick_model()
       vim.log.levels.INFO
     )
   end)
+end
+
+-- Valid reasoning-effort levels (must match the CLI's --effort choices).
+local EFFORT_LEVELS = { low = true, medium = true, high = true, xhigh = true, max = true }
+
+-- Apply an effort level: store it and tear down the live process so the next
+-- message respawns with --effort. Like a model change, this resets conversation
+-- context, so we say so. Shared by the slider's confirm and the "/effort <level>"
+-- shorthand.
+local function apply_effort(level)
+  state.effort = level
+  local had_session = state.job_id ~= nil
+  stop_process()
+  vim.notify(
+    "Claude effort → " .. level ..
+    (had_session and "  (new session — context reset)" or ""),
+    vim.log.levels.INFO
+  )
+end
+
+--- Set the reasoning-effort level for the panel session (`/effort`).
+-- With a valid `level` arg ("/effort high") it applies immediately; otherwise it
+-- opens the slider preselected at the current level. Effort is a spawn-time flag,
+-- so applying respawns the process (see apply_effort).
+function mod.pick_effort(level)
+  if level and EFFORT_LEVELS[level] then
+    apply_effort(level)
+    return
+  end
+  effort.open(state.effort or "medium", apply_effort)
+end
+
+--- The current effort level for the modal statusline (defaults to "medium" when
+--- unset, matching the CLI's shown default). Shown right of the model.
+function mod.current_effort()
+  return effort.current()
 end
 
 --- Friendly display name of the panel's current model (e.g. "Sonnet 4.6") for the

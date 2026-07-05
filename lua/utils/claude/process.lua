@@ -165,6 +165,13 @@ local function build_args()
     table.insert(args, "--model")
     table.insert(args, state.model)
   end
+  -- --effort sets the session reasoning-effort level (low/medium/high/xhigh/max);
+  -- nil leaves it unset so the model default applies. Spawn-time flag, so the
+  -- /effort slider respawns the process to change it (same as --model).
+  if state.effort and state.effort ~= "" then
+    table.insert(args, "--effort")
+    table.insert(args, state.effort)
+  end
   return args
 end
 

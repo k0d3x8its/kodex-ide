@@ -17,9 +17,20 @@ return {
       -- the buffer listed — mksession then writes it into the session file. On
       -- restore, toggleterm tries to reopen the saved terminal but the
       -- reconstructed object has direction=nil, which hits terminal.lua:466.
+      -- pre_save_cmds fire at VimLeavePre (exit), so tearing panels down here is
+      -- harmless — nvim is quitting.
       pre_save_cmds = {
         "lua require('toggleterm').toggle_all(true)",
         "lua for _,b in ipairs(vim.api.nvim_list_bufs()) do if vim.bo[b].buftype=='terminal' then pcall(vim.api.nvim_buf_delete,b,{force=true}) end end",
+        -- Purge the Claude panel before the session is written. sessionoptions
+        -- carries `localoptions` (core/options.lua), so mksession serialises each
+        -- window's `setlocal` values — including the panel window's `nonumber`
+        -- (set window-local in open_panel_window). Left in the session, that
+        -- nonumber replays onto a restored FILE window on the next launch and the
+        -- editor loses its line numbers. Closing the panel window + wiping its
+        -- scratch buffer here means only real editor windows (which keep the
+        -- global number=true) reach mksession, so nothing turns numbers off.
+        "lua pcall(function() local c=require('utils.claude'); if c.state.panel_win and vim.api.nvim_win_is_valid(c.state.panel_win) then vim.api.nvim_win_close(c.state.panel_win,true) end; if c.state.panel_buf and vim.api.nvim_buf_is_valid(c.state.panel_buf) then vim.api.nvim_buf_delete(c.state.panel_buf,{force=true}) end end)",
       },
     })
 

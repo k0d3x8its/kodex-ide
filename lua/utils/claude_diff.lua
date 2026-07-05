@@ -197,6 +197,21 @@ end
 
 function M.accept_all()
   local s = M.state
+  -- Capture before/after for the post-approval transcript block (Goal 14.4)
+  -- NOW, before any mutation below overwrites orig_buf. Both buffers are pristine
+  -- in every accept path (prewrite: orig=disk / scratch=proposed; post-write:
+  -- orig=old buffer / scratch=new disk). Rendered only after a SUCCESSFUL accept;
+  -- pcall so a render failure can never block the accept/write flow.
+  local blk_path, blk_old, blk_new
+  if s.orig_buf and vim.api.nvim_buf_is_valid(s.orig_buf)
+      and s.scratch and vim.api.nvim_buf_is_valid(s.scratch) then
+    blk_path = s.current   -- for filetype → treesitter language of the block
+    blk_old  = vim.api.nvim_buf_get_lines(s.orig_buf, 0, -1, false)
+    blk_new  = vim.api.nvim_buf_get_lines(s.scratch, 0, -1, false)
+  end
+  local function emit_transcript_block()
+    if blk_old and blk_new then pcall(claude.render_edit_block, blk_path, blk_old, blk_new) end
+  end
   -- Pre-write gate: nothing to write — accepting RELEASES the held permission
   -- request as "allow"; the CLI does the write itself right after. Flag the path
   -- approved first so the FCS the write triggers reloads silently (no second diff).
@@ -215,6 +230,7 @@ function M.accept_all()
     log("prewrite-accept:" .. tostring(s.current))
     claude.on_prewrite_resolve(true)
     close_diff()
+    emit_transcript_block()
     return
   end
   -- The original buffer can be :bd'd while the scratch diff is still open;
@@ -249,6 +265,7 @@ function M.accept_all()
   end
   log("accept-all:" .. s.current)
   close_diff()
+  emit_transcript_block()
 end
 
 function M.reject_all()

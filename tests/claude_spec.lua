@@ -215,6 +215,8 @@ H.check("T4 spawn has NO positional message / session flags",
   not argv_contains(a4, "hello claude")
   and not argv_contains(a4, "--session-id")
   and not argv_contains(a4, "--resume"), table.concat(a4, " "))
+H.check("T4 default spawn omits --effort (level unset)",
+  not argv_contains(a4, "--effort"), table.concat(a4, " "))
 H.check("T4 message sent as stream-json over stdin",
   last_sent_text() == "hello claude", tostring(last_sent_text()))
 H.check("T4 working flag set during send",       claude.state.working == true)
@@ -962,5 +964,40 @@ H.check("T26 fenced user message renders a code gutter (▎)",
 H.check("T26 fenced user message drops literal ``` rows",
   echo:find("```", 1, true) == nil, echo)
 claude.state.host_ctx_enabled = true    -- restore
+
+-- ── T27: /effort — apply level respawns with --effort, statusline + slider ─────
+-- apply mechanism mirrors --model: set state.effort + tear down the process so the
+-- next send respawns with --effort <level>.
+H.check("T27 current_effort defaults to medium when unset",
+  (function() claude.state.effort = nil; return claude.current_effort() end)() == "medium")
+
+-- "/effort high" shorthand applies immediately (no slider) and updates the label.
+claude.pick_effort("high")
+H.check("T27 pick_effort(level) sets state.effort", claude.state.effort == "high")
+H.check("T27 current_effort reflects the pick", claude.current_effort() == "high")
+H.check("T27 applying a level tears down the live process (respawn on next send)",
+  claude.state.job_id == nil)
+
+-- An invalid level is ignored (opens the slider instead of setting garbage).
+claude.state.effort = "high"
+claude.pick_effort("bogus")
+H.check("T27 invalid level does not overwrite the effort", claude.state.effort == "high")
+require("utils.claude.effort").close()   -- dismiss the slider the invalid arg opened
+
+-- Next send carries --effort <level>.
+claude.state.job_id = nil
+claude.state.effort  = "xhigh"
+user_send("go")
+local ae = last_argv()
+H.check("T27 respawn argv carries --effort xhigh",
+  argv_contains(ae, "--effort") and argv_contains(ae, "xhigh"), table.concat(ae, " "))
+
+-- The slider modal: open → move → confirm hands back the chosen level.
+local effort = require("utils.claude.effort")
+local picked
+effort.open("medium", function(lvl) picked = lvl end)
+H.check("T27 slider opens", effort.active() == true)
+effort.close()
+H.check("T27 slider closes", effort.active() == false)
 
 H.summary("claude")

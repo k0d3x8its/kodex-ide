@@ -100,6 +100,12 @@ Core.state = {
   -- spawn-time flag, so the running session can't switch mid-flight).
   model         = nil,
 
+  -- Reasoning-effort level passed to --effort on (re)spawn (low/medium/high/xhigh/
+  -- max). nil = leave --effort unset so the CLI/model default applies. Set by the
+  -- /effort slider (claude/effort.lua); like --model it's a spawn-time flag, so
+  -- changing it respawns the process. The statusline shows it right of the model.
+  effort        = nil,
+
   -- Permission mode passed to --permission-mode on (re)spawn. "default" pairs
   -- with the hidden --permission-prompt-tool stdio flag (build_args) so the CLI
   -- routes tool-permission decisions to us via can_use_tool control_requests

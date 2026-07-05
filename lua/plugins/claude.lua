@@ -248,6 +248,19 @@ return {
       -- Permission card outline: amber/caution, deliberately distinct from the
       -- clay chat-bar border so the card never reads as the reply input.
       vim.api.nvim_set_hl(0, "ClaudePermBorder",    { fg = "#E5C07B", bg = bar_bg, bold = true })
+
+      -- Slash-command menu ("/" picker above the chat bar). Flush surface with the
+      -- bar (same gray bg), clay border. The highlighted row is a full-width clay
+      -- band with dark text (mirrors the OpenCode reference). Command names clay,
+      -- descriptions dim. In the INPUT line the typed "/query" span is clay while
+      -- it's still a live command prefix, red once it matches nothing.
+      vim.api.nvim_set_hl(0, "ClaudeSlashBg",      { bg = bar_bg })
+      vim.api.nvim_set_hl(0, "ClaudeSlashBorder",  { fg = "#D97757", bg = bar_bg })
+      vim.api.nvim_set_hl(0, "ClaudeSlashSel",     { fg = "#1A1A1A", bg = "#D97757", bold = true })
+      vim.api.nvim_set_hl(0, "ClaudeSlashName",    { fg = "#D97757" })
+      vim.api.nvim_set_hl(0, "ClaudeSlashDesc",    { fg = "#6272A4" })
+      vim.api.nvim_set_hl(0, "ClaudeSlashMatch",   { fg = "#D97757", bold = true })
+      vim.api.nvim_set_hl(0, "ClaudeSlashNoMatch", { fg = "#FF5555" })
     end
 
     define_highlights()

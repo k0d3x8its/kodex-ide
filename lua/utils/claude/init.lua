@@ -751,6 +751,10 @@ render.wire({
 mod.expand_result = render.expand_result
 mod._foldtext     = render._foldtext
 
+-- Post-approval edit hunk (Goal 14.4): claude_diff calls this after an accepted
+-- edit to drop the numbered red/green block into the transcript.
+mod.render_edit_block = render.render_edit_hunk
+
 -- ─── Stream-json event dispatcher (Goal 6.3) ──────────────────────────────────
 
 -- Reply to a can_use_tool control_request over stdin (the permission gate).

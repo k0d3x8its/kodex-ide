@@ -178,6 +178,18 @@ return {
       -- Reuses the header clay so the diff palette is consistent with the panel.
       vim.api.nvim_set_hl(0, "ClaudeDiffAdd", { bg = "#D97757" })
 
+      -- Post-approval transcript hunk (Goal 14.4): full-line bg bands for the
+      -- numbered red/green diff block dropped into the panel after an edit is
+      -- accepted. Reuses the side-by-side review lens greens/reds so the inline
+      -- block and the vimdiff review read as the same palette.
+      vim.api.nvim_set_hl(0, "ClaudeHunkAdd", { bg = "#223a29" })  -- + added line (darkened so green code text pops)
+      vim.api.nvim_set_hl(0, "ClaudeHunkDel", { bg = "#47222e" })  -- - removed line (darkened so red code text pops)
+      -- Line-number gutter colours in the hunk block: green for added rows, red
+      -- for removed (brighter than the band so they read on top of it); context
+      -- rows keep the dim ClaudeDim number. Mirrors the Claude Code TUI.
+      vim.api.nvim_set_hl(0, "ClaudeHunkNumAdd", { fg = "#8fbf9f" })  -- + line number
+      vim.api.nvim_set_hl(0, "ClaudeHunkNumDel", { fg = "#c88a98" })  -- - line number
+
       -- ── Review diff: per-window red/green colour lenses ───────────────────
       -- Native `diffthis` is SYMMETRIC: a line unique to the LEFT (removed) and
       -- a line unique to the RIGHT (added) BOTH render under `DiffAdd`, because

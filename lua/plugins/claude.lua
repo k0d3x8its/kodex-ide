@@ -261,6 +261,15 @@ return {
       vim.api.nvim_set_hl(0, "ClaudeSlashDesc",    { fg = "#6272A4" })
       vim.api.nvim_set_hl(0, "ClaudeSlashMatch",   { fg = "#D97757", bold = true })
       vim.api.nvim_set_hl(0, "ClaudeSlashNoMatch", { fg = "#FF5555" })
+
+      -- /effort slider modal. Green axis + selected level (mirrors the CC TUI's
+      -- Faster─Smarter picker), dim unselected labels, gray footer hint. Green is
+      -- the same terminal-green as the "❯" prompt arrow (ClaudeArrow).
+      vim.api.nvim_set_hl(0, "ClaudeEffortTitle", { fg = "#5AF78E", bold = true })
+      vim.api.nvim_set_hl(0, "ClaudeEffortAxis",  { fg = "#5AF78E" })
+      vim.api.nvim_set_hl(0, "ClaudeEffortSel",   { fg = "#5AF78E", bold = true })
+      vim.api.nvim_set_hl(0, "ClaudeEffortDim",   { fg = "#6272A4" })
+      vim.api.nvim_set_hl(0, "ClaudeEffortHint",  { fg = "#6272A4" })
     end
 
     define_highlights()

@@ -37,6 +37,7 @@ local question = require(require_prefix .. "question")
 local gate = require(require_prefix .. "gate")
 local process = require(require_prefix .. "process")
 local render = require(require_prefix .. "render")
+local slash = require(require_prefix .. "slash")
 
 -- Full path required — ~/.local/bin is only on PATH in interactive bash, never
 -- in Neovim's environment. Matches the OPENCODE_BIN pattern in opencode.lua
@@ -822,6 +823,15 @@ mod._render_todo_lines = widgets.render_todo_lines
 mod._plan_complete     = widgets.plan_complete
 mod._apply_task_tool   = widgets.apply_task_tool
 
+-- ─── Slash-command menu ───────────────────────────────────────────────────────
+-- The chat bar's "/" command menu (claude/slash.lua). Injects the same two
+-- init-owned float helpers the other floats use; the menu floats above the bar.
+slash.wire({
+  panel_float_geom    = panel_float_geom,
+  harden_float_scroll = harden_float_scroll,
+})
+mod._slash = slash   -- test hook
+
 -- ─── Question card (AskUserQuestion) ──────────────────────────────────────────
 -- The AskUserQuestion card moved to claude/question.lua (Goal 15.4). It reaches
 -- back into init's float/pad/spinner/permission machinery — inject those helpers
@@ -1232,10 +1242,12 @@ local function open_chat_float(title, callback, opts)
   -- bar. Called on open, on input grow, and on resize.
   local MAX_INPUT_ROWS = 12
   local cur_rows       = 1
+  local bar_h          = 1   -- last interior height (rows+meters); slash menu floats above bar_h+2
   local function apply_layout()
     if not vim.api.nvim_win_is_valid(win) then return end
     local mrows = render_meters()
     local h     = cur_rows + mrows
+    bar_h = h
     local c     = vim.api.nvim_win_get_config(win)
     if c.height ~= h then
       c.height = h
@@ -1260,6 +1272,78 @@ local function open_chat_float(title, callback, opts)
     end
   end
 
+  -- ── Slash-command menu driver ──────────────────────────────────────────────
+  -- When the input line is "/<query>" (no space yet), pop the command menu above
+  -- the bar and colour the typed span (valid prefix vs no-match). A space after
+  -- the command, or any non-slash line, closes the menu. Runs on every text
+  -- change, after fit_height_now (so bar_h is current).
+  local slash_ns = vim.api.nvim_create_namespace("claude_slash_input")
+  local function on_slash_accept()
+    -- A command was inserted ("/name "): re-fit + keep the cursor typing in the bar.
+    fit_height_now()
+    if vim.api.nvim_win_is_valid(win) then
+      pcall(vim.api.nvim_set_current_win, win)
+      vim.cmd("startinsert!")
+    end
+  end
+  local function update_slash_menu()
+    if not vim.api.nvim_buf_is_valid(ibuf) then return end
+    vim.api.nvim_buf_clear_namespace(ibuf, slash_ns, 0, -1)
+    local lnum = vim.api.nvim_buf_line_count(ibuf) - 1
+    local line = vim.api.nvim_buf_get_lines(ibuf, lnum, lnum + 1, false)[1] or ""
+    -- CRITICAL: a prompt buffer keeps the "❯ " prompt AS part of the buffer line
+    -- (real typed line is "❯ /caveman", not "/caveman"), so strip the prompt before
+    -- matching. prefix_len is where the typed text starts (the "/" byte column),
+    -- used to anchor the colour extmark on the right span.
+    local prompt = vim.fn.prompt_getprompt(ibuf) or ""
+    local prefix_len = 0
+    if prompt ~= "" and line:sub(1, #prompt) == prompt then
+      prefix_len = #prompt
+    end
+    local typed = line:sub(prefix_len + 1)
+    -- Only a leading "/" with no whitespace => still composing a command: drive the
+    -- picker menu above the bar and colour the partial prefix while it still matches.
+    local query = typed:match("^/([^%s]*)$")
+    if query ~= nil then
+      -- Menu floats just above the bar. Use the bar window's LIVE height (interior +
+      -- 2 border) so the small gap stays constant regardless of the meter row / wrap
+      -- growth — a stale tracked height put the menu a row too high.
+      local bar_rows = bar_h + 2
+      if vim.api.nvim_win_is_valid(win) then
+        bar_rows = vim.api.nvim_win_get_config(win).height + 2
+      end
+      slash.open(ibuf, query, bar_rows, on_slash_accept)
+      -- Colour the "/query" span clay ONLY while it's still a live command prefix;
+      -- once the typed letters match nothing, leave it PLAIN (not red) — the
+      -- highlight signals "this is a potential command", then drops off when it
+      -- obviously isn't one anymore.
+      if slash.has_prefix(query) then
+        vim.api.nvim_buf_set_extmark(ibuf, slash_ns, lnum, prefix_len, {
+          end_col = #line, hl_group = "ClaudeSlashMatch",
+        })
+      end
+    else
+      if slash.active() then slash.close() end
+    end
+
+    -- Anywhere-in-line highlight: colour every "/token" that is still a live command
+    -- PREFIX, so a command typed mid-sentence or after args lights up as you type and
+    -- turns plain again the moment the letters stop matching any command (same
+    -- signal as the leading composer). Scans the whole line, so "run /brainstorm now"
+    -- and a half-typed "/brai" both colour, while "/braix" drops back to plain.
+    local from = 1
+    while true do
+      local s, e, tok = line:find("/([%w:_%-]+)", from)
+      if not s then break end
+      if slash.has_prefix(tok) then
+        vim.api.nvim_buf_set_extmark(ibuf, slash_ns, lnum, s - 1, {
+          end_col = e, hl_group = "ClaudeSlashMatch",
+        })
+      end
+      from = e + 1
+    end
+  end
+
   -- Fit the height SYNCHRONOUSLY on the text change, NOT on a debounce timer. The
   -- old 16ms vim.defer_fn left a one-frame window where the buffer had already
   -- wrapped to a new screen row but the float hadn't grown yet: too short, the
@@ -1270,8 +1354,16 @@ local function open_chat_float(title, callback, opts)
   -- row-count change (a wrap boundary crossing), not on every keystroke.
   vim.api.nvim_create_autocmd({ "TextChangedI", "TextChanged", "TextChangedP" }, {
     buffer   = ibuf,
-    callback = fit_height_now,
+    callback = function() fit_height_now(); update_slash_menu() end,
   })
+
+  -- ↑/↓ cycle the slash menu when it's open; no-op otherwise (a single-line prompt
+  -- has nothing to scroll to). <CR> is owned by the menu itself while open (see
+  -- claude/slash.lua), so it isn't mapped here.
+  vim.keymap.set("i", "<Up>",   function() slash.move(-1) end,
+    { buffer = ibuf, nowait = true, silent = true })
+  vim.keymap.set("i", "<Down>", function() slash.move(1) end,
+    { buffer = ibuf, nowait = true, silent = true })
 
   -- Keep the bar pinned to the Claude column + bottom when the terminal/window is
   -- resized (the fixed-width panel's left edge shifts as the editor grows, so a
@@ -1302,6 +1394,7 @@ local function open_chat_float(title, callback, opts)
       local last = vim.api.nvim_buf_get_lines(ibuf, -2, -1, false)[1] or ""
       state.chat_draft = last
     end
+    if slash.active() then slash.close() end   -- tear down the "/" menu with the bar
     vim.o.guicursor = "a:ver1-ClaudeCursorHidden"   -- re-hide; focus returns to panel
     clear_bottom_pad()   -- drop the reserved space so output reflows to the bottom
     pcall(vim.api.nvim_del_augroup_by_name, "ClaudeChatFloat")
@@ -1325,8 +1418,12 @@ local function open_chat_float(title, callback, opts)
     callback(text ~= "" and text or nil)
   end)
 
-  vim.keymap.set("i", "<Esc>", function() close(); callback(nil) end,
-    { buffer = ibuf, nowait = true, silent = true })
+  vim.keymap.set("i", "<Esc>", function()
+    -- While the "/" menu is open, Esc dismisses just the menu (stay in the bar);
+    -- otherwise it closes the whole bar.
+    if slash.active() then slash.close(); return end
+    close(); callback(nil)
+  end, { buffer = ibuf, nowait = true, silent = true })
   vim.keymap.set("n", "<Esc>", close, { buffer = ibuf, nowait = true, silent = true })
   vim.keymap.set("n", "q",     close, { buffer = ibuf, nowait = true, silent = true })
 

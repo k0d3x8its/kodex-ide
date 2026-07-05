@@ -690,6 +690,7 @@ end
 Markdown.build_md_lines    = build_md_lines
 Markdown.render_table      = render_table
 Markdown.render_code_block = render_code_block
+Markdown.code_ts_hls       = code_ts_hls   -- per-line treesitter runs (reused by the edit-hunk block)
 Markdown.is_fence          = is_fence
 Markdown.wrap_text         = wrap_text
 Markdown.disp_take         = disp_take

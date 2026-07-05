@@ -64,6 +64,13 @@ return {
       -- identical, active or inactive.
       local meta_color = { bg = "#5f6a8e", fg = "#f8f8f2" }
 
+      -- Model reads in the SAME clay-on-meta style as the CAVEMAN badge on the right
+      -- (bold #D97757 text on the meta bg), so the two accents bookend the tier. The
+      -- effort level next to it uses plain meta_color (white text), matching the
+      -- session cost. Both sit on the meta bg in BOTH bar states — only CLAUDE/CODE
+      -- swap to the dim #44475a block when the bar opens.
+      local model_color = { bg = meta_color.bg, fg = "#D97757", gui = "bold" }
+
       -- Inactive (chat bar open) CLAUDE / CODE: dim the orange block down to the
       -- panel gray #44475a with orange text. Because lualine colours a separator
       -- arrow as fg = block.bg, giving the block a #44475a bg also makes the
@@ -104,12 +111,19 @@ return {
             {
               function() return require("utils.claude").current_model() end,
               cond  = in_claude,
-              color = meta_color,
+              color = model_color,
             },
+            -- Effort level (low/medium/high/xhigh/max) right of the model, in place
+            -- of the old ✻ sparkle — set via the /effort slider. White-on-meta like
+            -- the session cost, so the two read as the same tier.
             {
-              function() return "✻" end,
+              function() return require("utils.claude").current_effort() end,
               cond = in_claude,
-              color = { fg = "#D97757" },
+              color = meta_color,
+              -- Drop the component's own left padding so only the single
+              -- component_separator space sits between the model and the level
+              -- (default padding stacked on the separator read as a double gap).
+              padding = { left = 0, right = 1 },
             },
             -- File format (the OS glyph,  on Linux) for NON-panel windows only —
             -- the panel shows ✻ above instead. Reads naturally beside the file's
@@ -201,16 +215,12 @@ return {
             { function() return "CLAUDE" end, cond = in_claude, color = claude_dim, separator = { right = pl_right } },
           },
           lualine_b = {
-            { function() return require("utils.claude").current_model() end, cond = in_claude, color = meta_color },
-            -- Dedicated arrow glyph (NOT a separator= field, whose bg is locked to
-            -- the right-hand block) pointing from the model into the ✻. fg = model
-            -- block bg (#5f6a8e), bg = ✻ block bg (#44475a) draws a filled powerline
-            -- triangle that caps the lightgray model and points at the sparkle.
-            { function() return pl_right end, cond = in_claude, color = { fg = "#5f6a8e", bg = "#44475a" }, padding = 0 },
-            -- ✻ gets the #44475a block bg so it matches the CLAUDE/CODE sections
-            -- when the chat bar is open (panel inactive), instead of sitting on the
-            -- lightgray model tier.
-            { function() return "✻" end, cond = in_claude, color = { fg = "#D97757", bg = "#44475a" } },
+            { function() return require("utils.claude").current_model() end, cond = in_claude, color = model_color },
+            -- Effort level (was the ✻ sparkle) stays on the meta bg beside the model
+            -- when the bar is open — same tier as cost/CAVEMAN. Only CLAUDE/CODE swap
+            -- to the dim #44475a block; model+effort read as one continuous meta run,
+            -- so no dark powerline arrow is drawn between them (like cost+CAVEMAN).
+            { function() return require("utils.claude").current_effort() end, cond = in_claude, color = meta_color, padding = { left = 0, right = 1 } },
           },
           lualine_c = {
             { "filename", cond = function() return not in_claude() end },

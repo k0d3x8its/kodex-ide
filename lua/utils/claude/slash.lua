@@ -71,6 +71,12 @@ end
 
 -- ─── Description resolver ──────────────────────────────────────────────────────
 
+-- Commands the PANEL implements locally (not advertised by the CLI's system/init
+-- slash_commands, so they'd never appear otherwise). Merged into the menu list +
+-- prefix/exact checks so they filter and highlight like any other command; their
+-- descriptions live in BUILTIN_DESC. `/effort` opens the reasoning-effort slider.
+local LOCAL_COMMANDS = { "effort" }
+
 -- Built-in + CLI-bundled commands have NO on-disk frontmatter file (they ship
 -- inside the claude binary), so their descriptions are hardcoded here. Anything
 -- not covered by a file OR this map renders name-only (graceful degradation).
@@ -99,6 +105,7 @@ local BUILTIN_DESC = {
   ["update-config"] = "Configure the Claude Code harness",
   recap           = "Recap recent work",
   insights        = "Show session insights",
+  effort          = "Set the reasoning-effort level (opens a slider)",
 }
 
 -- name → resolved first-sentence description, or false when we looked and found
@@ -298,12 +305,26 @@ function Slash.active()
   return menu.win ~= nil and vim.api.nvim_win_is_valid(menu.win)
 end
 
+-- The full command universe: the CLI-advertised names plus the panel's own
+-- LOCAL_COMMANDS (deduped — a local name already advertised isn't added twice).
+-- Every menu/prefix/exact check goes through this so local commands behave like
+-- advertised ones.
+local function all_commands()
+  local out, seen = {}, {}
+  for _, name in ipairs(state.slash_commands or {}) do
+    out[#out + 1] = name; seen[name] = true
+  end
+  for _, name in ipairs(LOCAL_COMMANDS) do
+    if not seen[name] then out[#out + 1] = name end
+  end
+  return out
+end
+
 -- Prefix-filter the full command list by `query` (the text after "/"), sorted.
 local function filter_commands(query)
-  local all = state.slash_commands or {}
   local q = (query or ""):lower()
   local out = {}
-  for _, name in ipairs(all) do
+  for _, name in ipairs(all_commands()) do
     if q == "" or name:lower():sub(1, #q) == q then
       out[#out + 1] = name
     end
@@ -318,7 +339,7 @@ end
 --- Drives the "highlight a valid /command anywhere in the line" colouring.
 function Slash.is_command(name)
   if not name or name == "" then return false end
-  for _, n in ipairs(state.slash_commands or {}) do
+  for _, n in ipairs(all_commands()) do
     if n == name or n:match("([^:]+)$") == name then return true end
   end
   return false
@@ -329,7 +350,7 @@ end
 function Slash.has_prefix(query)
   if not query or query == "" then return true end
   local q = query:lower()
-  for _, name in ipairs(state.slash_commands or {}) do
+  for _, name in ipairs(all_commands()) do
     if name:lower():sub(1, #q) == q then return true end
   end
   return false

@@ -483,6 +483,176 @@ local function render_tool(name, input)
   state.tool_run = { t0 = vim.loop.now() }
 end
 
+-- ── Post-approval edit hunk (Goal 14.4) ──────────────────────────────────────
+-- After an edit is ACCEPTED, drop a numbered red/green diff block into the
+-- transcript — a scannable record of what changed, mirroring the Claude Code
+-- TUI. Purely ADDITIVE: the vimdiff review surface is unchanged; this only
+-- appends to the panel. old_lines/new_lines are the before/after buffer contents
+-- captured by claude_diff at accept time (orig_buf vs scratch). vim.diff's
+-- unified output gives grouping, context, and real line numbers for free.
+local HUNK_CTX = 3    -- context lines each side of a change (user spec)
+local HUNK_CAP = 40   -- max changed (+/-) lines before the rest collapses to "…"
+
+-- The ClaudeCode* token groups bake in the code-block bg (#21222C); applied over
+-- the red/green hunk bands they'd punch near-black holes on every token cell. So
+-- we derive an fg-ONLY twin per group (same fg/italic/bold, NO bg) on first use —
+-- the band bg then shows through under the coloured token, matching the real
+-- Claude Code TUI. Cached; the panel palette is static so staleness is a non-issue.
+local hunk_fg_cache = {}
+local function hunk_fg_group(group)
+  local twin = hunk_fg_cache[group]
+  if twin then return twin end
+  twin = group .. "Fg"
+  local hl = vim.api.nvim_get_hl(0, { name = group })
+  vim.api.nvim_set_hl(0, twin, { fg = hl.fg, italic = hl.italic, bold = hl.bold })
+  hunk_fg_cache[group] = twin
+  return twin
+end
+
+local function render_edit_hunk(path, old_lines, new_lines)
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  local old_text = table.concat(old_lines or {}, "\n")
+  local new_text = table.concat(new_lines or {}, "\n")
+  if old_text == new_text then return end
+  local ud = vim.diff(old_text, new_text, { ctxlen = HUNK_CTX, result_type = "unified" })
+  if not ud or ud == "" then return end
+
+  -- Treesitter token runs for each side, keyed by that side's line number. Added
+  -- + context rows colour from the NEW content, deleted rows from the OLD. `lang`
+  -- = the target's filetype (lua/python/…); code_ts_hls maps it to a parser and
+  -- returns nil (→ no syntax, plain text) when none is available. pcall-guarded.
+  local lang = (path and path ~= "" and vim.filetype.match({ filename = path })) or ""
+  local ok_n, syn_new = pcall(markdown.code_ts_hls, lang, new_lines or {})
+  local ok_o, syn_old = pcall(markdown.code_ts_hls, lang, old_lines or {})
+  if not ok_n then syn_new = nil end
+  if not ok_o then syn_old = nil end
+
+  -- Parse the unified diff into typed rows, tracking real line numbers off each
+  -- @@ header. Deleted rows carry the OLD number; added/context carry the NEW.
+  -- Once HUNK_CAP changed lines are shown, further +/- are counted into `dropped`
+  -- (rendered as a single collapse line) and context is stopped.
+  local rows, oldno, newno, changed, dropped = {}, nil, nil, 0, 0
+  for _, dl in ipairs(vim.split(ud, "\n", { plain = true })) do
+    local ho, hn = dl:match("^@@ %-(%d+),?%d* %+(%d+)")
+    if ho then
+      oldno, newno = tonumber(ho), tonumber(hn)
+      if #rows > 0 then rows[#rows + 1] = { kind = "gap" } end  -- ⋮ between groups
+    elseif oldno then
+      local sign = dl:sub(1, 1)
+      if sign == "+" then
+        if changed < HUNK_CAP then rows[#rows + 1] = { kind = "add", num = newno, text = dl:sub(2) }; changed = changed + 1
+        else dropped = dropped + 1 end
+        newno = newno + 1
+      elseif sign == "-" then
+        if changed < HUNK_CAP then rows[#rows + 1] = { kind = "del", num = oldno, text = dl:sub(2) }; changed = changed + 1
+        else dropped = dropped + 1 end
+        oldno = oldno + 1
+      elseif sign == " " then
+        if changed < HUNK_CAP then rows[#rows + 1] = { kind = "ctx", num = newno, text = dl:sub(2) } end
+        oldno = oldno + 1; newno = newno + 1
+      end
+      -- sign "\" ("\ No newline at end of file") falls through — ignored.
+    end
+  end
+  if #rows == 0 then return end
+  if dropped > 0 then rows[#rows + 1] = { kind = "more", n = dropped } end
+
+  -- Gutter width = widest line number actually shown (min 3 for alignment).
+  local maxnum = 1
+  for _, r in ipairs(rows) do if r.num and r.num > maxnum then maxnum = r.num end end
+  local gw   = math.max(#tostring(maxnum), 3)
+  local pad  = string.rep(" ", gw)
+  local ind  = "    "                          -- indent so the hunk nests UNDER the ● Editing / └ block (TUI-style)
+  local ind_b    = #ind
+  local prefix_b = ind_b + gw + 3              -- indent + "<num> <sign> " = code start byte col
+  local cw   = math.max(panel_width() - prefix_b - 1, 8)   -- code width before HARD wrap
+
+  -- Flatten rows → display lines. A code row wider than `cw` is HARD-WRAPPED into
+  -- chunks here (not left to Vim's soft wrap) so EACH screen row keeps its own
+  -- gutter + band + clipped syntax; a soft-wrapped continuation would otherwise
+  -- render bare — no gutter, broken band, stray ↪ (same fix as render_code_block).
+  -- Continuation chunks carry a blank gutter so the code stays column-aligned.
+  local disp = {}   -- { text=, band=hlgroup|nil, dim_gutter=bool, sep=bool, spans={{b0,b1,grp}} }
+  for _, r in ipairs(rows) do
+    if r.kind == "gap" then
+      disp[#disp + 1] = { text = ind .. pad .. " ⋮", sep = true }
+    elseif r.kind == "more" then
+      disp[#disp + 1] = { text = ind .. pad .. "   … +" .. r.n .. " more changed line"
+        .. (r.n == 1 and "" or "s"), sep = true }
+    else
+      local sign = (r.kind == "add" and "+") or (r.kind == "del" and "-") or " "
+      local head = ind .. string.format("%" .. gw .. "d %s ", r.num, sign)  -- prefix_b bytes total
+      local band = (r.kind == "add" and "ClaudeHunkAdd")
+        or (r.kind == "del" and "ClaudeHunkDel") or nil
+      local numhl = (r.kind == "add" and "ClaudeHunkNumAdd")
+        or (r.kind == "del" and "ClaudeHunkNumDel") or "ClaudeDim"
+      local syn  = (r.kind == "del") and syn_old or syn_new
+      local runs = syn and r.num and syn[r.num] or nil
+      local rest, boff, firstrow = r.text, 0, true
+      repeat
+        local chunk = (rest == "") and "" or disp_take(rest, cw)
+        local clen  = #chunk
+        local spans = {}
+        if runs then                            -- clip each token run to this chunk's byte span
+          for _, s in ipairs(runs) do
+            local cs = math.max(s[1], boff)
+            local ce = math.min(s[2], boff + clen)
+            if ce > cs then
+              spans[#spans + 1] = { prefix_b + (cs - boff), prefix_b + (ce - boff), s[3] }
+            end
+          end
+        end
+        disp[#disp + 1] = {
+          text       = (firstrow and head or string.rep(" ", prefix_b)) .. chunk,
+          band       = band,
+          dim_gutter = firstrow,               -- only the first chunk shows the number
+          numhl      = numhl,                  -- gutter colour: green add / red del / dim ctx
+          spans      = spans,
+        }
+        rest, boff, firstrow = rest:sub(clen + 1), boff + clen, false
+      until rest == ""
+    end
+  end
+
+  -- Sit flush under the ● Editing / └ block: drop any trailing blank rows first
+  -- (render_tool leaves a randomizer blank below the corner) so there's no gap
+  -- between the header and the hunk.
+  local lc = vim.api.nvim_buf_line_count(buf)
+  while lc > 0 and (vim.api.nvim_buf_get_lines(buf, lc - 1, lc, false)[1] or "") == "" do
+    local was = vim.bo[buf].modifiable
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, lc - 1, lc, false, {})
+    vim.bo[buf].modifiable = was
+    lc = lc - 1
+  end
+
+  local first, texts = vim.api.nvim_buf_line_count(buf), {}
+  for i, d in ipairs(disp) do texts[i] = d.text end
+  buf_append(texts)
+
+  -- Highlight: full-line bg band for add/del (line_hl_group fills the EOL gap to
+  -- the window edge); dim the line-number gutter on the first chunk; dim the ⋮
+  -- separators / collapse line; fg-only treesitter tokens over the code.
+  state.hunk_ns = state.hunk_ns or vim.api.nvim_create_namespace("ClaudeHunk")
+  for i, d in ipairs(disp) do
+    local ln = first + i - 1
+    if d.band then
+      vim.api.nvim_buf_set_extmark(buf, state.hunk_ns, ln, 0, { line_hl_group = d.band })
+    end
+    if d.sep then
+      hl_lines(ln, ln, "ClaudeDim")
+    else
+      if d.dim_gutter then hl_range(ln, ind_b, ind_b + gw, d.numhl or "ClaudeDim") end
+      for _, sp in ipairs(d.spans) do
+        hl_range(ln, sp[1], sp[2], hunk_fg_group(sp[3]))
+      end
+    end
+  end
+  buf_append({ "" })   -- trailing blank so the next content/spinner anchors below
+end
+Render.render_edit_hunk = render_edit_hunk
+
 -- Normalise a tool_result `content` field to a flat list of display lines.
 -- The CLI sends `content` as either a plain STRING (the common case, e.g.
 -- "1\n2\n…") or an array of `{type="text",text=…}` blocks. Tabs → two spaces
@@ -920,6 +1090,10 @@ local function dispatch(event)
             or meta.name == "TaskCreate" or meta.name == "TaskUpdate") then
           -- Noisy "Todos modified" / "Task #N created" ack — the bottom widget
           -- already reflects it, so drop the body (don't render it inline).
+        elseif meta and EDIT_NAMES[meta.name] and block.is_error ~= true then
+          -- "The file … has been updated successfully" ack — redundant with the
+          -- diff window AND the post-approval red/green hunk block, so drop it.
+          -- Errors still render (the user needs to see why an edit failed).
         elseif sb then
           -- A registered search (Grep/Glob tool, or search-shaped Bash) rewrites
           -- its own header + renders the file list.

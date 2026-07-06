@@ -224,14 +224,24 @@ H.check("U10 closing the view also closes the tag",
   claude.state.subagent_tag_win == nil
   or not vim.api.nvim_win_is_valid(claude.state.subagent_tag_win))
 
--- ── U11: the drill-in renders the subagent's inner tool activity ───────────────
+-- ── U11: the subagent's LIVE buffer streams its inner activity ─────────────────
 
-local ev_lines = widgets.render_subagent_events(claude.state.subagents[1])
-local ev_text  = table.concat(ev_lines, "\n")
-H.check("U11 drill-in shows the inner Bash tool call",
+-- append_subagent_event ran during the U2 feeds → subagents[1].buf is already
+-- populated (not a snapshot rendered at open-time), so the drill-in is live.
+local sbuf = claude.state.subagents[1].buf
+H.check("U11 subagent has its own live buffer", sbuf ~= nil and vim.api.nvim_buf_is_valid(sbuf))
+local ev_text = table.concat(vim.api.nvim_buf_get_lines(sbuf, 0, -1, false), "\n")
+H.check("U11 live buffer shows the inner Bash tool call",
   ev_text:find("Bash(echo hi", 1, true) ~= nil, ev_text)
-H.check("U11 drill-in shows the tool result body (kept out of main, shown here)",
+H.check("U11 live buffer shows the tool result body (kept out of main, shown here)",
   ev_text:find("hello-from-subagent", 1, true) ~= nil)
+-- A further inner event appends live (buffer grows without reopening the view).
+local before = vim.api.nvim_buf_line_count(sbuf)
+widgets.append_subagent_event(claude.state.subagents[1],
+  { type = "assistant", message = { content = { {
+    type = "tool_use", name = "Read", input = { file_path = "/tmp/x.lua" } } } } })
+H.check("U11 live buffer grows as new events stream in",
+  vim.api.nvim_buf_line_count(sbuf) > before)
 
 -- ── U12: a long description truncates so the meta stays visible (overflow fix) ──
 

@@ -52,6 +52,9 @@ return {
       -- purple ClaudeTool. Resolved by render_tool via TOOL_HL.
       vim.api.nvim_set_hl(0, "ClaudeToolRead", { fg = "#56B6C2" })
       vim.api.nvim_set_hl(0, "ClaudeToolRun",  { fg = "#D19A66" })
+      -- The advisor ("● Advising using <model>") header — bright green + bold, so
+      -- an escalation to the advisor model reads distinctly from ordinary tools.
+      vim.api.nvim_set_hl(0, "ClaudeAdvisor",  { fg = "#50FA7B", bold = true })
 
       -- Inline markdown: code spans (`...`) in Dracula cyan, bold (**...**) in
       -- white-bold so they pop against the orange ClaudeProse base. Applied by

@@ -280,7 +280,9 @@ function set_bottom_pad(rows)
   local buf = state.panel_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf) and state.pad_ns) then return end
   state.chat_pad = (rows and rows >= 1) and rows or 0
-  local total = state.chat_pad + (widgets.todo_height and widgets.todo_height() or 0)
+  local total = state.chat_pad
+    + (widgets.todo_height and widgets.todo_height() or 0)
+    + (widgets.subagent_height and widgets.subagent_height() or 0)
   vim.api.nvim_buf_clear_namespace(buf, state.pad_ns, 0, -1)
   state.pad_rows = total
   local is_panel = state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)
@@ -311,7 +313,9 @@ end
 -- it drops below its anchor and hides UNDER the question card / chat bar. Re-running
 -- set_bottom_pad re-anchors it to `pad_rows` above the bottom. No-op with no pad.
 local function reanchor_pad()
-  if (state.chat_pad or 0) > 0 or (widgets.todo_height and widgets.todo_height() > 0) then
+  if (state.chat_pad or 0) > 0
+      or (widgets.todo_height and widgets.todo_height() > 0)
+      or (widgets.subagent_height and widgets.subagent_height() > 0) then
     set_bottom_pad(state.chat_pad or 0)
   end
 end
@@ -1024,6 +1028,9 @@ local function set_panel_keymaps(buf)
   vim.keymap.set("n", "<CR>", function()
     if state.perm then
       resolve_permission(state.perm.options[state.perm.choice].kind)
+    elseif widgets.subagent_enter() then
+      -- Switcher is up: Enter opens the selected subagent's drill-in (or returns to
+      -- main). The chat bar is still reachable with i/a/o while a subagent runs.
     else
       open_input()
     end
@@ -1031,7 +1038,7 @@ local function set_panel_keymaps(buf)
     buffer  = buf,
     noremap = true,
     silent  = true,
-    desc    = "Claude: reply / confirm permission",
+    desc    = "Claude: reply / confirm permission / subagent view",
   })
   -- <Esc> rejects the pending permission when a card is up; otherwise it
   -- interrupts the current turn (control_request) while keeping the session
@@ -1110,9 +1117,7 @@ local function set_panel_keymaps(buf)
     { buffer = buf, noremap = true, silent = true, desc = "Claude: subagent switcher up" })
   vim.keymap.set("n", "<Down>", function() nav_or_default(1,  "<Down>") end,
     { buffer = buf, noremap = true, silent = true, desc = "Claude: subagent switcher down" })
-  vim.keymap.set("n", "<CR>", function()
-    widgets.subagent_enter()   -- no-op when no switcher; panel is otherwise read-only
-  end, { buffer = buf, noremap = true, silent = true, desc = "Claude: open subagent view" })
+  -- <CR> (subagent view / chat bar) is bound above, folded into the permission handler.
 end
 
 -- ─── Persistent bidirectional subprocess (spawn + send) ──────────────────────

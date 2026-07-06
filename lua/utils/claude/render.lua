@@ -1328,8 +1328,9 @@ local function dispatch(event)
     local sub = subagent_by_id(parent)
     if sub then
       sub.events[#sub.events + 1] = event
+      widgets.append_subagent_event(sub, event)   -- stream into the subagent's live buffer
       remove_typing_ph()
-      render_subagent_inline(event)
+      render_subagent_inline(event)               -- compact trail in main
       return
     end
   end

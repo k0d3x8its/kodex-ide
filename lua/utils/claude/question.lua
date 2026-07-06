@@ -35,6 +35,7 @@ local start_spinner
 local stop_spinner
 local clear_hint
 local prompt_input
+local set_waiting_hint
 
 --- Inject init's float/pad/spinner/permission helpers. Called once from init after
 --- they are defined.
@@ -49,6 +50,7 @@ function Question.wire(hooks)
   stop_spinner              = hooks.stop_spinner
   clear_hint                = hooks.clear_hint
   prompt_input              = hooks.prompt_input
+  set_waiting_hint          = hooks.set_waiting_hint
 end
 
 -- ─── Question card (AskUserQuestion) ──────────────────────────────────────────
@@ -240,6 +242,7 @@ local function close_question_card(receipt, receipt_hl)
     buf_append({ receipt })
     hl_lines(recl, recl, receipt_hl or "ClaudeQuestion")
   end
+  core.resume_turn()   -- fold the answer wait out of the turn timer (mirrors the tick)
   -- Blank line so the resumed spinner gets its own row, not the receipt's EOL
   -- (same reason as resolve_permission — set_hint anchors to the last line).
   -- Re-baseline the thinking timer past the user's answer time.
@@ -571,6 +574,7 @@ local function show_question_card(event)
   end
 
   stop_spinner()
+  core.pause_turn()   -- freeze the turn clock: the CLI is blocked on the user's answer
   clear_hint()
 
   state.qask_reopen_bar = false
@@ -582,6 +586,9 @@ local function show_question_card(event)
   state.qask = q
   open_question_float(q)
   render_question_card()
+  -- Spinner is stopped for the question card, so paint the frozen "Waiting…" hint
+  -- ourselves (sits above the card thanks to the reserved pad).
+  if set_waiting_hint then set_waiting_hint() end
 end
 Question.show_question_card = show_question_card
 

@@ -122,18 +122,25 @@ Core.state = {
   -- to "plan" (and back to "default"), respawning the process.
   permission_mode = "default",
 
-  -- Open-buffer awareness (FINDINGS § Q-CTX). host_file = the real file the user
-  -- had open in the editor when the panel opened (captured pre-focus-steal):
-  -- { path=<abs>, disp=<~/.-relative> } or nil. host_ctx_sent gates the ambient
-  -- @-mention injection to ONCE per session (re-inlining every turn bloats
-  -- context + drifts). Both cleared on session teardown / panel close.
+  -- Open-buffer awareness (FINDINGS § Q-CTX; v2 = re-attach-on-change + echo note).
+  -- host_file = the real file the user had open when the panel opened (captured
+  -- pre-focus-steal): { path=<abs>, disp=<~/.-relative> } or nil — kept as a
+  -- fallback; each send now resolves the LIVE editor file (current_host_file()) so
+  -- switching files mid-session re-attaches. host_ctx_last_path = the abs path last
+  -- folded in: a full @<path> inline fires when the live file DIFFERS from it
+  -- (first turn / file switch), while a same-file repeat gets a cheap plain-text
+  -- path breadcrumb instead (the content is already in history — re-inlining every
+  -- turn bloats the window; the breadcrumb keeps a bare "this file" resolvable).
+  -- Cleared on teardown.
   --
-  -- Injection is SILENT, matching OpenCode: the user's first real message gets an
-  -- @<path> appended to the WIRE only (the transcript echo stays their own text),
-  -- so there is NO visible auto-prompt. host_ctx_enabled is the master on/off,
-  -- toggled by <leader>cb and PERSISTED across restarts (see host_ctx_pref_*).
-  host_file       = nil,
-  host_ctx_sent   = false,
+  -- Injection is ambient (OpenCode-style): the fold-in is appended to the WIRE
+  -- only, the transcript echo stays the user's own text — but v2 adds a dim
+  -- "· with @<file>" note under the echo (render_user) on a full inline so an
+  -- attach is visible (breadcrumb turns show no note).
+  -- host_ctx_enabled is the master on/off, toggled by <leader>cb and PERSISTED
+  -- across restarts (see host_ctx_pref_*).
+  host_file        = nil,
+  host_ctx_last_path = nil,
   host_ctx_enabled = true,   -- overwritten from disk at module load
 
   -- Messages the user typed while a turn was in flight, FIFO. Shown as shaded

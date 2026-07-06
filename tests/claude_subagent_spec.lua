@@ -144,11 +144,52 @@ feed({ type = "assistant", parent_tool_use_id = "toolu_agent_B", message = { con
 H.check("U4 inner event routes to the CORRECT subagent (2, not 1)",
   #claude.state.subagents[2].events == 1 and #claude.state.subagents[1].events == 2)
 
--- ── U5: mod.reset() drops all subagent sessions ────────────────────────────────
+-- ── U6: the switcher bar renders (auto-opened during capture) ──────────────────
+
+local widgets = require("utils.claude.widgets")
+local function bar_lines()
+  local b = claude.state.subagent_buf
+  return (b and vim.api.nvim_buf_is_valid(b))
+    and vim.api.nvim_buf_get_lines(b, 0, -1, false) or {}
+end
+
+H.check("U6 switcher window opened on capture",
+  claude.state.subagent_win ~= nil and vim.api.nvim_win_is_valid(claude.state.subagent_win))
+local bl = bar_lines()
+H.check("U6 row 1 is the 'main' pseudo-entry", bl[1] and bl[1]:find("main", 1, true) ~= nil, bl[1])
+H.check("U6 main is selected by default (● filled, sel=1)", bl[1] and bl[1]:find("●", 1, true) ~= nil, bl[1])
+H.check("U6 subagent row shows kind + desc",
+  bl[2] and bl[2]:find("general%-purpose") ~= nil and bl[2]:find("Fable review of 15.7", 1, true) ~= nil, bl[2])
+H.check("U6 unselected subagent row uses hollow ○", bl[2] and bl[2]:find("○", 1, true) ~= nil, bl[2])
+H.check("U6 completed subagent meta shows token count",
+  bl[2] and bl[2]:find("29.4k", 1, true) ~= nil, bl[2])
+H.check("U6 one main row + two subagent rows", #bl == 3, tostring(#bl))
+
+-- ── U7: subagent_height reserves space; float_bottom_row lifts above it ─────────
+
+H.check("U7 subagent_height > 0 while the bar is shown", widgets.subagent_height() > 0)
+H.check("U7 float_bottom_row lifted by the full bar height",
+  widgets.float_bottom_row() == vim.o.lines - 2 - widgets.subagent_height() - widgets.todo_height())
+
+-- ── U8: selection glyph tracks state.subagent_sel ──────────────────────────────
+
+claude.state.subagent_sel = 2
+widgets.update_subagent_bar()
+bl = bar_lines()
+H.check("U8 selecting row 2 fills it (●) and hollows main (○)",
+  bl[1] and bl[1]:find("○", 1, true) ~= nil and bl[2] and bl[2]:find("●", 1, true) ~= nil,
+  (bl[1] or "") .. " | " .. (bl[2] or ""))
+claude.state.subagent_sel = 1
+
+-- ── U5: mod.reset() drops all subagent sessions + closes the bar ───────────────
 
 claude.reset()
 vim.wait(30)
 H.check("U5 reset clears state.subagents", claude.state.subagents == nil)
 H.check("U5 reset restores subagent_sel to 1", claude.state.subagent_sel == 1)
+H.check("U5 reset closes the switcher window",
+  claude.state.subagent_win == nil
+  or not vim.api.nvim_win_is_valid(claude.state.subagent_win))
+H.check("U5 subagent_height back to 0 after reset", widgets.subagent_height() == 0)
 
 H.summary("claude_subagent")

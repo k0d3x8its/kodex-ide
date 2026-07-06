@@ -106,6 +106,15 @@ Core.state = {
   -- changing it respawns the process. The statusline shows it right of the model.
   effort        = nil,
 
+  -- Advisor model for the server-side advisor tool (the "advisor strategy": the
+  -- executor model escalates hard calls to a stronger advisor, then resumes).
+  -- Alias/id: "opus" (default) / "sonnet" / "fable", or nil = No advisor (unset).
+  -- Passed as --advisor on spawn; changed mid-session via an apply_flag_settings
+  -- control_request (NO respawn / context reset — unlike --model/--effort). Set by
+  -- the /advisor picker (claude/advisor.lua). Drives the "Advising using <model>"
+  -- header, since the stream event itself does NOT carry the advisor model.
+  advisor_model = "opus",
+
   -- Permission mode passed to --permission-mode on (re)spawn. "default" pairs
   -- with the hidden --permission-prompt-tool stdio flag (build_args) so the CLI
   -- routes tool-permission decisions to us via can_use_tool control_requests

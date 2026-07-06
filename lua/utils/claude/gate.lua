@@ -39,6 +39,9 @@ local stop_spinner
 local clear_hint
 local prompt_input
 local float_bottom_row
+local set_bottom_pad
+local clear_bottom_pad
+local set_waiting_hint
 
 --- Inject init's spinner/hint/float helpers. Called once from init after they
 --- are defined (prompt_input arrives as a thunk since it is defined further down
@@ -50,6 +53,9 @@ function Gate.wire(hooks)
   clear_hint       = hooks.clear_hint
   prompt_input     = hooks.prompt_input
   float_bottom_row = hooks.float_bottom_row
+  set_bottom_pad   = hooks.set_bottom_pad
+  clear_bottom_pad = hooks.clear_bottom_pad
+  set_waiting_hint = hooks.set_waiting_hint
 end
 
 local function send_permission_response(request_id, decision, o)
@@ -159,6 +165,7 @@ function Gate.on_prewrite_resolve(accepted)
     send_permission_response(p.request_id, "deny",
       { message = "User rejected the proposed change in review" })
   end
+  core.resume_turn()   -- fold the review wait out of the turn timer (mirrors the tick)
   if state.working then
     state.activity_t0 = vim.loop.now()
     start_spinner()
@@ -244,6 +251,10 @@ local function resolve_permission(kind)
     buf_append({ mark .. " " .. p.display .. " — " .. verb })
     hl_lines(recl, recl, kind == "deny" and "ClaudeDim" or "ClaudeQuestion")
   end
+
+  -- Resume the turn clock: fold the decision wait into the paused total so the
+  -- cumulative turn timer + "✻ …for Ns" done line exclude it (mirrors the tick).
+  core.resume_turn()
 
   -- A blank line below the receipt so the resumed spinner anchors to its OWN line
   -- (set_hint pins EOL virt_text to the last buffer line) instead of trailing the
@@ -438,9 +449,15 @@ local function open_permission_float(p)
   vim.wo[win].breakindent = true   -- align wrapped continuation under the line's indent
   vim.wo[win].cursorline  = false
   harden_float_scroll(win)         -- BUG A: no over-scroll past the command tail
+  -- Reserve the card's footprint as bottom padding so live output + the "Waiting…"
+  -- hint push ABOVE the card instead of peeking below it (float_h interior + 2
+  -- border rows + 1 separator — same contract the question card uses).
+  if set_bottom_pad then set_bottom_pad(float_h + 3) end
   -- BUG B: track the panel column/width on resize, re-fitting the wrapped height.
   p.resize_close = attach_panel_float_resize(win, "ClaudePermFloat", function(_, _, w)
-    pcall(vim.api.nvim_win_set_height, win, perm_height(w))
+    local h = perm_height(w)
+    pcall(vim.api.nvim_win_set_height, win, h)
+    if set_bottom_pad then set_bottom_pad(h + 3) end
   end)
 
   for _, h in ipairs(body_hl) do
@@ -480,6 +497,7 @@ local function open_permission_float(p)
     pattern = tostring(win),
     once    = true,
     callback = function()
+      if clear_bottom_pad then clear_bottom_pad() end   -- drop the card's reserve on any close path
       if state.perm and state.perm.win == win then resolve_permission("deny") end
     end,
   })
@@ -514,6 +532,7 @@ local function show_permission_card(event)
   p.options[#p.options + 1] = { label = "Reject", kind = "deny" }
 
   stop_spinner()
+  core.pause_turn()   -- freeze the turn clock: the CLI is blocked on the user's choice
   clear_hint()   -- drop any stale "Working…" hint so nothing peeks behind the float
 
   -- Dismiss any open chat bar BEFORE opening the card. The bar anchors SW at the
@@ -529,6 +548,10 @@ local function show_permission_card(event)
   state.perm = p
   open_permission_float(p)
   render_perm_choice_row()
+  -- The spinner is stopped for the perm card, so paint the frozen "Waiting…" hint
+  -- ourselves (the tick-driven gates show it from the running spinner). Sits above
+  -- the card thanks to the reserved bottom pad (open_permission_float).
+  if set_waiting_hint then set_waiting_hint() end
 end
 Gate.show_permission_card = show_permission_card
 
@@ -648,8 +671,13 @@ local function open_diff_card_float(d)
   vim.wo[win].breakindent = true
   vim.wo[win].cursorline  = false
   harden_float_scroll(win)
+  -- Reserve the card's footprint so live output + the "Waiting…" hint push ABOVE
+  -- the card instead of peeking below it (interior + 2 border + 1 separator).
+  if set_bottom_pad then set_bottom_pad(float_h + 3) end
   d.resize_close = attach_panel_float_resize(win, "ClaudeDiffCardFloat", function(_, _, w)
-    pcall(vim.api.nvim_win_set_height, win, card_height(w))
+    local h = card_height(w)
+    pcall(vim.api.nvim_win_set_height, win, h)
+    if set_bottom_pad then set_bottom_pad(h + 3) end
   end)
 
   for _, h in ipairs(body_hl) do
@@ -680,6 +708,7 @@ local function open_diff_card_float(d)
     pattern = tostring(win),
     once    = true,
     callback = function()
+      if clear_bottom_pad then clear_bottom_pad() end   -- drop the card's reserve on any close path
       if state.diff_card and state.diff_card.win == win then
         state.diff_card = nil -- dismissed some other way; not a decision
       end

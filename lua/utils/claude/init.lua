@@ -2153,11 +2153,12 @@ function mod.reset()
   state.todo_seq      = nil
   widgets.close_todo_widget()
   -- Drop captured subagent sessions on session reset + close the switcher bar and
-  -- any open drill-in view.
-  state.subagents     = nil
-  state.subagent_sel  = 1
+  -- any open drill-in view (wipe the per-subagent live buffers before clearing).
   widgets.close_subagent_view()
   widgets.close_subagent_bar()
+  widgets.wipe_subagent_buffers()
+  state.subagents     = nil
+  state.subagent_sel  = 1
   if state.perm and state.perm.win and vim.api.nvim_win_is_valid(state.perm.win) then
     pcall(vim.api.nvim_win_close, state.perm.win, true)
   end

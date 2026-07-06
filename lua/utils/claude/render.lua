@@ -1292,23 +1292,46 @@ local function subagent_by_task(task_id)
   return nil
 end
 
+-- Compact one-line render of a subagent's inner tool CALLS, nested under its
+-- agent header in the main transcript (mirrors the CC-TUI: the subagent's
+-- Bash/Read/etc. show as dim indented one-liners; its prose, thinking, and
+-- result bodies stay in the drill-in view so main isn't flooded with the full
+-- inner stream). Only tool_use blocks surface here.
+local function render_subagent_inline(event)
+  if (event.type or "") ~= "assistant" then return end
+  for _, b in ipairs((event.message or {}).content or {}) do
+    if (b.type or "") == "tool_use" then
+      local a   = b.input or {}
+      local arg = a.command or a.pattern or a.file_path or a.description or a.path or ""
+      local ln  = vim.api.nvim_buf_line_count(state.panel_buf)
+      buf_append({ "    ● " .. (b.name or "tool") .. "(" .. corner_one_line(tostring(arg)) .. ")" })
+      hl_lines(ln, ln, "ClaudeDim")
+    end
+  end
+end
+
 -- ─── Stream-json event dispatcher (Goal 6.3) ──────────────────────────────────
 
 -- Dispatch one fully parsed stream-json event object.
 local function dispatch(event)
   local ev_type = event.type or ""
 
-  -- Goal 17.1: subagent inner-event routing. A spawned Agent/Task subagent's
-  -- inner activity (thinking/tool_use/tool_result) streams tagged with
-  -- parent_tool_use_id = the spawning Agent tool_use id; main-session events
-  -- carry null. Accumulate those into the matching subagent's .events sink so
-  -- the focused drill-in view (17.3) can re-render just that subagent — then
-  -- FALL THROUGH so they STILL render inline in the main transcript
-  -- (reference-faithful, Option B). See FINDINGS § Q-SUBAGENT-STREAM.
+  -- Subagent inner-event routing. A spawned Agent/Task subagent's inner activity
+  -- (thinking/tool_use/tool_result) streams tagged with parent_tool_use_id = the
+  -- spawning Agent tool_use id; main-session events carry null. Accumulate the raw
+  -- event into the matching subagent's .events sink (for the drill-in view), render
+  -- a COMPACT nested one-liner for its tool calls in main, then RETURN — do NOT
+  -- fall through to the full inline render (that flooded main with every inner
+  -- event). See FINDINGS § Q-SUBAGENT-STREAM.
   local parent = event.parent_tool_use_id
   if parent then
     local sub = subagent_by_id(parent)
-    if sub then sub.events[#sub.events + 1] = event end
+    if sub then
+      sub.events[#sub.events + 1] = event
+      remove_typing_ph()
+      render_subagent_inline(event)
+      return
+    end
   end
 
   if ev_type == "system" and event.subtype == "init" then
@@ -1418,6 +1441,16 @@ local function dispatch(event)
       if (block.type or "") == "tool_result" then
         local meta = state.tool_meta and state.tool_meta[block.tool_use_id]
         local sb   = state.search_blocks and state.search_blocks[block.tool_use_id]
+        -- The parent-turn Agent tool_result (null parent, id = the Agent tool_use)
+        -- is the subagent's FINAL result — a reliable "done" signal even if the
+        -- system/task_* lifecycle events didn't match. Flip status + auto-dismiss.
+        -- (The result body still renders below as the agent's summary in main.)
+        local sub_done = subagent_by_id(block.tool_use_id)
+        if sub_done then
+          sub_done.status = "completed"
+          widgets.update_subagent_bar()
+          widgets.maybe_dismiss_subagents()
+        end
         if meta and (meta.name == "TodoWrite"
             or meta.name == "TaskCreate" or meta.name == "TaskUpdate") then
           -- Noisy "Todos modified" / "Task #N created" ack — the bottom widget

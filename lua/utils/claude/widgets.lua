@@ -370,24 +370,45 @@ local function fmt_dur(ms)
   return s .. "s"
 end
 
+-- Truncate a string to at most `cols` display columns (multibyte-safe), adding a
+-- single "…" when it overflows. Used so a long subagent description can't push the
+-- status/token meta off the right edge of the card (the live "@@@" overflow bug).
+local function trunc_display(s, cols)
+  if cols <= 0 then return "" end
+  if vim.fn.strdisplaywidth(s) <= cols then return s end
+  local out = vim.fn.strcharpart(s, 0, math.max(cols - 1, 0))
+  while vim.fn.strdisplaywidth(out) > cols - 1 and #out > 0 do
+    out = vim.fn.strcharpart(out, 0, vim.fn.strchars(out) - 1)
+  end
+  return out .. "…"
+end
+
 -- Build the switcher rows + per-row highlight spans. Row 1 is the "main"
 -- pseudo-entry (selecting it returns to the main transcript); rows 2..N+1 are the
 -- captured subagents in order. The selected row (state.subagent_sel, 1-based)
 -- gets a green filled ● (ClaudeAdvisor); the rest a dim hollow ○ (ClaudeDim) —
 -- reference-faithful. Byte spans are ASCII-safe up to the glyph; the ● / ○ / ↓
 -- are multibyte, so meta spans are measured off the built string, not char counts.
+-- The label is truncated so the (dim) meta always stays visible within the card.
 function Widgets.render_subagent_lines()
   local subs = state.subagents or {}
   local sel  = state.subagent_sel or 1
   local lines, hls = {}, {}
 
+  -- Inner text budget = card width (panel column minus its 2 border cells).
+  local _, w = panel_float_geom()
+  local budget = math.max((w or 40) - 2, 12)
+
   local function add_row(idx, label, meta)
     local glyph = (idx == sel) and "●" or "○"
     local ghl   = (idx == sel) and "ClaudeAdvisor" or "ClaudeDim"
+    -- Reserve room for the glyph + spaces + meta segment, then fit the label.
+    local seg = (meta and meta ~= "") and ("   " .. meta) or ""
+    local fixed = vim.fn.strdisplaywidth(" " .. glyph .. " " .. seg)
+    label = trunc_display(label, budget - fixed)
     local text  = " " .. glyph .. " " .. label
     local spans = { { 1, 1 + #glyph, ghl } }   -- colour just the selection glyph
-    if meta and meta ~= "" then
-      local seg = "   " .. meta
+    if seg ~= "" then
       spans[#spans + 1] = { #text, #text + #seg, "ClaudeDim" }
       text = text .. seg
     end
@@ -402,7 +423,7 @@ function Widgets.render_subagent_lines()
     if s.status == "completed" and type(s.usage) == "table" then
       -- Final numbers from system/task_notification.usage (FINDINGS § Q-SUBAGENT-STREAM).
       local du, tk = fmt_dur(s.usage.duration_ms), fmt_tokens(s.usage.total_tokens)
-      meta = (du and (du .. " · ") or "") .. (tk and ("↓ " .. tk .. " tokens") or "")
+      meta = "✓ " .. (du and (du .. " · ") or "") .. (tk and ("↓ " .. tk .. " tokens") or "")
     else
       -- No live token count until the subagent completes; show its status word.
       meta = s.status or "running"
@@ -485,6 +506,174 @@ function Widgets.update_subagent_bar()
       pcall(vim.api.nvim_del_augroup_by_name, "ClaudeSubagentResize")
     end
   end
+end
+
+-- Terminal (non-running) subagent statuses. task_updated/task_notification set
+-- "completed"; keep the others so a failed/cancelled run still counts as "done"
+-- for the auto-dismiss (else the bar would hang forever).
+local TERMINAL_STATUS = { completed = true, failed = true, cancelled = true, error = true }
+
+-- True only when there is ≥1 subagent AND every one has reached a terminal status.
+function Widgets.subagents_all_done()
+  local subs = state.subagents
+  if not (subs and #subs > 0) then return false end
+  for _, s in ipairs(subs) do
+    if not TERMINAL_STATUS[s.status] then return false end
+  end
+  return true
+end
+
+-- Auto-dismiss the switcher once every subagent has finished — the real CC-TUI
+-- hides it when nothing is live (user-confirmed 2026-07-06). Mirrors the Task-Plan
+-- card: arm a single deferred close, re-check at fire time so a subagent spawned
+-- within the window cancels it. Clears state so a later spawn starts a fresh list;
+-- the finished subagents' output already rendered inline in main.
+function Widgets.maybe_dismiss_subagents()
+  if not Widgets.subagents_all_done() then
+    state.subagent_dismiss_pending = false
+    return
+  end
+  if state.subagent_dismiss_pending then return end
+  state.subagent_dismiss_pending = true
+  vim.defer_fn(function()
+    state.subagent_dismiss_pending = false
+    if Widgets.subagents_all_done() then
+      Widgets.close_subagent_view()
+      Widgets.close_subagent_bar()
+      state.subagents    = nil
+      state.subagent_sel = 1
+      Widgets.reflow_bottom_floats()
+    end
+  end, 2500)
+end
+
+-- Move the switcher selection (state.subagent_sel, 1 = main). Returns false when
+-- the bar isn't showing so the panel keymap can fall through to normal ↑/↓.
+function Widgets.subagent_nav(delta)
+  local subs = state.subagents
+  if not (subs and #subs > 0) then return false end
+  local n   = #subs + 1
+  local sel = (state.subagent_sel or 1) + delta
+  if sel < 1 then sel = 1 elseif sel > n then sel = n end
+  state.subagent_sel = sel
+  Widgets.update_subagent_bar()
+  return true
+end
+
+-- Enter on the selected switcher row: main (sel 1) closes the drill-in view;
+-- a subagent row opens/swaps to its transcript view. Returns false when no bar.
+function Widgets.subagent_enter()
+  local subs = state.subagents
+  if not (subs and #subs > 0) then return false end
+  if (state.subagent_sel or 1) <= 1 then
+    Widgets.close_subagent_view()
+  else
+    Widgets.open_subagent_view((state.subagent_sel or 1) - 1)
+  end
+  return true
+end
+
+-- Render a subagent's accumulated .events into readable drill-in lines. Not full
+-- transcript fidelity — a compact live peek: text prose, tool headers, and dim
+-- one-line tool-result corners. (The main transcript keeps the full inline render.)
+function Widgets.render_subagent_events(sub)
+  local lines, hls = {}, {}
+  local function push(text, hl)
+    lines[#lines + 1] = text
+    hls[#lines]       = hl and { { 0, -1, hl } } or {}
+  end
+  for _, ev in ipairs(sub.events or {}) do
+    if ev.type == "assistant" then
+      for _, b in ipairs((ev.message or {}).content or {}) do
+        if b.type == "text" and type(b.text) == "string" and b.text ~= "" then
+          for _, ln in ipairs(vim.split(b.text, "\n", { plain = true })) do
+            push("  " .. ln, nil)
+          end
+        elseif b.type == "thinking" then
+          push("  ▸ Thinking", "ClaudeDim")
+        elseif b.type == "tool_use" then
+          local a = b.input or {}
+          local arg = a.command or a.pattern or a.file_path or a.description or a.path or ""
+          push("  ● " .. (b.name or "tool") .. "(" .. trunc_display(tostring(arg), 60) .. ")", nil)
+        end
+      end
+    elseif ev.type == "user" then
+      for _, b in ipairs((ev.message or {}).content or {}) do
+        if b.type == "tool_result" then
+          local body = b.content
+          if type(body) == "table" then
+            local parts = {}
+            for _, c in ipairs(body) do parts[#parts + 1] = c.text or "" end
+            body = table.concat(parts, " ")
+          end
+          body = tostring(body or ""):gsub("%s+", " ")
+          push("    └ " .. trunc_display(body, 70), "ClaudeDim")
+        end
+      end
+    end
+  end
+  if #lines == 0 then push("  (no inner activity captured yet)", "ClaudeDim") end
+  return lines, hls
+end
+
+-- Close the drill-in view float.
+function Widgets.close_subagent_view()
+  if state.subagent_view_win and vim.api.nvim_win_is_valid(state.subagent_view_win) then
+    pcall(vim.api.nvim_win_close, state.subagent_view_win, true)
+  end
+  state.subagent_view_win = nil
+  state.subagent_view     = nil
+end
+
+-- Open (or swap) the drill-in view: a bordered float covering the transcript area
+-- (above the switcher), titled with the agent + desc, showing render_subagent_events.
+-- Focusable + entered so q/<Esc> close it back to main.
+function Widgets.open_subagent_view(i)
+  local subs = state.subagents
+  local sub  = subs and subs[i]
+  if not sub then return end
+  if not (state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)) then return end
+
+  local lines, hls = Widgets.render_subagent_events(sub)
+  local buf = state.subagent_view_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    buf = vim.api.nvim_create_buf(false, true)
+    state.subagent_view_buf = buf
+  end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  state.subagent_view_ns = state.subagent_view_ns
+    or vim.api.nvim_create_namespace("claude_subagent_view")
+  vim.api.nvim_buf_clear_namespace(buf, state.subagent_view_ns, 0, -1)
+  for r, spans in ipairs(hls) do
+    for _, h in ipairs(spans) do
+      vim.api.nvim_buf_add_highlight(buf, state.subagent_view_ns, h[3], r - 1, h[1], h[2])
+    end
+  end
+
+  local col, w = panel_float_geom()
+  local ph     = vim.api.nvim_win_get_height(state.panel_win)
+  local height = math.max(ph - Widgets.subagent_height() - 2, 3)
+  local cfg = {
+    relative = "editor", anchor = "NW",
+    row = 1, col = col, width = math.max(w - 2, 1), height = height,
+    style = "minimal", zindex = 40, border = "rounded",
+    title = " ⟢ " .. (sub.kind or "agent") .. " · " .. trunc_display(sub.desc or "", 30) .. " ",
+    title_pos = "left",
+  }
+  if state.subagent_view_win and vim.api.nvim_win_is_valid(state.subagent_view_win) then
+    pcall(vim.api.nvim_win_set_config, state.subagent_view_win, cfg)
+  else
+    state.subagent_view_win = vim.api.nvim_open_win(buf, true, cfg)   -- enter → q/Esc work
+    vim.wo[state.subagent_view_win].winhl =
+      "Normal:ClaudeNormal,NormalNC:ClaudeNormal,FloatBorder:ClaudePermBorder,FloatTitle:ClaudePermBorder"
+    for _, k in ipairs({ "q", "<Esc>" }) do
+      vim.keymap.set("n", k, function() Widgets.close_subagent_view() end,
+        { buffer = buf, noremap = true, silent = true, desc = "Claude: close subagent view" })
+    end
+  end
+  state.subagent_view = i
 end
 
 return Widgets

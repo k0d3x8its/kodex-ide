@@ -1095,6 +1095,24 @@ local function set_panel_keymaps(buf)
     silent  = true,
     desc    = "Claude: expand tool_result under cursor",
   })
+
+  -- Subagent switcher (17.3): ↑/↓ move the selection while the switcher bar is
+  -- shown; when it isn't, fall through to normal cursor motion (feedkeys with the
+  -- "n" noremap flag, so no recursion). <CR> opens the selected subagent's drill-in
+  -- view (or returns to main on the "main" row). These only act when subagents
+  -- exist, so the panel's normal read behaviour is unchanged the rest of the time.
+  local function nav_or_default(delta, key)
+    if not widgets.subagent_nav(delta) then
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(key, true, false, true), "n", false)
+    end
+  end
+  vim.keymap.set("n", "<Up>",   function() nav_or_default(-1, "<Up>")   end,
+    { buffer = buf, noremap = true, silent = true, desc = "Claude: subagent switcher up" })
+  vim.keymap.set("n", "<Down>", function() nav_or_default(1,  "<Down>") end,
+    { buffer = buf, noremap = true, silent = true, desc = "Claude: subagent switcher down" })
+  vim.keymap.set("n", "<CR>", function()
+    widgets.subagent_enter()   -- no-op when no switcher; panel is otherwise read-only
+  end, { buffer = buf, noremap = true, silent = true, desc = "Claude: open subagent view" })
 end
 
 -- ─── Persistent bidirectional subprocess (spawn + send) ──────────────────────
@@ -2129,10 +2147,11 @@ function mod.reset()
   state.todos         = nil
   state.todo_seq      = nil
   widgets.close_todo_widget()
-  -- Goal 17: drop captured subagent sessions on session reset + close the switcher
-  -- bar (the drill-in view teardown joins here in 17.3).
+  -- Drop captured subagent sessions on session reset + close the switcher bar and
+  -- any open drill-in view.
   state.subagents     = nil
   state.subagent_sel  = 1
+  widgets.close_subagent_view()
   widgets.close_subagent_bar()
   if state.perm and state.perm.win and vim.api.nvim_win_is_valid(state.perm.win) then
     pcall(vim.api.nvim_win_close, state.perm.win, true)

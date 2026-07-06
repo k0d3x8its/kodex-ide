@@ -208,12 +208,21 @@ widgets.subagent_enter()
 H.check("U10 Enter on a subagent opens the drill-in view",
   claude.state.subagent_view_win ~= nil and vim.api.nvim_win_is_valid(claude.state.subagent_view_win)
   and claude.state.subagent_view == 1)
+H.check("U10 a green title tag opens alongside the view",
+  claude.state.subagent_tag_win ~= nil and vim.api.nvim_win_is_valid(claude.state.subagent_tag_win))
+H.check("U10 the tag shows the subagent title (its description)",
+  (vim.api.nvim_buf_get_lines(claude.state.subagent_tag_buf, 0, 1, false)[1] or "")
+    :find("Fable review", 1, true) ~= nil,
+  vim.api.nvim_buf_get_lines(claude.state.subagent_tag_buf, 0, 1, false)[1])
 claude.state.subagent_sel = 1   -- main
 widgets.subagent_enter()
 H.check("U10 Enter on main closes the drill-in view",
   claude.state.subagent_view == nil
   and (claude.state.subagent_view_win == nil
        or not vim.api.nvim_win_is_valid(claude.state.subagent_view_win)))
+H.check("U10 closing the view also closes the tag",
+  claude.state.subagent_tag_win == nil
+  or not vim.api.nvim_win_is_valid(claude.state.subagent_tag_win))
 
 -- ── U11: the drill-in renders the subagent's inner tool activity ───────────────
 

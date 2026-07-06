@@ -196,7 +196,10 @@ local function last_line_is_sep()
   return false
 end
 
-local function render_user(text)
+-- note (optional): the ~-relative path of a file whose context was attached to
+-- the WIRE this turn (open-buffer awareness v2). When set, a dim "· with @<file>"
+-- line is drawn under the echo so the ambient injection is visible to the user.
+local function render_user(text, note)
   if not text or text == "" then return end
   -- Draw the turn separator at the TOP of this turn (above the echo), unless a
   -- separator already sits there (banner divider on the first turn). Responses
@@ -241,6 +244,13 @@ local function render_user(text)
       if prose_row == 1 then hl_range(ln, 0, #USER_ARROW, "ClaudeArrow") end
       idx = idx + 1
     end
+  end
+  -- Open-buffer awareness v2 (c): a dim note showing which file's context rode
+  -- along on the wire this turn. Indented to sit under the prose echo.
+  if note and note ~= "" then
+    local ln = vim.api.nvim_buf_line_count(state.panel_buf)
+    buf_append({ "  · with @" .. note })
+    hl_lines(ln, ln, "ClaudeDim")
   end
 end
 Render.render_user = render_user

@@ -239,12 +239,20 @@ H.check("U12 the raw 300-char desc is NOT present in full",
 
 H.check("U13 not all-done while subagents[2] is still running",
   widgets.subagents_all_done() == false)
--- Close subagents[2] via the parent-turn Agent result (null parent, id = Agent id) —
--- the reliable "done" fallback when the system/task_* events don't match (FIX 3).
+-- A background agent's parent-turn result is only a launch ack — it must NOT mark
+-- the subagent done (else the switcher vanishes while it still runs). Feed one and
+-- assert status stays running.
 feed({ type = "user", parent_tool_use_id = vim.NIL, message = { content = { {
-  type = "tool_result", tool_use_id = "toolu_agent_B", content = "done",
+  type = "tool_result", tool_use_id = "toolu_agent_B",
+  content = "Async agent launched successfully.",
 } } } })
-H.check("U13 parent-turn Agent result flips status to completed",
+H.check("U13 launch-ack tool_result does NOT complete a running subagent",
+  claude.state.subagents[2].status ~= "completed", claude.state.subagents[2].status)
+-- The real terminal signal (system/task_notification, keyed by the Agent id) closes it.
+feed({ type = "system", subtype = "task_notification",
+  task_id = "task_B", tool_use_id = "toolu_agent_B", status = "completed",
+  usage = { total_tokens = 1200, tool_uses = 1, duration_ms = 5000 } })
+H.check("U13 task_notification completes the background subagent",
   claude.state.subagents[2].status == "completed", claude.state.subagents[2].status)
 H.check("U13 all-done once every subagent is terminal", widgets.subagents_all_done() == true)
 H.check("U13 all-done arms the deferred auto-dismiss", claude.state.subagent_dismiss_pending == true)

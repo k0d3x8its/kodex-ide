@@ -801,11 +801,58 @@ local function write_body_lines(entry, limit)
   return lines, hls
 end
 
+-- Greedy display-width word-wrap: split `s` into rows no wider than `width` cells.
+-- A single word longer than width is hard-split via disp_take so it never overflows.
+-- Used for the advisor summary so the whole sentence reads instead of clipping.
+local function wrap_disp(s, width)
+  local rows, line = {}, ""
+  for word in tostring(s):gmatch("%S+") do
+    if line == "" then
+      line = word
+    elseif vim.fn.strdisplaywidth(line .. " " .. word) <= width then
+      line = line .. " " .. word
+    else
+      rows[#rows + 1] = line; line = word
+    end
+    while vim.fn.strdisplaywidth(line) > width do   -- lone over-long word: hard-split
+      rows[#rows + 1] = disp_take(line, width)
+      line = line:sub(#disp_take(line, width) + 1)
+    end
+  end
+  if line ~= "" then rows[#rows + 1] = line end
+  return rows
+end
+
 -- Build the COLLAPSED preview: first K one-row-truncated lines off a dim `└`
 -- corner + a dim "… +N lines (ctrl+o to expand)" affordance on overflow.
 -- Returns (lines, line_hls) where line_hls[i] = list of {b0, b1, group}.
 local function build_collapsed(entry)
   if entry.kind == "write" then return write_body_lines(entry, WRITE_HEAD_K) end
+  -- Advisor-style summary collapse: the advice body is prose (a few VERY long
+  -- paragraph-lines), so a first-K preview would clip each paragraph to one row
+  -- with `…` and — when the body is ≤ RESULT_HEAD_K lines — leave no expand
+  -- affordance (dead ctrl+o). Instead collapse to a fixed one-line summary + a
+  -- green ✔, always expandable, mirroring the CC TUI's advisor block.
+  if entry.summary then
+    local avail = math.max(panel_width() - 6, 20)
+    local ck    = #"✔"                             -- byte width of the check glyph
+    -- Word-wrap the whole sentence + the expand affordance as one run, so the
+    -- "(ctrl+o to expand)" rides the last summary row instead of a line of its own
+    -- (clipping to one row hid the tail). ✔ leads row 1 (green); continuations hang
+    -- at the indent, all dim.
+    local rows  = wrap_disp("✔ " .. entry.summary .. "  (ctrl+o to expand)", avail)
+    local lines, hls = {}, {}
+    for i, r in ipairs(rows) do
+      local corner = (i == 1)
+      lines[i] = (corner and RES_CORNER or RES_INDENT) .. r
+      hls[i]   = corner
+        and { { 0, #RES_CORNER, "ClaudeDim" },                       -- dim corner
+              { #RES_CORNER, #RES_CORNER + ck, "ClaudeAdvisor" },    -- green ✔
+              { #RES_CORNER + ck, -1, "ClaudeDim" } }                -- dim text
+        or  { { 0, -1, "ClaudeDim" } }                               -- dim continuation
+    end
+    return lines, hls
+  end
   local group   = entry.is_error and "ClaudeError" or "ClaudeDim"
   local n_shown = math.min(#entry.body, RESULT_HEAD_K)
   local hidden  = #entry.body - n_shown
@@ -873,7 +920,7 @@ end
 -- stash it on state.tool_results for the <C-o> toggle. `meta` is the originating
 -- tool_use {name,path} — a Read result renders as a syntax-highlighted code block
 -- when expanded. Shared foundation for the skill-result / error / search features.
-local function render_tool_result(content, is_error, meta)
+local function render_tool_result(content, is_error, meta, opts)
   local body = tool_result_lines(content)
   if #body == 0 then return end
   local buf = state.panel_buf
@@ -899,7 +946,11 @@ local function render_tool_result(content, is_error, meta)
     is_error   = is_error,
     lang       = lang,                    -- filetype for the expanded code block (or nil)
     code_body  = code_body,               -- line-number-stripped body for code render
-    toggleable = #body > RESULT_HEAD_K,   -- only overflowing blocks collapse/expand
+    -- toggleable normally means vertical overflow (> K lines). always_toggle forces
+    -- it for prose blocks (advisor) whose few long lines would otherwise clip with no
+    -- expand escape. summary, when set, drives the one-line collapsed view above.
+    toggleable = (#body > RESULT_HEAD_K) or (opts and opts.always_toggle) or false,
+    summary    = opts and opts.summary,
     expanded   = false,
   }
 
@@ -915,6 +966,53 @@ local function render_tool_result(content, is_error, meta)
 
   buf_append({ "" })   -- trailing blank so the eol randomizer / next block clears the body
   state.tool_results[#state.tool_results + 1] = entry
+end
+
+-- The advisor tool (the "advisor strategy") is a SERVER-side tool: the executor
+-- model escalates a hard call to a stronger advisor model, which streams back as an
+-- `advisor_tool_result` content block, then the executor resumes. Two quirks drive
+-- this render:
+--   1. The tool_use arrives as `server_tool_use` (name "advisor"), not `tool_use`.
+--   2. The advisor MODEL is NOT in the stream — the executor envelope's model is
+--      the EXECUTOR. So we label "using <model>" from the panel's tracked
+--      state.advisor_model (the /advisor pick), exactly as the CC TUI does.
+-- Header mirrors a tool block: "● Advising using Opus 4.8" in bright-green ClaudeAdvisor.
+-- The canned one-line collapsed summary, verbatim from the CC TUI's advisor block.
+-- Unverified against a real (non-mock) consult — update if the live wording differs.
+local ADVISOR_SUMMARY = "Advisor has reviewed the conversation and will apply the feedback"
+local function render_advisor_header()
+  -- Mark the advisor call in-flight so the compute-phase word reads "Consulting"
+  -- (not "Typing") until the advice arrives. Cleared in render_advisor_result and,
+  -- as a safety net, at turn-end (result event) so it can never stick.
+  state.advisor_pending = true
+  local model  = state.advisor_model and friendly_model(state.advisor_model) or ""
+  local header = "● Advising" .. (model ~= "" and (" using " .. model) or "")
+  local first  = vim.api.nvim_buf_line_count(state.panel_buf)
+  buf_append({ header })
+  hl_lines(first, first, "ClaudeAdvisor")
+  buf_append({ "" })   -- randomizer row / attach point the advice body strips
+end
+
+-- The advice itself → the standard collapsible tool-result body under the
+-- "● Advising …" header. `content` is { type="advisor_result", text=<markdown> };
+-- an error result (e.g. "Advisor unavailable") carries no usable text, so render a
+-- short error line instead.
+local function render_advisor_result(content)
+  -- Advice arrived: the consult is over, so the compute word reverts to "Typing" as
+  -- the executor resumes composing (paired with render_advisor_header's set).
+  state.advisor_pending = false
+  local text = (type(content) == "table") and content.text or content
+  if type(text) ~= "string" or text == "" then
+    render_tool_result("Advisor unavailable", true, nil)
+  else
+    -- Collapsed = a fixed summary + green ✔ (always ctrl+o-expandable to the full,
+    -- word-wrapped advice), mirroring the CC TUI's advisor block. ADVISOR_SUMMARY is
+    -- the string observed in the TUI; if the real wording differs, change it here.
+    render_tool_result(text, false, nil, {
+      summary       = ADVISOR_SUMMARY,
+      always_toggle = true,
+    })
+  end
 end
 
 -- Render a Write's content as a numbered, indented, syntax-highlighted body under
@@ -1284,6 +1382,12 @@ local function dispatch(event)
         render_prose(block.text or "")
       elseif btype == "thinking" then
         render_thinking(block.thinking or "")
+      elseif btype == "server_tool_use" and (block.name == "advisor") then
+        -- Escalation to the advisor model: "● Advising using <model>" header. The
+        -- advice arrives as a separate advisor_tool_result block (below).
+        render_advisor_header()
+      elseif btype == "advisor_tool_result" then
+        render_advisor_result(block.content)
       elseif btype == "tool_use" then
         local name  = block.name or ""
         local input = block.input or {}

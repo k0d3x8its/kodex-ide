@@ -305,6 +305,8 @@ local function dispatch_send(text)
   state.system_ready = false
   state.working      = true
   state.turn_t0      = vim.loop.now()   -- cumulative turn timer (every spinner phase + churn line)
+  state.turn_paused_ms = 0              -- fresh turn: no accumulated modal-wait pause yet
+  state.pause_t0     = nil              -- not currently paused on a decision modal
   state.activity_t0  = vim.loop.now()   -- baseline for the first thinking block's timer
   state.think_dur    = nil              -- no stale duration from a prior turn
   state.think_tokens = 0

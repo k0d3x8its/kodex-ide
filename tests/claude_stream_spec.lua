@@ -634,4 +634,104 @@ H.check("S19 WebFetch header is the Fetching gerund",
 H.check("S19 WebFetch corner shows the url",
   panel_text():find("https://example.com/doc", 1, true) ~= nil, panel_text())
 
+-- ── S20: a NEW-file Write renders its content as a numbered, collapsible body ──
+-- Write to a nonexistent path gets its own "● Write(<file>)" header + "Wrote N
+-- lines to <file>" corner, then the content as a numbered body that collapses past
+-- 10 lines behind the "ctrl+o to expand" affordance (no red/green change summary —
+-- it's not an Edit). Placed last: it registers a tool_results fold entry + leaves a
+-- collapse affordance in the panel, which earlier panel-wide assertions would trip.
+claude.state.think_start = nil
+claude.state.tool_run    = nil
+local wpath = "/tmp/kodex_write_probe_nonexistent.py"
+os.remove(wpath)   -- ensure NEW file → numbered-body path (not the accept-time diff)
+local wbody = {}
+for i = 1, 13 do wbody[i] = "x" .. i .. " = " .. i end
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", name = "Write", input = { file_path = wpath, content = table.concat(wbody, "\n") },
+} } } })
+local wt = panel_text()
+H.check("S20 Write header is '● Write <file>' (no parens)",
+  wt:find("● Write ", 1, true) ~= nil and wt:find("● Write(", 1, true) == nil, wt)
+H.check("S20 corner reads 'Wrote 13 lines to …'", wt:find("Wrote 13 lines to", 1, true) ~= nil, wt)
+H.check("S20 numbered content body rendered", wt:find("%f[%d]1%s+x1 = 1") ~= nil, wt)
+H.check("S20 overflow collapses behind ctrl+o affordance",
+  wt:find("+3 lines (ctrl+o to expand)", 1, true) ~= nil, wt)
+H.check("S20 Write shows NO Edit-style change summary",
+  wt:find("Added 13 lines", 1, true) == nil, wt)
+H.check("S20 Write body stashed as a toggleable 'write' fold entry",
+  (function()
+    local last = claude.state.tool_results and claude.state.tool_results[#claude.state.tool_results]
+    return last and last.kind == "write" and #last.code_lines == 13 and last.toggleable == true
+  end)())
+
+-- ── S21: fg-only twin cache survives a colorscheme wipe (#8a regression) ──────
+-- A `:colorscheme` runs `:highlight clear`, wiping the ns-0 ClaudeCode*Fg twins
+-- the edit-hunk / Write body syntax spans point at. define_highlights() restores
+-- the BASE groups on ColorScheme, but the render module caches the derived twins
+-- forever — so without invalidation the next render reuses a cached twin NAME
+-- pointing at a now-EMPTY group → code renders with no syntax colour. The fix:
+-- the ColorScheme autocmd calls render.reset_hunk_fg_cache() so twins re-derive.
+local render = require("utils.claude.render")
+local function twin_has_fg()
+  return not vim.tbl_isempty(vim.api.nvim_get_hl(0, { name = "ClaudeCodeKeywordFg" }))
+end
+-- Base group present (as define_highlights would leave it); derive the twin once.
+vim.api.nvim_set_hl(0, "ClaudeCodeKeyword", { fg = "#FF79C6" })
+render._hunk_fg_group("ClaudeCodeKeyword")
+H.check("S21 twin derived with fg on first use", twin_has_fg())
+
+-- Simulate the :colorscheme wipe: the twin group is cleared, the base survives
+-- (its own ColorScheme handler re-created it). The cache still holds the twin.
+vim.api.nvim_set_hl(0, "ClaudeCodeKeywordFg", {})
+H.check("S21 :colorscheme wipes the twin group", not twin_has_fg())
+render._hunk_fg_group("ClaudeCodeKeyword")   -- cached name returned; NOT re-derived
+H.check("S21 stale cache leaves the twin empty (the bug)", not twin_has_fg())
+
+-- The fix: invalidating the cache makes the next derive rebuild the twin.
+render.reset_hunk_fg_cache()
+render._hunk_fg_group("ClaudeCodeKeyword")
+H.check("S21 reset_hunk_fg_cache re-derives the twin with fg", twin_has_fg())
+
+-- ── S22: turn timer pauses while a decision modal is up (Waiting…) ────────────
+-- A decision modal blocks the CLI on the USER; the turn clock must freeze so the
+-- wait isn't counted (matching the official TUI's "waiting…"). gated() detects any
+-- of the modal states; turn_elapsed_ms() subtracts accumulated + in-progress pause.
+local core = require("utils.claude.core")
+
+-- gated() is true for EACH decision-modal state, false when none is up.
+for _, field in ipairs({ "perm", "prewrite", "qask", "diff_card" }) do
+  claude.state.perm, claude.state.prewrite = nil, nil
+  claude.state.qask, claude.state.diff_card, claude.state.diff_pending = nil, nil, nil
+  claude.state[field] = (field == "diff_pending") and true or {}
+  H.check("S22 gated() true when state." .. field .. " is set", claude._gated() == true)
+end
+claude.state.perm, claude.state.prewrite = nil, nil
+claude.state.qask, claude.state.diff_card, claude.state.diff_pending = nil, nil, nil
+H.check("S22 gated() false when no modal is up", claude._gated() == false)
+
+-- turn_elapsed_ms excludes the accumulated pause total.
+claude.state.turn_t0        = vim.loop.now() - 5000   -- turn started 5s ago
+claude.state.turn_paused_ms = 2000                    -- 2s of that was modal-wait
+claude.state.pause_t0       = nil
+local e1 = core.turn_elapsed_ms()
+H.check("S22 elapsed excludes accumulated pause (~3s)", e1 >= 2800 and e1 <= 3200, e1)
+
+-- An IN-PROGRESS pause (pause_t0 set) is also subtracted, live.
+claude.state.pause_t0 = vim.loop.now() - 1000         -- currently 1s into a pause
+local e2 = core.turn_elapsed_ms()
+H.check("S22 elapsed excludes in-progress pause (~2s)", e2 >= 1800 and e2 <= 2200, e2)
+
+-- resume_turn folds the in-progress pause into the total and clears pause_t0.
+core.resume_turn()
+H.check("S22 resume_turn clears pause_t0", claude.state.pause_t0 == nil)
+H.check("S22 resume_turn folds pause into total (~3000ms)",
+  claude.state.turn_paused_ms >= 2900 and claude.state.turn_paused_ms <= 3100,
+  claude.state.turn_paused_ms)
+
+-- pause_turn is idempotent: a second call keeps the original pause origin.
+claude.state.pause_t0 = nil
+core.pause_turn(); local first = claude.state.pause_t0
+core.pause_turn()
+H.check("S22 pause_turn is idempotent (origin preserved)", claude.state.pause_t0 == first)
+
 H.summary("claude_stream")

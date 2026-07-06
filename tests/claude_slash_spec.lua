@@ -84,16 +84,17 @@ H.check("S4 menu starts closed", slash.active() == false)
 
 slash.open(ibuf, "", 3, function() end)   -- empty query → all commands, sorted
 H.check("S4 menu opens", slash.active() == true)
--- Sorted list: brainstorm, changelog, compact, diagnose, review → first is brainstorm.
-H.check("S4 first selection is the alphabetical first (brainstorm)",
-  slash.selected() == "brainstorm", tostring(slash.selected()))
+-- Sorted list includes the LOCAL_COMMANDS (advisor, effort): advisor, brainstorm,
+-- changelog, compact, diagnose, effort, review → first is advisor (leading "a").
+H.check("S4 first selection is the alphabetical first (advisor)",
+  slash.selected() == "advisor", tostring(slash.selected()))
 
 slash.move(1)
-H.check("S4 ↓ advances the selection", slash.selected() == "changelog", tostring(slash.selected()))
+H.check("S4 ↓ advances the selection", slash.selected() == "brainstorm", tostring(slash.selected()))
 slash.move(-1)
-H.check("S4 ↑ returns to the top", slash.selected() == "brainstorm", tostring(slash.selected()))
+H.check("S4 ↑ returns to the top", slash.selected() == "advisor", tostring(slash.selected()))
 slash.move(-1)   -- clamp at top
-H.check("S4 ↑ clamps at the first row", slash.selected() == "brainstorm")
+H.check("S4 ↑ clamps at the first row", slash.selected() == "advisor")
 
 -- Re-filter to a prefix: only "c*" commands, selection resets to the top.
 slash.open(ibuf, "c", 3, function() end)

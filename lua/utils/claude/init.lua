@@ -2129,10 +2129,11 @@ function mod.reset()
   state.todos         = nil
   state.todo_seq      = nil
   widgets.close_todo_widget()
-  -- Goal 17.1: drop captured subagent sessions on session reset. The switcher
-  -- bar + drill-in view (17.2/17.3) get their own teardown here once they exist.
+  -- Goal 17: drop captured subagent sessions on session reset + close the switcher
+  -- bar (the drill-in view teardown joins here in 17.3).
   state.subagents     = nil
   state.subagent_sel  = 1
+  widgets.close_subagent_bar()
   if state.perm and state.perm.win and vim.api.nvim_win_is_valid(state.perm.win) then
     pcall(vim.api.nvim_win_close, state.perm.win, true)
   end

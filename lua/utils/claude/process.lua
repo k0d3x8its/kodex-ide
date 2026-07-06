@@ -345,11 +345,13 @@ local function send(text)
   -- echo appended below it — and then stop_spinner's "delete last line" would eat
   -- the echo instead of the placeholder.
   remove_typing_ph()
-  render_user(text)
+  -- Resolve the open-buffer @-mention BEFORE the echo so render_user can show the
+  -- dim "· with @file" note (v2c). wire carries the mention; note = the display
+  -- path when an attach fired this turn (nil = nothing attached, no note).
+  local wire, note = attach_host_context(text)
+  render_user(text, note)
   buf_append({ "" })
-  -- Wire text may carry a first-turn @-mention of the open file; the echo above
-  -- shows the user's own text unchanged.
-  dispatch_send(attach_host_context(text))
+  dispatch_send(wire)
 end
 Process.send = send
 

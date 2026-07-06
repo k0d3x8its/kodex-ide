@@ -734,4 +734,74 @@ core.pause_turn(); local first = claude.state.pause_t0
 core.pause_turn()
 H.check("S22 pause_turn is idempotent (origin preserved)", claude.state.pause_t0 == first)
 
+-- ── S23: advisor strategy render (server_tool_use + advisor_tool_result) ───────
+-- The advisor escalation arrives as a `server_tool_use` (name "advisor") header +
+-- a separate `advisor_tool_result` body. The advisor MODEL is NOT in the stream —
+-- it's labelled from state.advisor_model (the /advisor pick). Shapes captured live
+-- (Sonnet executor / Opus advisor). See .work/FINDINGS.md § Q-ADVISOR.
+claude.state.think_start   = nil
+claude.state.tool_run      = nil
+claude.state.advisor_model = "opus"
+feed({ type = "assistant", message = { content = { {
+  type = "server_tool_use", id = "srvtoolu_1", name = "advisor", input = {},
+} } } })
+H.check("S23 advisor header labels the tracked advisor model",
+  panel_text():find("● Advising using Opus 4.8", 1, true) ~= nil, panel_text())
+-- The header marks the consult in-flight, so the compute-phase word reads
+-- "Consulting" (not "Typing") until the advice lands.
+H.check("S23 in-flight consult sets advisor_pending + 'Consulting' word",
+  claude.state.advisor_pending == true and claude._activity_word() == "Consulting",
+  tostring(claude.state.advisor_pending) .. " / " .. claude._activity_word())
+
+feed({ type = "assistant", message = { content = { {
+  type = "advisor_tool_result", tool_use_id = "srvtoolu_1",
+  content = { type = "advisor_result", text = "Consult the protocol, not your notes." },
+} } } })
+-- Advice arrived → flag clears, word reverts to "Typing" for the executor's resume.
+H.check("S23 advice clears advisor_pending + word reverts to 'Typing'",
+  claude.state.advisor_pending == false and claude._activity_word() == "Typing",
+  tostring(claude.state.advisor_pending) .. " / " .. claude._activity_word())
+-- The advice is prose (long paragraph-lines), so the panel collapses it to a fixed
+-- one-line summary + green ✔ (always ctrl+o-expandable) rather than a clipped
+-- first-K preview. Assert: (1) the canned summary shows, (2) the expand affordance
+-- shows, (3) the raw advice is NOT in the collapsed panel but IS stored on the
+-- tool_results entry (so ctrl+o can expand to the full, word-wrapped advice).
+-- Prefix only: the summary clips to panel width in the narrow test viewport.
+H.check("S23 advisor advice collapses to the canned summary line",
+  panel_text():find("✔ Advisor has reviewed", 1, true) ~= nil, panel_text())
+H.check("S23 advisor collapsed block is expandable (ctrl+o affordance)",
+  panel_text():find("ctrl+o to expand", 1, true) ~= nil, panel_text())
+H.check("S23 raw advice hidden when collapsed but kept for expansion",
+  panel_text():find("Consult the protocol", 1, true) == nil
+    and (function()
+      local e = claude.state.tool_results and claude.state.tool_results[#claude.state.tool_results]
+      return e and e.toggleable and table.concat(e.body, "\n"):find("Consult the protocol", 1, true) ~= nil
+    end)(), panel_text())
+
+-- No tracked advisor (nil) → header omits the "using <model>" suffix, no crash.
+claude.state.think_start   = nil
+claude.state.tool_run      = nil
+claude.state.advisor_model = nil
+feed({ type = "assistant", message = { content = { {
+  type = "server_tool_use", id = "srvtoolu_2", name = "advisor", input = {},
+} } } })
+-- Assert a STANDALONE "● Advising" line exists (no "using" suffix). Checking the
+-- whole buffer for absence of "using" would false-fail on the earlier Opus header,
+-- so match an exact line instead.
+H.check("S23 header without a tracked model shows bare '● Advising'",
+  (function()
+    for _, l in ipairs(vim.api.nvim_buf_get_lines(claude.state.panel_buf, 0, -1, false)) do
+      if l == "● Advising" then return true end
+    end
+    return false
+  end)(), panel_text())
+
+-- An error result (no usable text) renders the "Advisor unavailable" line.
+feed({ type = "assistant", message = { content = { {
+  type = "advisor_tool_result", tool_use_id = "srvtoolu_2",
+  content = { type = "advisor_result" },   -- no text field
+} } } })
+H.check("S23 error/empty advisor result shows 'Advisor unavailable'",
+  panel_text():find("Advisor unavailable", 1, true) ~= nil, panel_text())
+
 H.summary("claude_stream")

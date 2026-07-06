@@ -209,7 +209,12 @@ function M.accept_all()
     blk_old  = vim.api.nvim_buf_get_lines(s.orig_buf, 0, -1, false)
     blk_new  = vim.api.nvim_buf_get_lines(s.scratch, 0, -1, false)
   end
+  -- Captured before close_diff() below resets s.kind. A NEW-file Write already
+  -- rendered its content inline as a numbered body at tool_use time
+  -- (render.render_write_body), so the accept-time red/green hunk would double it up.
+  local is_new = s.kind == "new"
   local function emit_transcript_block()
+    if is_new then return end
     if blk_old and blk_new then pcall(claude.render_edit_block, blk_path, blk_old, blk_new) end
   end
   -- Pre-write gate: nothing to write — accepting RELEASES the held permission

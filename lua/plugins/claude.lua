@@ -276,9 +276,16 @@ return {
 
     -- Re-apply after any colorscheme change (`:colorscheme X` resets all
     -- user-defined highlights; without this autocmd the panel goes grey).
+    -- Also drop the render module's derived fg-only twin cache: `:colorscheme`
+    -- wipes the ns-0 twins (ClaudeCode*Fg) used by the edit-hunk / Write body
+    -- syntax spans, and their cache would otherwise keep pointing at the wiped
+    -- (empty) groups → code renders with no syntax colour (see reset_hunk_fg_cache).
     vim.api.nvim_create_autocmd("ColorScheme", {
       group    = vim.api.nvim_create_augroup("ClaudeHighlights", { clear = true }),
-      callback = define_highlights,
+      callback = function()
+        define_highlights()
+        pcall(function() require("utils.claude.render").reset_hunk_fg_cache() end)
+      end,
     })
 
     -- Right-click "Ask Claude" on a visual selection, at the TOP of the PopUp

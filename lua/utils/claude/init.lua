@@ -1143,25 +1143,47 @@ local function current_host_file(prefer_win)
 end
 mod._current_host_file = current_host_file
 
--- Append an @<abspath> mention of the open file to the WIRE text on the FIRST
--- turn of a session, so the CLI inlines the file with no Read round-trip
--- (verified: stream-json input honours @-mentions, absolute paths included —
--- FINDINGS § Q-CTX empirical result). Once per session (host_ctx_sent); later
--- turns send the user's text verbatim. NEUTRAL phrasing only — command-y text
--- ("ignore … do not use tools") trips the CLI's prompt-injection heuristic. The
--- transcript echo stays the user's own text; only the wire carries the mention.
+-- Fold the open editor file into the WIRE text so Claude stays aware of it.
+-- v2 (option A — token-efficient): a FULL @<abspath> mention only on the FIRST
+-- turn for a file (and on a file SWITCH) — the CLI inlines the whole file with no
+-- Read round-trip (verified: stream-json honours @-mentions, absolute paths
+-- included — FINDINGS § Q-CTX). On REPEAT turns for the SAME file the content is
+-- already in session history, so re-inlining every turn would bloat the context
+-- window; instead a cheap plain-text path breadcrumb (NO @, so no re-inline) is
+-- appended so a bare "this file" still resolves. Without the breadcrumb the model
+-- loses the referent on turn 2+ and asks for the path (observed live 2026-07-06).
+--
+-- The LIVE editor file is resolved each send (current_host_file()); host_ctx_last_
+-- path tracks the file last folded in, distinguishing "changed → full inline" from
+-- "same → breadcrumb". NEUTRAL phrasing only — command-y text ("ignore … do not
+-- use tools") trips the CLI's prompt-injection heuristic. Returns (wire_text,
+-- note): note = the ~-relative display path ONLY on a full inline (first/changed),
+-- for render_user's dim echo line; nil on a breadcrumb or no-op. The transcript
+-- echo always stays the user's own text; only the wire carries the fold-in.
 local function attach_host_context(text)
-  if not state.host_ctx_enabled then return text end
-  if state.host_ctx_sent then return text end
-  local hf = state.host_file or current_host_file()
-  if not hf then return text end
-  state.host_ctx_sent = true
-  -- Don't double-attach if the user already referenced the file themselves.
+  if not state.host_ctx_enabled then return text, nil end
+  -- Prefer the live editor file so a mid-session switch is picked up: the focused
+  -- window first (a user reading a split), else the tabpage scan; fall back to the
+  -- panel-open snapshot if no editor window is live. In a real send the panel float
+  -- holds focus (host_file_of filters it out), so this resolves to the scan.
+  local hf = current_host_file(vim.api.nvim_get_current_win()) or state.host_file
+  if not hf then return text, nil end
+  -- User already named the file themselves — nothing to fold in; mark it seen so a
+  -- later bare "this file" gets a breadcrumb, not a fresh full inline. No note.
   if text:find(hf.path, 1, true) or text:find("@" .. hf.disp, 1, true) then
-    return text
+    state.host_ctx_last_path = hf.path
+    return text, nil
   end
-  return text .. "\n\n(For context, the file I currently have open in my editor: @"
-    .. hf.path .. ")"
+  local changed = hf.path ~= state.host_ctx_last_path
+  state.host_ctx_last_path = hf.path
+  if changed then
+    -- First turn on this file (or a switch): full @<abspath> → CLI inlines it.
+    return text .. "\n\n(For context, the file I currently have open in my editor: @"
+      .. hf.path .. ")", hf.disp
+  end
+  -- Same file, repeat turn: cheap breadcrumb, no re-inline, no note.
+  return text .. "\n\n(Still working in the file open in my editor: "
+    .. hf.path .. ")", nil
 end
 mod._attach_host_context = attach_host_context
 
@@ -1184,11 +1206,12 @@ end
 state.host_ctx_enabled = load_host_ctx_pref()
 
 -- Toggle open-buffer awareness on/off (<leader>cb) and remember it across
--- restarts. Off = the panel never injects the open file; on = silent first-turn
--- @-mention. host_ctx_sent is reset so re-enabling mid-session re-arms injection.
+-- restarts. Off = the panel never injects the open file; on = @-mention on the
+-- next send. host_ctx_last_path is cleared so re-enabling mid-session re-arms
+-- injection for the current file.
 function mod.toggle_host_ctx()
   state.host_ctx_enabled = not state.host_ctx_enabled
-  state.host_ctx_sent = false
+  state.host_ctx_last_path = nil
   save_host_ctx_pref(state.host_ctx_enabled)
   vim.notify(
     "Claude open-buffer context " .. (state.host_ctx_enabled and "ON" or "OFF")
@@ -2018,7 +2041,7 @@ function mod.toggle(root_override)
     state.panel_win    = nil
     state.claude_active = false
     state.host_file     = nil
-    state.host_ctx_sent = false
+    state.host_ctx_last_path = nil
     pcall(vim.api.nvim_del_augroup_by_name, "ClaudeDirTrack")
     require("utils.claude_diff").on_panel_close()
     return
@@ -2038,7 +2061,7 @@ function mod.toggle(root_override)
   -- a reopen (which reuses scrollback + an already-primed session).
   local fresh         = vim.api.nvim_buf_line_count(buf) <= 1
   state.host_file     = current_host_file(prev_win)
-  if fresh then state.host_ctx_sent = false end
+  if fresh then state.host_ctx_last_path = nil end
   open_panel_window(buf)
 
   -- Render banner on fresh buffer only (reopen after close reuses scrollback).
@@ -2051,8 +2074,10 @@ function mod.toggle(root_override)
       vim.fn.fnamemodify(state.stored_root or root, ":~"))
   end
   clear_hint()
-  -- No auto-prompt: matching OpenCode, the open file is injected SILENTLY on the
-  -- user's first real message (attach_host_context), not announced up front.
+  -- No auto-prompt: matching OpenCode, the open file is injected on the user's
+  -- first real message (attach_host_context) — and re-injected on a file switch —
+  -- not announced up front. v2 surfaces each attach as a dim echo note, not a
+  -- separate prompt.
 end
 
 --- Open the panel without toggling — dock-launch flow (FINDINGS.md § A2).
@@ -2097,7 +2122,7 @@ function mod.reset()
   state.diff_pending  = false
   state.prewrite      = nil
   state.host_file     = nil
-  state.host_ctx_sent = false
+  state.host_ctx_last_path = nil
   state.tool_results  = {}
   state.tool_meta     = {}
   state.search_blocks = {}

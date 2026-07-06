@@ -1356,6 +1356,7 @@ local function dispatch(event)
       sub.task_id = event.task_id
       if type(event.description) == "string" then sub.desc = event.description end
       if type(event.subagent_type) == "string" then sub.kind = event.subagent_type end
+      widgets.update_subagent_bar()   -- refresh row text (same height, no reflow)
     end
 
   elseif ev_type == "system" and event.subtype == "task_updated" then
@@ -1364,6 +1365,7 @@ local function dispatch(event)
     local sub = subagent_by_task(event.task_id)
     if sub and type(event.patch) == "table" and type(event.patch.status) == "string" then
       sub.status = event.patch.status
+      widgets.update_subagent_bar()   -- status word → glyph/meta refresh
     end
 
   elseif ev_type == "system" and event.subtype == "task_notification" then
@@ -1375,6 +1377,7 @@ local function dispatch(event)
       if type(event.usage) == "table" then sub.usage = event.usage end
       if type(event.summary) == "string" then sub.summary = event.summary end
       if type(event.status) == "string" then sub.status = event.status end
+      widgets.update_subagent_bar()   -- final tokens/duration → meta refresh
     end
 
   elseif ev_type == "stream_event" then
@@ -1517,6 +1520,10 @@ local function dispatch(event)
             usage    = nil,
             summary  = nil,
           }
+          -- The switcher appears / grows a row → refresh it AND reflow (its height
+          -- changed, so the Task card + chat bar must lift above it). 17.2.
+          widgets.update_subagent_bar()
+          widgets.reflow_bottom_floats()
         end
         -- MG 14.2: pre-load the edit target so the FileChangedShell interceptor
         -- catches the CLI's write (covers new + unloaded files). tool_use always

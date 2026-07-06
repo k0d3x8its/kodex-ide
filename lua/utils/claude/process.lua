@@ -172,6 +172,14 @@ local function build_args()
     table.insert(args, "--effort")
     table.insert(args, state.effort)
   end
+  -- --advisor sets the server-side advisor model at spawn (hidden flag, accepted
+  -- but not in --help). nil = No advisor → omit the flag so the CLI leaves it
+  -- unset. Mid-session changes go through apply_flag_settings (no respawn), so
+  -- this only seeds a FRESH session with the current pick.
+  if state.advisor_model and state.advisor_model ~= "" then
+    table.insert(args, "--advisor")
+    table.insert(args, state.advisor_model)
+  end
   return args
 end
 

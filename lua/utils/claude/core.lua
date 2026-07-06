@@ -208,8 +208,45 @@ Core.state = {
   -- and reused to drive the chat bar's "/" command menu (see claude/slash.lua).
   -- Names only — descriptions are resolved separately from skill/command files.
   slash_commands = nil,
+
+  -- Turn-timer pause accounting. While a decision modal (permission / prewrite /
+  -- question / diff-review card) is up, the CLI is blocked on the USER, so the
+  -- turn timer freezes and the spinner reads "Waiting…" (matching the official
+  -- TUI). turn_paused_ms accumulates completed pauses; pause_t0 is the start of
+  -- the CURRENT pause (nil when not paused). turn_elapsed_ms() subtracts both so
+  -- the climbing timer + the "✻ …for Ns" done line exclude the wait. Reset at
+  -- dispatch alongside turn_t0.
+  turn_paused_ms = 0,
+  pause_t0       = nil,
 }
 local state = Core.state
+
+-- Wall-clock ms the model has actually been working this turn, EXCLUDING time
+-- spent paused on a user-decision modal. now - turn_t0 minus the accumulated
+-- pause total minus the in-progress pause (if currently paused). Shared by the
+-- live spinner label and the past-tense done line so both read the same number.
+function Core.turn_elapsed_ms()
+  if not state.turn_t0 then return 0 end
+  local paused = state.turn_paused_ms or 0
+  if state.pause_t0 then paused = paused + (vim.loop.now() - state.pause_t0) end
+  return vim.loop.now() - state.turn_t0 - paused
+end
+
+-- Mark the turn clock paused (a decision modal just went up). Idempotent — a
+-- second call while already paused keeps the original start, so re-entrant paths
+-- (spinner tick + card open racing) don't lose the pause origin.
+function Core.pause_turn()
+  if not state.pause_t0 then state.pause_t0 = vim.loop.now() end
+end
+
+-- Resume the turn clock (the modal resolved): fold the just-ended pause into the
+-- accumulated total so turn_elapsed_ms() keeps excluding it. No-op if not paused.
+function Core.resume_turn()
+  if state.pause_t0 then
+    state.turn_paused_ms = (state.turn_paused_ms or 0) + (vim.loop.now() - state.pause_t0)
+    state.pause_t0 = nil
+  end
+end
 
 Core.opts = {
   width_pct = 0.40,

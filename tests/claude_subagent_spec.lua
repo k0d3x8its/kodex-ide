@@ -82,22 +82,33 @@ H.check("U1 ● Task header still rendered inline in main",
 
 -- ── U2: inner events (parent-tagged) accumulate into the sink AND hit main ─────
 
-local main_before = panel_text()
+local function main_lines() return vim.api.nvim_buf_line_count(claude.state.panel_buf) end
+
+local rows0 = main_lines()
 feed({ type = "assistant", parent_tool_use_id = AGENT_ID, message = { content = { {
   type = "tool_use", id = "toolu_bash_1", name = "Bash",
-  input = { command = "echo hello-from-subagent" },
+  input = { command = "echo hi" },
 } } } })
+local rows_after_call = main_lines()
 feed({ type = "user", parent_tool_use_id = AGENT_ID, message = { content = { {
   type = "tool_result", tool_use_id = "toolu_bash_1", content = "hello-from-subagent",
 } } } })
+local rows_after_result = main_lines()
 
 subs = claude.state.subagents
 H.check("U2 both inner events accumulated into the sink",
   subs and #subs[1].events == 2, subs and #subs[1].events)
 H.check("U2 sink holds the raw inner tool_use event",
   subs and subs[1].events[1].message.content[1].name == "Bash")
-H.check("U2 inner activity ALSO rendered inline in main (Option B fall-through)",
-  #panel_text() > #main_before, "main should grow — inner events aren't hidden")
+-- Inner tool CALLS render as a compact nested one-liner in main.
+H.check("U2 inner tool call shows as a compact nested one-liner in main",
+  panel_text():find("    ● Bash(", 1, true) ~= nil, panel_text())
+H.check("U2 inner tool call added exactly one nested row", rows_after_call - rows0 == 1,
+  tostring(rows_after_call - rows0))
+-- Inner tool RESULT bodies do NOT flood main (they live in the drill-in view only).
+H.check("U2 inner tool_result body adds nothing to main", rows_after_result == rows_after_call)
+H.check("U2 inner tool_result body is NOT dumped into main",
+  panel_text():find("hello-from-subagent", 1, true) == nil, panel_text())
 
 -- A null-parent event must NOT land in any sink.
 feed({ type = "assistant", parent_tool_use_id = vim.NIL, message = { content = { {
@@ -209,8 +220,8 @@ H.check("U10 Enter on main closes the drill-in view",
 local ev_lines = widgets.render_subagent_events(claude.state.subagents[1])
 local ev_text  = table.concat(ev_lines, "\n")
 H.check("U11 drill-in shows the inner Bash tool call",
-  ev_text:find("Bash(echo hello-from-subagent", 1, true) ~= nil, ev_text)
-H.check("U11 drill-in shows the tool result body",
+  ev_text:find("Bash(echo hi", 1, true) ~= nil, ev_text)
+H.check("U11 drill-in shows the tool result body (kept out of main, shown here)",
   ev_text:find("hello-from-subagent", 1, true) ~= nil)
 
 -- ── U12: a long description truncates so the meta stays visible (overflow fix) ──
@@ -228,10 +239,15 @@ H.check("U12 the raw 300-char desc is NOT present in full",
 
 H.check("U13 not all-done while subagents[2] is still running",
   widgets.subagents_all_done() == false)
-claude.state.subagents[2].status = "completed"
+-- Close subagents[2] via the parent-turn Agent result (null parent, id = Agent id) —
+-- the reliable "done" fallback when the system/task_* events don't match (FIX 3).
+feed({ type = "user", parent_tool_use_id = vim.NIL, message = { content = { {
+  type = "tool_result", tool_use_id = "toolu_agent_B", content = "done",
+} } } })
+H.check("U13 parent-turn Agent result flips status to completed",
+  claude.state.subagents[2].status == "completed", claude.state.subagents[2].status)
 H.check("U13 all-done once every subagent is terminal", widgets.subagents_all_done() == true)
-widgets.maybe_dismiss_subagents()
-H.check("U13 maybe_dismiss arms the deferred close", claude.state.subagent_dismiss_pending == true)
+H.check("U13 all-done arms the deferred auto-dismiss", claude.state.subagent_dismiss_pending == true)
 
 -- ── U5: mod.reset() drops all subagent sessions + closes the bar ───────────────
 

@@ -520,7 +520,7 @@ local function spinner_label()
   -- including the post-tool model round-trip — ever looks frozen. The flavour word
   -- stays the PRIMARY verb the whole turn (set once at dispatch).
   local word    = state.flavor_word or "Working"
-  local elapsed = state.turn_t0 and fmt_think_dur(vim.loop.now() - state.turn_t0) or "0s"
+  local elapsed = fmt_think_dur(core.turn_elapsed_ms())
   local parts   = { elapsed }
   -- The PHASE word (thinking / typing / a tool label) is NO LONGER in the bracket:
   -- the phase now shows exactly once, either as the in-body activity line
@@ -536,6 +536,25 @@ local function spinner_label()
   return string.format("%s %s… [%s]\n<Esc> to interrupt", frame, word, table.concat(parts, " · "))
 end
 mod._spinner_label = spinner_label
+
+-- A user-decision modal is up and the CLI is blocked on the user: the permission
+-- card, the pre-write edit gate, the AskUserQuestion card, or the diff-review
+-- card. While any is up the turn timer must FREEZE (the wait isn't the model's
+-- work) and the spinner reads "Waiting…" — matching the official TUI which pauses
+-- its clock until the user acts. diff_pending rides along: an open unreviewed
+-- vimdiff is the same "your decision needed" state even without a float card.
+local function gated()
+  return state.perm ~= nil or state.prewrite ~= nil or state.qask ~= nil
+    or state.diff_card ~= nil or state.diff_pending == true
+end
+mod._gated = gated
+
+-- The frozen "Waiting…" hint shown in place of the climbing spinner while a
+-- decision modal owns the panel. The braille frame still animates so the panel
+-- reads alive, but NO timer — the clock is paused (see turn_elapsed_ms).
+local function waiting_label()
+  return string.format("%s Waiting…\n<Esc> to interrupt", SPINNER[spin_i])
+end
 
 local function stop_spinner()
   if state.spin_timer then
@@ -563,8 +582,19 @@ local function start_spinner()
   render_queue()
   state.spin_timer = vim.fn.timer_start(110, function()
     if not state.working then stop_spinner(); return end
-    if state.perm then remove_typing_ph(); return end  -- a permission card owns the panel; don't clobber
     spin_i = spin_i % #SPINNER + 1
+    if gated() then
+      -- A decision modal owns the panel: pause the turn clock and show a frozen
+      -- "Waiting…" hint. Don't clobber the body with the typing placeholder — the
+      -- modal float is the active surface.
+      core.pause_turn()
+      remove_typing_ph()
+      set_hint(waiting_label(), "ClaudeInput")
+      return
+    end
+    -- Not (any longer) gated: fold the just-ended pause into the accumulated total
+    -- so the resumed timer excludes the wait, then resume the normal spinner.
+    core.resume_turn()
     tick_typing_ph()
     set_hint(spinner_label(), "ClaudeInput")
     -- Re-anchor the queue to the (now lower) last line as output streams in.
@@ -782,6 +812,15 @@ gate.wire({
   clear_hint       = clear_hint,
   prompt_input     = function() mod.prompt_input() end,
   float_bottom_row = widgets.float_bottom_row,
+  -- Reserve transcript space under the perm / diff cards so live output (and the
+  -- "Waiting…" hint) sits ABOVE the card instead of peeking below it — same pad
+  -- contract the question card + chat bar use.
+  set_bottom_pad   = set_bottom_pad,
+  clear_bottom_pad = clear_bottom_pad,
+  -- Paint the frozen "Waiting…" hint when the permission card stops the spinner
+  -- (the diff/prewrite/question gates keep the spinner running, so their tick
+  -- shows it directly — this covers the one gate that halts the tick).
+  set_waiting_hint = function() set_hint(waiting_label(), "ClaudeInput") end,
 })
 
 -- Re-source the gate helpers init still calls directly (event dispatcher, chat bar)
@@ -859,6 +898,7 @@ question.wire({
   stop_spinner              = stop_spinner,
   clear_hint                = clear_hint,
   prompt_input              = function() mod.prompt_input() end,
+  set_waiting_hint          = function() set_hint(waiting_label(), "ClaudeInput") end,
 })
 -- Re-export the question card's test hooks so the `mod._question*` spec references
 -- resolve; they moved to claude/question.lua (Goal 15.4). The dispatch call site

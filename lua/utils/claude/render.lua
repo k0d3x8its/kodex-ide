@@ -1270,11 +1270,46 @@ local function render_result(_text)
   hl_lines(l, l, "ClaudeDim")
 end
 
+-- ─── Subagent lookup helpers (Goal 17) ────────────────────────────────────────
+
+-- Resolve a subagent entry by the Agent tool_use id (inner events +
+-- task_notification key on this). nil if none / no subagents yet.
+local function subagent_by_id(id)
+  if not (id and state.subagents) then return nil end
+  for _, s in ipairs(state.subagents) do
+    if s.id == id then return s end
+  end
+  return nil
+end
+
+-- Resolve by task_id (task_updated keys on this; linked to the Agent id at
+-- task_started). Separate id space from the tool_use id above.
+local function subagent_by_task(task_id)
+  if not (task_id and state.subagents) then return nil end
+  for _, s in ipairs(state.subagents) do
+    if s.task_id == task_id then return s end
+  end
+  return nil
+end
+
 -- ─── Stream-json event dispatcher (Goal 6.3) ──────────────────────────────────
 
 -- Dispatch one fully parsed stream-json event object.
 local function dispatch(event)
   local ev_type = event.type or ""
+
+  -- Goal 17.1: subagent inner-event routing. A spawned Agent/Task subagent's
+  -- inner activity (thinking/tool_use/tool_result) streams tagged with
+  -- parent_tool_use_id = the spawning Agent tool_use id; main-session events
+  -- carry null. Accumulate those into the matching subagent's .events sink so
+  -- the focused drill-in view (17.3) can re-render just that subagent — then
+  -- FALL THROUGH so they STILL render inline in the main transcript
+  -- (reference-faithful, Option B). See FINDINGS § Q-SUBAGENT-STREAM.
+  local parent = event.parent_tool_use_id
+  if parent then
+    local sub = subagent_by_id(parent)
+    if sub then sub.events[#sub.events + 1] = event end
+  end
 
   if ev_type == "system" and event.subtype == "init" then
     -- NOTE: system/init fires once per TURN in stream-json mode (verified: 2 inits
@@ -1309,6 +1344,37 @@ local function dispatch(event)
     -- the "Thinking… Xs" label (e.g. "· 111 tok"). Type-guarded like session_cost.
     if type(event.estimated_tokens) == "number" then
       state.think_tokens = event.estimated_tokens
+    end
+
+  elseif ev_type == "system" and event.subtype == "task_started" then
+    -- Goal 17.1: subagent spawned. This event LINKS the two id spaces — task_id
+    -- (which task_updated keys on) and tool_use_id (the Agent id inner events +
+    -- task_notification key on). Attach task_id + refresh the naming fields on the
+    -- entry captured at the Agent tool_use. (FINDINGS § Q-SUBAGENT-STREAM.)
+    local sub = subagent_by_id(event.tool_use_id)
+    if sub then
+      sub.task_id = event.task_id
+      if type(event.description) == "string" then sub.desc = event.description end
+      if type(event.subagent_type) == "string" then sub.kind = event.subagent_type end
+    end
+
+  elseif ev_type == "system" and event.subtype == "task_updated" then
+    -- Status transition (running → completed). Keyed by task_id, so resolve via
+    -- the task_started link. patch carries { status, end_time }.
+    local sub = subagent_by_task(event.task_id)
+    if sub and type(event.patch) == "table" and type(event.patch.status) == "string" then
+      sub.status = event.patch.status
+    end
+
+  elseif ev_type == "system" and event.subtype == "task_notification" then
+    -- Final subagent close: carries the token/duration totals the switcher shows
+    -- (usage.total_tokens / duration_ms), a summary string, and the terminal
+    -- status. Keyed by tool_use_id (the Agent id) — match by id, fall back to task.
+    local sub = subagent_by_id(event.tool_use_id) or subagent_by_task(event.task_id)
+    if sub then
+      if type(event.usage) == "table" then sub.usage = event.usage end
+      if type(event.summary) == "string" then sub.summary = event.summary end
+      if type(event.status) == "string" then sub.status = event.status end
     end
 
   elseif ev_type == "stream_event" then
@@ -1432,6 +1498,25 @@ local function dispatch(event)
         if block.id then
           state.tool_meta = state.tool_meta or {}
           state.tool_meta[block.id] = { name = name, path = input.file_path or input.path }
+        end
+        -- Goal 17.1: an Agent/Task spawn opens a subagent session. Record it (keyed
+        -- insertion order = switcher index) so its inner events (routed at the top
+        -- of dispatch by parent_tool_use_id) accumulate into .events. task_id/model/
+        -- usage/summary fill in later from the system/task_* lifecycle events. The
+        -- ● Task header still renders inline above (17.2 refines it to the agent name).
+        if (name == "Agent" or name == "Task") and block.id then
+          state.subagents = state.subagents or {}
+          state.subagents[#state.subagents + 1] = {
+            id       = block.id,
+            task_id  = nil,
+            desc     = input.description or input.subagent_type or "subagent",
+            kind     = input.subagent_type,
+            model    = nil,
+            status   = "running",
+            events   = {},
+            usage    = nil,
+            summary  = nil,
+          }
         end
         -- MG 14.2: pre-load the edit target so the FileChangedShell interceptor
         -- catches the CLI's write (covers new + unloaded files). tool_use always

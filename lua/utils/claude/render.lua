@@ -1441,16 +1441,11 @@ local function dispatch(event)
       if (block.type or "") == "tool_result" then
         local meta = state.tool_meta and state.tool_meta[block.tool_use_id]
         local sb   = state.search_blocks and state.search_blocks[block.tool_use_id]
-        -- The parent-turn Agent tool_result (null parent, id = the Agent tool_use)
-        -- is the subagent's FINAL result — a reliable "done" signal even if the
-        -- system/task_* lifecycle events didn't match. Flip status + auto-dismiss.
-        -- (The result body still renders below as the agent's summary in main.)
-        local sub_done = subagent_by_id(block.tool_use_id)
-        if sub_done then
-          sub_done.status = "completed"
-          widgets.update_subagent_bar()
-          widgets.maybe_dismiss_subagents()
-        end
+        -- NOTE: do NOT treat the parent-turn Agent tool_result as "done" — for a
+        -- BACKGROUND agent it's only a "launched successfully" ack that arrives
+        -- immediately while the agent keeps running (probed 2026-07-06, FINDINGS
+        -- § Q-SUBAGENT-STREAM). The real terminal signal is system/task_updated
+        -- (patch.status) + system/task_notification (status + usage), handled above.
         if meta and (meta.name == "TodoWrite"
             or meta.name == "TaskCreate" or meta.name == "TaskUpdate") then
           -- Noisy "Todos modified" / "Task #N created" ack — the bottom widget

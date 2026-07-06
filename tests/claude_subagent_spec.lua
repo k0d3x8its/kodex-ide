@@ -158,8 +158,9 @@ H.check("U6 switcher window opened on capture",
 local bl = bar_lines()
 H.check("U6 row 1 is the 'main' pseudo-entry", bl[1] and bl[1]:find("main", 1, true) ~= nil, bl[1])
 H.check("U6 main is selected by default (● filled, sel=1)", bl[1] and bl[1]:find("●", 1, true) ~= nil, bl[1])
-H.check("U6 subagent row shows kind + desc",
-  bl[2] and bl[2]:find("general%-purpose") ~= nil and bl[2]:find("Fable review of 15.7", 1, true) ~= nil, bl[2])
+-- (desc may be truncated to fit a narrow panel — the kind prefix always survives.)
+H.check("U6 subagent row shows the agent kind",
+  bl[2] and bl[2]:find("general%-") ~= nil, bl[2])
 H.check("U6 unselected subagent row uses hollow ○", bl[2] and bl[2]:find("○", 1, true) ~= nil, bl[2])
 H.check("U6 completed subagent meta shows token count",
   bl[2] and bl[2]:find("29.4k", 1, true) ~= nil, bl[2])
@@ -180,6 +181,57 @@ H.check("U8 selecting row 2 fills it (●) and hollows main (○)",
   bl[1] and bl[1]:find("○", 1, true) ~= nil and bl[2] and bl[2]:find("●", 1, true) ~= nil,
   (bl[1] or "") .. " | " .. (bl[2] or ""))
 claude.state.subagent_sel = 1
+
+-- ── U9: ↑/↓ navigation moves the selection + clamps ────────────────────────────
+
+claude.state.subagent_sel = 1
+H.check("U9 nav down selects row 2", widgets.subagent_nav(1) == true and claude.state.subagent_sel == 2)
+H.check("U9 nav down selects row 3", widgets.subagent_nav(1) == true and claude.state.subagent_sel == 3)
+H.check("U9 nav down clamps at the last row (3)", widgets.subagent_nav(1) == true and claude.state.subagent_sel == 3)
+H.check("U9 nav up returns to row 2", widgets.subagent_nav(-1) == true and claude.state.subagent_sel == 2)
+
+-- ── U10: Enter opens the drill-in view; main closes it ─────────────────────────
+
+claude.state.subagent_sel = 2   -- subagents[1]
+widgets.subagent_enter()
+H.check("U10 Enter on a subagent opens the drill-in view",
+  claude.state.subagent_view_win ~= nil and vim.api.nvim_win_is_valid(claude.state.subagent_view_win)
+  and claude.state.subagent_view == 1)
+claude.state.subagent_sel = 1   -- main
+widgets.subagent_enter()
+H.check("U10 Enter on main closes the drill-in view",
+  claude.state.subagent_view == nil
+  and (claude.state.subagent_view_win == nil
+       or not vim.api.nvim_win_is_valid(claude.state.subagent_view_win)))
+
+-- ── U11: the drill-in renders the subagent's inner tool activity ───────────────
+
+local ev_lines = widgets.render_subagent_events(claude.state.subagents[1])
+local ev_text  = table.concat(ev_lines, "\n")
+H.check("U11 drill-in shows the inner Bash tool call",
+  ev_text:find("Bash(echo hello-from-subagent", 1, true) ~= nil, ev_text)
+H.check("U11 drill-in shows the tool result body",
+  ev_text:find("hello-from-subagent", 1, true) ~= nil)
+
+-- ── U12: a long description truncates so the meta stays visible (overflow fix) ──
+
+claude.state.subagents[2].desc = string.rep("x", 300)   -- subagents[2] is still running
+widgets.update_subagent_bar()
+local row3 = bar_lines()[3] or ""
+H.check("U12 long desc is truncated with an ellipsis", row3:find("…", 1, true) ~= nil, row3)
+H.check("U12 status meta ('running') stays visible past the long desc",
+  row3:find("running", 1, true) ~= nil, row3)
+H.check("U12 the raw 300-char desc is NOT present in full",
+  row3:find(string.rep("x", 300), 1, true) == nil)
+
+-- ── U13: auto-dismiss arms only when EVERY subagent is finished ─────────────────
+
+H.check("U13 not all-done while subagents[2] is still running",
+  widgets.subagents_all_done() == false)
+claude.state.subagents[2].status = "completed"
+H.check("U13 all-done once every subagent is terminal", widgets.subagents_all_done() == true)
+widgets.maybe_dismiss_subagents()
+H.check("U13 maybe_dismiss arms the deferred close", claude.state.subagent_dismiss_pending == true)
 
 -- ── U5: mod.reset() drops all subagent sessions + closes the bar ───────────────
 

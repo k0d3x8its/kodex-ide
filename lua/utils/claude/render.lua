@@ -331,16 +331,17 @@ end
 -- The edit-family tools (their input carries the change to summarise + diff).
 local EDIT_NAMES = { Edit = true, MultiEdit = true, Write = true, NotebookEdit = true }
 
--- Devicon glyph for a path, as "<glyph> " (trailing space) so callers concat it
--- straight before the name. "" when nvim-web-devicons is absent (no nerd font) so
--- the panel still renders without it — and so headless tests see plain text.
+-- Devicon glyph for a path, as " <glyph>" (leading space) so callers concat it
+-- straight AFTER the name — the glyph always trails the filename wherever a path
+-- is shown. "" when nvim-web-devicons is absent (no nerd font) so the panel still
+-- renders without it — and so headless tests see plain text.
 local function file_glyph(path)
   if not path or path == "" then return "" end
   local ok, devicons = pcall(require, "nvim-web-devicons")
   if not ok then return "" end
   local icon = devicons.get_icon(
     vim.fn.fnamemodify(path, ":t"), vim.fn.fnamemodify(path, ":e"), { default = true })
-  return icon and (icon .. " ") or ""
+  return icon and (" " .. icon) or ""
 end
 
 -- Added / removed line counts between two blobs by unordered multiset diff (lines
@@ -407,17 +408,32 @@ end
 --   ● Editing  claude.lua          ● Reading 1 file          ● Running bash
 --     └ Added 5 lines, removed 1      └ lua/utils/claude.lua     └ tree -L 1
 -- Returns (header, detail); detail nil/"" renders header alone.
+-- Source-line count of a Write's content (trailing newline doesn't count as a
+-- line), matching what render_write_body actually lists.
+local function content_line_count(s)
+  local lines = vim.split(tostring(s or ""), "\n", { plain = true })
+  if #lines > 1 and lines[#lines] == "" then return #lines - 1 end
+  return #lines
+end
+
 local function tool_lines(name, input)
   local path = input.file_path or input.path
-  if EDIT_NAMES[name] then
+  if name == "Write" then
+    -- Write gets its own header (CC-TUI shape) + a "Wrote N lines to <path>" corner;
+    -- the written content renders as a numbered, collapsible body (render_write_body).
+    local rel = rel_path(path)
+    local n = content_line_count(input.content)
+    return "● Write " .. rel .. file_glyph(path),
+           string.format("Wrote %d %s to %s", n, n == 1 and "line" or "lines", rel)
+  elseif EDIT_NAMES[name] then
     local a, r = edit_counts(name, input)
-    return "● Editing " .. file_glyph(path) .. vim.fn.fnamemodify(path or "", ":t"),
+    return "● Editing " .. vim.fn.fnamemodify(path or "", ":t") .. file_glyph(path),
            change_summary(a, r)
   elseif name == "Read" or name == "NotebookRead" then
-    return "● Reading 1 file", file_glyph(path) .. rel_path(path)
+    return "● Reading 1 file", rel_path(path) .. file_glyph(path)
   elseif name == "Bash" then
     -- .sh devicon after "bash" for the shell glyph the user asked for.
-    return "● Running bash " .. file_glyph("run.sh"), corner_one_line(input.command)
+    return "● Running bash" .. file_glyph("run.sh"), corner_one_line(input.command)
   elseif name == "Grep" then
     return "● Searching", corner_one_line(input.pattern)
       .. (input.path and ("  ·  " .. rel_path(input.path)) or "")
@@ -497,7 +513,15 @@ local HUNK_CAP = 40   -- max changed (+/-) lines before the rest collapses to "�
 -- the red/green hunk bands they'd punch near-black holes on every token cell. So
 -- we derive an fg-ONLY twin per group (same fg/italic/bold, NO bg) on first use —
 -- the band bg then shows through under the coloured token, matching the real
--- Claude Code TUI. Cached; the panel palette is static so staleness is a non-issue.
+-- Claude Code TUI. Cached to skip the derivation on every render.
+--
+-- Staleness IS a hazard: the twins live in namespace 0, so a `:colorscheme` (which
+-- runs `:highlight clear`) WIPES them. The plugin's ColorScheme autocmd re-creates
+-- the base ClaudeCode* groups but not these derived twins — so without cache
+-- invalidation the next render reuses a cached twin NAME pointing at a now-empty
+-- group, and the token renders in the default fg (no visible syntax colour). The
+-- ColorScheme autocmd therefore calls reset_hunk_fg_cache() so the twins re-derive
+-- from the freshly-restored base groups on the next render.
 local hunk_fg_cache = {}
 local function hunk_fg_group(group)
   local twin = hunk_fg_cache[group]
@@ -508,6 +532,17 @@ local function hunk_fg_group(group)
   hunk_fg_cache[group] = twin
   return twin
 end
+
+-- Drop every derived fg-only twin so the next hunk_fg_group() re-derives it from
+-- the current base group. Called from the ColorScheme autocmd (plugins/claude.lua)
+-- after define_highlights() restores the base ClaudeCode* palette — a :colorscheme
+-- clears ns-0 groups, and a cached twin name would otherwise point at an empty
+-- (wiped) group forever. Mutated in place so the hunk_fg_group upvalue stays bound.
+local function reset_hunk_fg_cache()
+  for k in pairs(hunk_fg_cache) do hunk_fg_cache[k] = nil end
+end
+Render.reset_hunk_fg_cache = reset_hunk_fg_cache
+Render._hunk_fg_group = hunk_fg_group   -- exposed for the regression spec (S21)
 
 local function render_edit_hunk(path, old_lines, new_lines)
   local buf = state.panel_buf
@@ -711,10 +746,66 @@ end
 -- Corner + continuation prefixes for a rendered tool_result body.
 local RES_CORNER, RES_INDENT = "  └ ", "    "
 
+-- Content lines shown in a Write body before it collapses to a "… +N" affordance.
+local WRITE_HEAD_K = 10
+
+-- Build the numbered, indented, syntax-highlighted body for a Write's content
+-- (entry.code_lines / entry.lang). `limit` caps how many source lines render (nil
+-- = all, for the expanded view). Returns (lines, hls) in apply_line_hls span
+-- format: a dim right-aligned line-number gutter + fg-ONLY treesitter token spans
+-- over the code (fg-only via hunk_fg_group so the code-block bg doesn't punch a
+-- dark box through the panel). Long lines hard-wrap into gutter-blank rows so each
+-- screen row keeps its own number + clipped syntax (same discipline as the hunk).
+local function write_body_lines(entry, limit)
+  local code  = entry.code_lines
+  local total = #code
+  local shown = limit and math.min(limit, total) or total
+  local ok, syn = pcall(markdown.code_ts_hls, entry.lang or "", code)
+  if not ok then syn = nil end
+
+  local gw   = math.max(#tostring(total), 2)
+  local ind  = "    "
+  local prefix_b = #ind + gw + 2                 -- indent + number + 2 spaces = code start col
+  local cw   = math.max(panel_width() - prefix_b - 1, 8)
+
+  local lines, hls = {}, {}
+  for i = 1, shown do
+    local runs = syn and syn[i] or nil
+    local head = ind .. string.format("%" .. gw .. "d  ", i)   -- exactly prefix_b bytes
+    local rest, boff, firstrow = code[i], 0, true
+    repeat
+      local chunk = (rest == "") and "" or disp_take(rest, cw)
+      local clen  = #chunk
+      local spans = {}
+      if firstrow then spans[#spans + 1] = { #ind, #ind + gw, "ClaudeDim" } end  -- gutter number
+      if runs then                                -- clip each token run to this chunk's byte span
+        for _, s in ipairs(runs) do
+          local cs = math.max(s[1], boff)
+          local ce = math.min(s[2], boff + clen)
+          if ce > cs then
+            spans[#spans + 1] = { prefix_b + (cs - boff), prefix_b + (ce - boff), hunk_fg_group(s[3]) }
+          end
+        end
+      end
+      lines[#lines + 1] = (firstrow and head or string.rep(" ", prefix_b)) .. chunk
+      hls[#hls + 1]     = spans
+      rest, boff, firstrow = rest:sub(clen + 1), boff + clen, false
+    until rest == ""
+  end
+  if limit and total > shown then
+    local hidden = total - shown
+    lines[#lines + 1] = string.format("%s… +%d %s (ctrl+o to expand)",
+      RES_INDENT, hidden, hidden == 1 and "line" or "lines")
+    hls[#hls + 1] = { { 0, -1, "ClaudeDim" } }
+  end
+  return lines, hls
+end
+
 -- Build the COLLAPSED preview: first K one-row-truncated lines off a dim `└`
 -- corner + a dim "… +N lines (ctrl+o to expand)" affordance on overflow.
 -- Returns (lines, line_hls) where line_hls[i] = list of {b0, b1, group}.
 local function build_collapsed(entry)
+  if entry.kind == "write" then return write_body_lines(entry, WRITE_HEAD_K) end
   local group   = entry.is_error and "ClaudeError" or "ClaudeDim"
   local n_shown = math.min(#entry.body, RESULT_HEAD_K)
   local hidden  = #entry.body - n_shown
@@ -741,6 +832,7 @@ end
 -- source was a Read of a known filetype (entry.lang set), else the full body off
 -- the dim corner (un-truncated; wrapping is fine — the user asked to see it all).
 local function build_expanded(entry)
+  if entry.kind == "write" then return write_body_lines(entry, nil) end
   if entry.lang then
     return render_code_block(entry.lang, entry.code_body)
   end
@@ -824,6 +916,55 @@ local function render_tool_result(content, is_error, meta)
   buf_append({ "" })   -- trailing blank so the eol randomizer / next block clears the body
   state.tool_results[#state.tool_results + 1] = entry
 end
+
+-- Render a Write's content as a numbered, indented, syntax-highlighted body under
+-- its ● Write(...) header — the TUI-faithful "here's the new file" block. Fires at
+-- tool_use time (input.content is present then) for NEW files; overwrite Writes
+-- keep the accept-time red/green diff hunk. Registers a "write" fold entry so <C-o>
+-- expands the collapsed preview to the whole file (build_collapsed/expanded route
+-- to write_body_lines on entry.kind == "write").
+local function render_write_body(path, content)
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  local code = vim.split(tostring(content or ""):gsub("\t", "  "), "\n", { plain = true })
+  if #code > 1 and code[#code] == "" then table.remove(code) end   -- drop trailing newline's empty line
+  if #code == 0 then return end
+
+  state.tool_result_ns = state.tool_result_ns
+    or vim.api.nvim_create_namespace("claude_tool_result")
+  state.tool_results = state.tool_results or {}
+
+  -- Drop the running tool block's trailing randomizer blank so the body sits
+  -- directly under the `└ Wrote …` corner (same as render_tool_result).
+  local last = vim.api.nvim_buf_line_count(buf)
+  if last > 0 and vim.api.nvim_buf_get_lines(buf, last - 1, last, false)[1] == "" then
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, last - 1, last, false, {})
+    vim.bo[buf].modifiable = false
+  end
+
+  local lang = (path and path ~= "" and vim.filetype.match({ filename = path })) or nil
+  if lang == "" then lang = nil end
+  local entry = {
+    kind       = "write",
+    code_lines = code,
+    lang       = lang,
+    toggleable = #code > WRITE_HEAD_K,
+    expanded   = false,
+  }
+
+  local lines, hls = build_collapsed(entry)
+  local first = vim.api.nvim_buf_line_count(buf)
+  buf_append(lines)
+  apply_line_hls(buf, first, hls)
+  entry.start_mark = vim.api.nvim_buf_set_extmark(buf, state.tool_result_ns, first, 0, {})
+  entry.end_mark   = vim.api.nvim_buf_set_extmark(buf, state.tool_result_ns,
+    first + #lines - 1, 0, {})
+
+  buf_append({ "" })
+  state.tool_results[#state.tool_results + 1] = entry
+end
+Render.render_write_body = render_write_body
 
 
 -- Render the PROVISIONAL search header at tool_use time and register the block so
@@ -1014,7 +1155,8 @@ local function render_result(_text)
   -- if the turn somehow had no flavour index.
   local word = (state.flavor_idx and FLAVOR_DONE[state.flavor_idx])
     or FLAVOR_DONE[math.random(#FLAVOR_DONE)]
-  local line = "  ✻ " .. word .. " for " .. fmt_think_dur(vim.loop.now() - state.turn_t0)
+  -- Exclude modal-wait time so the done line matches the paused live timer.
+  local line = "  ✻ " .. word .. " for " .. fmt_think_dur(core.turn_elapsed_ms())
   local l    = vim.api.nvim_buf_line_count(buf)
   buf_append({ line })
   hl_lines(l, l, "ClaudeDim")
@@ -1163,6 +1305,13 @@ local function dispatch(event)
           render_search(sd, block.id)
         else
           render_tool(name, input)
+          -- A Write to a NEW file (doesn't exist on disk yet at request time) shows
+          -- its content as a numbered, syntax-highlighted body — like Read/Edit do.
+          -- Overwrite Writes fall through to the accept-time red/green diff hunk.
+          if name == "Write" and type(input.content) == "string" and input.content ~= ""
+              and vim.fn.filereadable(input.file_path or input.path or "") == 0 then
+            render_write_body(input.file_path or input.path, input.content)
+          end
         end
         -- Correlate this tool_use with its later tool_result (by id) so the
         -- result render knows the tool + file path (e.g. a Read → code block).

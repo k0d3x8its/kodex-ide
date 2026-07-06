@@ -885,8 +885,10 @@ prewrite_result = true
 vim.fn.delete(t21)
 
 -- ── T23–T25: Open-buffer awareness (FINDINGS § Q-CTX) ─────────────────────────
--- host_file_of/current_host_file filter to real on-disk file windows; a fresh
--- session's first turn appends an @<path> mention (once), later turns don't.
+-- host_file_of/current_host_file filter to real on-disk file windows; attach
+-- does a FULL @<path> inline on the first turn / a file switch (v2b) and a cheap
+-- plain-path breadcrumb on same-file repeats, returning a display-path note only
+-- on the full inline (for the dim echo line, v2c).
 
 local hostpath = "/tmp/claude_host_" .. tostring(vim.loop.now()) .. ".lua"
 vim.fn.writefile({ "-- host file", "local x = 1", "return x" }, hostpath)
@@ -917,37 +919,73 @@ H.check("T24 current_host_file finds the open file",
   (claude._current_host_file() or {}).path == host_abs,
   vim.inspect(claude._current_host_file()))
 
--- attach_host_context: first turn appends the mention, later turns don't
-claude.state.host_ctx_sent = false
+-- attach_host_context (v2): once per FILE (host_ctx_last_path gate), returns
+-- (wire, note) where note = the display path when an attach fired this turn.
+vim.cmd("edit " .. host_abs)   -- make host_abs the live editor file
+claude.state.host_ctx_last_path = nil
 claude.state.host_file = { path = host_abs, disp = host_abs }
-local w1 = claude._attach_host_context("hello")
+local w1, n1 = claude._attach_host_context("hello")
 H.check("T25 first turn appends @<path> mention",
   w1:find("@" .. host_abs, 1, true) ~= nil and w1:find("hello", 1, true) ~= nil, w1)
-H.check("T25 host_ctx_sent flips true after first attach",
-  claude.state.host_ctx_sent == true)
-local w2 = claude._attach_host_context("second")
-H.check("T25 later turns send verbatim (no re-attach)", w2 == "second")
+local host_disp = vim.fn.fnamemodify(host_abs, ":~:.")
+H.check("T25 attach returns the display path as the note", n1 == host_disp, tostring(n1))
+H.check("T25 host_ctx_last_path records the attached file",
+  claude.state.host_ctx_last_path == host_abs)
+local w2, n2 = claude._attach_host_context("second")
+H.check("T25 same file gets a plain breadcrumb (path, NO @) and no note",
+  w2:find(host_abs, 1, true) ~= nil
+    and w2:find("@" .. host_abs, 1, true) == nil
+    and w2:find("second", 1, true) ~= nil
+    and n2 == nil, w2)
 
--- no double-attach when the user already referenced the file themselves
-claude.state.host_ctx_sent = false
-local w3 = claude._attach_host_context("look at " .. host_abs)
+-- v2b: switching to a DIFFERENT file re-attaches its context
+local host2 = "/tmp/claude_host2_" .. tostring(vim.loop.now()) .. ".lua"
+vim.fn.writefile({ "-- second host", "return 2" }, host2)
+local host_abs2 = vim.fn.fnamemodify(host2, ":p")
+vim.cmd("edit " .. host_abs2)
+local host_disp2 = vim.fn.fnamemodify(host_abs2, ":~:.")
+local w2b, n2b = claude._attach_host_context("now this one")
+H.check("T25 v2b file switch re-attaches the new file",
+  w2b:find("@" .. host_abs2, 1, true) ~= nil and n2b == host_disp2, w2b)
+H.check("T25 v2b host_ctx_last_path advanced to the new file",
+  claude.state.host_ctx_last_path == host_abs2)
+vim.fn.delete(host_abs2)
+vim.cmd("edit " .. host_abs)   -- restore the primary host file as the open one
+
+-- no double-attach when the user already referenced the file themselves (still
+-- marked seen so later turns stay verbatim)
+claude.state.host_ctx_last_path = nil
+local w3, n3 = claude._attach_host_context("look at " .. host_abs)
 H.check("T25 no double-attach when path already present",
-  w3 == "look at " .. host_abs and claude.state.host_ctx_sent == true)
+  w3 == "look at " .. host_abs and n3 == nil
+    and claude.state.host_ctx_last_path == host_abs)
 
 -- no host file → text is untouched
-claude.state.host_ctx_sent = false
+claude.state.host_ctx_last_path = nil
 claude.state.host_file = nil
 vim.cmd("tabnew")   -- empty unnamed buffer, no real-file window in this tab
-H.check("T25 attach is a no-op with no open file",
-  claude._attach_host_context("plain") == "plain")
+local w4, n4 = claude._attach_host_context("plain")
+H.check("T25 attach is a no-op with no open file", w4 == "plain" and n4 == nil)
 
 -- disabled (host_ctx_enabled=false) → no injection even with a file armed
-claude.state.host_ctx_sent = false
+claude.state.host_ctx_last_path = nil
 claude.state.host_file = { path = host_abs, disp = host_abs }
 claude.state.host_ctx_enabled = false
+local w5, n5 = claude._attach_host_context("hi")
 H.check("T25 attach is a no-op when open-buffer context is OFF",
-  claude._attach_host_context("hi") == "hi")
+  w5 == "hi" and n5 == nil)
 claude.state.host_ctx_enabled = true   -- restore
+
+-- v2c: send() drives render_user with the note → a dim "· with @<file>" line
+-- appears under the echo when an attach fires this turn.
+vim.cmd("edit " .. host_abs)
+claude.state.host_ctx_last_path = nil
+claude.state.working = false
+claude._send("what does this do")
+vim.wait(30)
+local uecho = panel_text()
+H.check("T25 v2c echo shows the dim '· with @file' context note",
+  uecho:find("· with @" .. host_disp, 1, true) ~= nil, uecho)
 
 vim.fn.delete(host_abs)
 

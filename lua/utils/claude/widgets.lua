@@ -616,8 +616,12 @@ function Widgets.render_subagent_events(sub)
   return lines, hls
 end
 
--- Close the drill-in view float.
+-- Close the drill-in view + its title tag.
 function Widgets.close_subagent_view()
+  if state.subagent_tag_win and vim.api.nvim_win_is_valid(state.subagent_tag_win) then
+    pcall(vim.api.nvim_win_close, state.subagent_tag_win, true)
+  end
+  state.subagent_tag_win = nil
   if state.subagent_view_win and vim.api.nvim_win_is_valid(state.subagent_view_win) then
     pcall(vim.api.nvim_win_close, state.subagent_view_win, true)
   end
@@ -625,8 +629,37 @@ function Widgets.close_subagent_view()
   state.subagent_view     = nil
 end
 
--- Open (or swap) the drill-in view: a bordered float covering the transcript area
--- (above the switcher), titled with the agent + desc, showing render_subagent_events.
+-- Pin the green title tag to the top-right corner of the drill-in view. A tiny
+-- non-focusable float ` <desc> ` over the view's top-right (zindex above it).
+local function open_subagent_tag(sub, view_row, view_col, view_w)
+  -- The tag shows the subagent TITLE (its description), matching the CC-TUI.
+  local title = sub.desc or sub.kind or "subagent"
+  local label = " " .. trunc_display(title, math.max(view_w - 4, 8)) .. " "
+  local buf = state.subagent_tag_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    buf = vim.api.nvim_create_buf(false, true)
+    state.subagent_tag_buf = buf
+  end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { label })
+  vim.bo[buf].modifiable = false
+  local tw  = math.min(vim.fn.strdisplaywidth(label), math.max(view_w - 2, 4))
+  local cfg = {
+    relative = "editor", anchor = "NE",
+    row = view_row, col = view_col + view_w, width = tw, height = 1,
+    style = "minimal", focusable = false, zindex = 60,
+  }
+  if state.subagent_tag_win and vim.api.nvim_win_is_valid(state.subagent_tag_win) then
+    pcall(vim.api.nvim_win_set_config, state.subagent_tag_win, cfg)
+  else
+    state.subagent_tag_win = vim.api.nvim_open_win(buf, false, cfg)
+    vim.wo[state.subagent_tag_win].winhl = "Normal:ClaudeSubagentTag,NormalNC:ClaudeSubagentTag"
+  end
+end
+
+-- Open (or swap) the drill-in view: a FULL-COVER borderless float over the whole
+-- panel transcript area (above the switcher), so it reads like a fresh Claude panel
+-- showing just this subagent's session — with a green title tag pinned top-right.
 -- Focusable + entered so q/<Esc> close it back to main.
 function Widgets.open_subagent_view(i)
   local subs = state.subagents
@@ -652,27 +685,28 @@ function Widgets.open_subagent_view(i)
     end
   end
 
+  -- Full-cover geometry: from the panel's top row down to just above the switcher,
+  -- the full panel-column width — an opaque fresh-panel look (no border).
   local col, w = panel_float_geom()
+  local prow   = vim.api.nvim_win_get_position(state.panel_win)[1]
   local ph     = vim.api.nvim_win_get_height(state.panel_win)
-  local height = math.max(ph - Widgets.subagent_height() - 2, 3)
+  local height = math.max(ph - Widgets.subagent_height(), 3)
   local cfg = {
     relative = "editor", anchor = "NW",
-    row = 1, col = col, width = math.max(w - 2, 1), height = height,
-    style = "minimal", zindex = 40, border = "rounded",
-    title = " ⟢ " .. (sub.kind or "agent") .. " · " .. trunc_display(sub.desc or "", 30) .. " ",
-    title_pos = "left",
+    row = prow, col = col, width = math.max(w, 1), height = height,
+    style = "minimal", zindex = 40, border = "none",
   }
   if state.subagent_view_win and vim.api.nvim_win_is_valid(state.subagent_view_win) then
     pcall(vim.api.nvim_win_set_config, state.subagent_view_win, cfg)
   else
     state.subagent_view_win = vim.api.nvim_open_win(buf, true, cfg)   -- enter → q/Esc work
-    vim.wo[state.subagent_view_win].winhl =
-      "Normal:ClaudeNormal,NormalNC:ClaudeNormal,FloatBorder:ClaudePermBorder,FloatTitle:ClaudePermBorder"
+    vim.wo[state.subagent_view_win].winhl = "Normal:ClaudeNormal,NormalNC:ClaudeNormal"
     for _, k in ipairs({ "q", "<Esc>" }) do
       vim.keymap.set("n", k, function() Widgets.close_subagent_view() end,
         { buffer = buf, noremap = true, silent = true, desc = "Claude: close subagent view" })
     end
   end
+  open_subagent_tag(sub, prow, col, math.max(w, 1))
   state.subagent_view = i
 end
 

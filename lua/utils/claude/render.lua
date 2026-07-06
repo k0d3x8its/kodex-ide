@@ -1365,7 +1365,8 @@ local function dispatch(event)
     local sub = subagent_by_task(event.task_id)
     if sub and type(event.patch) == "table" and type(event.patch.status) == "string" then
       sub.status = event.patch.status
-      widgets.update_subagent_bar()   -- status word → glyph/meta refresh
+      widgets.update_subagent_bar()          -- status word → glyph/meta refresh
+      widgets.maybe_dismiss_subagents()      -- all finished → auto-hide the switcher
     end
 
   elseif ev_type == "system" and event.subtype == "task_notification" then
@@ -1377,7 +1378,8 @@ local function dispatch(event)
       if type(event.usage) == "table" then sub.usage = event.usage end
       if type(event.summary) == "string" then sub.summary = event.summary end
       if type(event.status) == "string" then sub.status = event.status end
-      widgets.update_subagent_bar()   -- final tokens/duration → meta refresh
+      widgets.update_subagent_bar()          -- final tokens/duration → meta refresh
+      widgets.maybe_dismiss_subagents()      -- all finished → auto-hide the switcher
     end
 
   elseif ev_type == "stream_event" then

@@ -39,6 +39,7 @@ local process = require(require_prefix .. "process")
 local render = require(require_prefix .. "render")
 local slash = require(require_prefix .. "slash")
 local effort = require(require_prefix .. "effort")
+local advisor = require(require_prefix .. "advisor")
 
 -- Full path required — ~/.local/bin is only on PATH in interactive bash, never
 -- in Neovim's environment. Matches the OPENCODE_BIN pattern in opencode.lua
@@ -430,6 +431,10 @@ local PH_FRAMES = { "●∙∙", "∙●∙", "∙∙●", "∙●∙" }
 -- shows its own cornered block instead (see in_typing_phase), so the word only
 -- ever covers the two block-less compute phases.
 local function activity_word()
+  -- While the executor is blocked on the advisor (server_tool_use advisor sent, no
+  -- advisor_tool_result yet), the compute phase IS the consult — say so. Checked
+  -- first so it wins over a concurrent thinking block.
+  if state.advisor_pending then return "Consulting" end
   if state.think_start then return "Thinking" end
   return "Typing"
 end
@@ -440,6 +445,11 @@ end
 -- independent of the 110ms braille tick.
 local function typing_ph_line()
   local frame = PH_FRAMES[(math.floor(vim.loop.now() / 350) % #PH_FRAMES) + 1]
+  -- While advising, nest the activity line under the "● Advising using <model>"
+  -- header with a `└` connector so it reads as "the consult is what's running".
+  if state.advisor_pending then
+    return string.format("  └ %s %s", frame, activity_word())
+  end
   return string.format("%s %s", frame, activity_word())
 end
 
@@ -476,6 +486,22 @@ mod._activity_word    = activity_word
 -- auto-follows into view; the flag is set AFTER so a later append removes it.
 local function add_typing_ph()
   if state.typing_ph then return end
+  -- While advising, drop the "● Advising …" header's trailing blank first so the
+  -- nested `└ Consulting` line attaches DIRECTLY under it (no gap breaking the
+  -- connector). The activity block's own trailing blank still anchors the eol
+  -- randomizer below. When advice arrives, render_advisor_result's body strips as
+  -- usual, so nothing double-counts.
+  if state.advisor_pending then
+    local buf = state.panel_buf
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+      local n = vim.api.nvim_buf_line_count(buf)
+      if n > 0 and vim.api.nvim_buf_get_lines(buf, n - 1, n, false)[1] == "" then
+        vim.bo[buf].modifiable = true
+        vim.api.nvim_buf_set_lines(buf, n - 1, n, false, {})
+        vim.bo[buf].modifiable = false
+      end
+    end
+  end
   buf_append({ typing_ph_line(), "" })
   local n = vim.api.nvim_buf_line_count(state.panel_buf)
   hl_lines(n - 2, n - 2, "ClaudeDim")   -- the word line; the blank stays unpainted
@@ -570,6 +596,10 @@ local function stop_spinner()
   state.think_start = nil
   state.think_idx   = nil
   state.tool_run    = nil
+  -- Safety net: the advisor-pending word/indent must never outlive the turn (e.g. an
+  -- upstream advisor error that emits no advisor_tool_result). render_advisor_result
+  -- clears it on the normal path; this catches turn-end/interrupt/reset.
+  state.advisor_pending = nil
 end
 
 local function start_spinner()
@@ -880,6 +910,16 @@ effort.wire({
   harden_float_scroll = harden_float_scroll,
 })
 mod._effort = effort   -- test hook
+
+-- ─── Advisor picker (/advisor) ────────────────────────────────────────────────
+-- The advisor-model modal (claude/advisor.lua). Same float helpers as the effort
+-- slider; confirming applies the advisor LIVE via apply_flag_settings (no respawn,
+-- so context is preserved — unlike the /effort and /model respawns).
+advisor.wire({
+  panel_float_geom    = panel_float_geom,
+  harden_float_scroll = harden_float_scroll,
+})
+mod._advisor = advisor   -- test hook
 
 -- ─── Question card (AskUserQuestion) ──────────────────────────────────────────
 -- The AskUserQuestion card moved to claude/question.lua (Goal 15.4). It reaches
@@ -1195,6 +1235,13 @@ local function submit(text)
   local level = text:match("^/effort%s*(%S*)$")
   if level ~= nil then
     mod.pick_effort(level ~= "" and level or nil)
+    return
+  end
+  -- Intercept the panel-local /advisor command: "/advisor <model>" applies directly,
+  -- a bare "/advisor" opens the picker. Never sent to the CLI as a message.
+  local adv = text:match("^/advisor%s*(%S*)$")
+  if adv ~= nil then
+    mod.pick_advisor(adv ~= "" and adv or nil)
     return
   end
   if state.working then
@@ -2169,6 +2216,47 @@ end
 --- unset, matching the CLI's shown default). Shown right of the model.
 function mod.current_effort()
   return effort.current()
+end
+
+-- Accepted advisor aliases for the "/advisor <model>" shorthand.
+local ADVISOR_MODELS = { opus = true, sonnet = true, fable = true }
+
+-- Apply an advisor model (nil = No advisor / unset). Unlike --model and --effort
+-- this does NOT respawn: an apply_flag_settings control_request changes the setting
+-- on the LIVE process, so conversation context is preserved (matches the TUI). When
+-- no session is running yet, we only store it — the next spawn seeds --advisor from
+-- state.advisor_model (see process.build_args). Shared by the picker's confirm and
+-- the "/advisor <model>" shorthand.
+local function apply_advisor(id)
+  state.advisor_model = id
+  if state.job_id then
+    local req = vim.json.encode({
+      type       = "control_request",
+      request_id = uuid4(),
+      request    = {
+        subtype  = "apply_flag_settings",
+        -- vim.NIL encodes to JSON null, which unsets advisorModel ("No advisor").
+        settings = { advisorModel = id or vim.NIL },
+      },
+    })
+    pcall(vim.fn.chansend, state.job_id, req .. "\n")
+  end
+  vim.notify("Claude advisor → " .. advisor.current_label(), vim.log.levels.INFO)
+end
+
+--- Choose the advisor model for the panel session (`/advisor`). With a valid alias
+--- ("/advisor opus") it applies immediately; "off"/"none" disables it; a bare
+--- "/advisor" opens the picker preselected at the current advisor. Applied live
+--- (no respawn) via apply_advisor.
+function mod.pick_advisor(id)
+  if id and ADVISOR_MODELS[id] then apply_advisor(id); return end
+  if id == "off" or id == "none" then apply_advisor(nil); return end
+  advisor.open(apply_advisor)
+end
+
+--- The current advisor label for the modal statusline ("Opus 4.8" / "off").
+function mod.current_advisor()
+  return advisor.current_label()
 end
 
 --- Friendly display name of the panel's current model (e.g. "Sonnet 4.6") for the

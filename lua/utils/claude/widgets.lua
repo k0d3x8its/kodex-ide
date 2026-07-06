@@ -145,11 +145,18 @@ function Widgets.todo_height()
   return (state.todos and #state.todos > 0) and (state.todo_h or 0) or 0
 end
 
+-- Rows the subagent switcher bar occupies (0 when hidden). Bottom floats + the
+-- Task-plan card add this so they stack ABOVE the switcher (bottommost card).
+function Widgets.subagent_height()
+  return (state.subagents and #state.subagents > 0) and (state.subagent_h or 0) or 0
+end
+
 -- SW `row` for a bottom float (chat bar / permission / question / diff): the
--- panel bottom, lifted above the task widget when it is visible. Single source so
--- every float + the resize handler stack consistently.
+-- panel bottom, lifted above the Task-plan card AND the subagent switcher when
+-- either is visible. Single source so every float + the resize handler stack
+-- consistently. Bottom-to-top: subagent switcher, Task-plan card, then floats.
 function Widgets.float_bottom_row()
-  return vim.o.lines - 2 - Widgets.todo_height()
+  return vim.o.lines - 2 - Widgets.subagent_height() - Widgets.todo_height()
 end
 
 -- Close the task-list widget float (kept buffer is reused on next open).
@@ -167,6 +174,19 @@ end
 -- transcript space. Called when the widget appears / changes height while floats
 -- are already open (their open-time row is otherwise stale).
 function Widgets.reflow_bottom_floats()
+  -- Re-place the bottom-pinned cards first so their offsets are current: the
+  -- subagent switcher pins to the very bottom, the Task-plan card lifts above it.
+  -- (Both otherwise keep their open-time row, stale once the other appears.)
+  if state.subagent_win and vim.api.nvim_win_is_valid(state.subagent_win) then
+    local c = vim.api.nvim_win_get_config(state.subagent_win)
+    c.row = vim.o.lines - 2
+    pcall(vim.api.nvim_win_set_config, state.subagent_win, c)
+  end
+  if state.todo_win and vim.api.nvim_win_is_valid(state.todo_win) then
+    local c = vim.api.nvim_win_get_config(state.todo_win)
+    c.row = vim.o.lines - 2 - Widgets.subagent_height()
+    pcall(vim.api.nvim_win_set_config, state.todo_win, c)
+  end
   local row = Widgets.float_bottom_row()
   local function move(win)
     if win and vim.api.nvim_win_is_valid(win) then
@@ -298,7 +318,9 @@ function Widgets.update_todo_widget()
   -- panel-column minus the 2 border cells.
   local cfg = {
     relative = "editor", anchor = "SW",
-    row = vim.o.lines - 2, col = col, width = math.max(w - 2, 1), height = #lines,
+    -- Lift above the subagent switcher (bottommost card) when it is visible.
+    row = vim.o.lines - 2 - Widgets.subagent_height(),
+    col = col, width = math.max(w - 2, 1), height = #lines,
     style = "minimal", focusable = false, zindex = 30,   -- below modals (default 50)
     border = "rounded", title = " ✻ Task Plan ", title_pos = "left",
   }
@@ -326,6 +348,141 @@ function Widgets.update_todo_widget()
     })
     state.todo_resize_teardown = function()
       pcall(vim.api.nvim_del_augroup_by_name, "ClaudeTodoResize")
+    end
+  end
+end
+
+-- ─── Subagent switcher bar (Goal 17.2) ────────────────────────────────────────
+
+-- Token count in the reference switcher's compact form (74.5k, 1.2M, 980).
+local function fmt_tokens(n)
+  if type(n) ~= "number" then return nil end
+  if n >= 1e6 then return string.format("%.1fM", n / 1e6) end
+  if n >= 1e3 then return string.format("%.1fk", n / 1e3) end
+  return tostring(math.floor(n))
+end
+
+-- Duration (ms) in the reference form (2m 41s, 32s).
+local function fmt_dur(ms)
+  if type(ms) ~= "number" then return nil end
+  local s = math.floor(ms / 1000)
+  if s >= 60 then return string.format("%dm %ds", math.floor(s / 60), s % 60) end
+  return s .. "s"
+end
+
+-- Build the switcher rows + per-row highlight spans. Row 1 is the "main"
+-- pseudo-entry (selecting it returns to the main transcript); rows 2..N+1 are the
+-- captured subagents in order. The selected row (state.subagent_sel, 1-based)
+-- gets a green filled ● (ClaudeAdvisor); the rest a dim hollow ○ (ClaudeDim) —
+-- reference-faithful. Byte spans are ASCII-safe up to the glyph; the ● / ○ / ↓
+-- are multibyte, so meta spans are measured off the built string, not char counts.
+function Widgets.render_subagent_lines()
+  local subs = state.subagents or {}
+  local sel  = state.subagent_sel or 1
+  local lines, hls = {}, {}
+
+  local function add_row(idx, label, meta)
+    local glyph = (idx == sel) and "●" or "○"
+    local ghl   = (idx == sel) and "ClaudeAdvisor" or "ClaudeDim"
+    local text  = " " .. glyph .. " " .. label
+    local spans = { { 1, 1 + #glyph, ghl } }   -- colour just the selection glyph
+    if meta and meta ~= "" then
+      local seg = "   " .. meta
+      spans[#spans + 1] = { #text, #text + #seg, "ClaudeDim" }
+      text = text .. seg
+    end
+    lines[#lines + 1] = text
+    hls[#hls + 1]     = spans
+  end
+
+  add_row(1, "main", nil)
+  for i, s in ipairs(subs) do
+    local label = (s.kind or "agent") .. "  " .. (s.desc or "")
+    local meta
+    if s.status == "completed" and type(s.usage) == "table" then
+      -- Final numbers from system/task_notification.usage (FINDINGS § Q-SUBAGENT-STREAM).
+      local du, tk = fmt_dur(s.usage.duration_ms), fmt_tokens(s.usage.total_tokens)
+      meta = (du and (du .. " · ") or "") .. (tk and ("↓ " .. tk .. " tokens") or "")
+    else
+      -- No live token count until the subagent completes; show its status word.
+      meta = s.status or "running"
+    end
+    add_row(i + 1, label, meta)
+  end
+  return lines, hls
+end
+
+-- Close the switcher float (kept buffer is reused on next open).
+function Widgets.close_subagent_bar()
+  if state.subagent_resize_teardown then
+    state.subagent_resize_teardown(); state.subagent_resize_teardown = nil
+  end
+  if state.subagent_win and vim.api.nvim_win_is_valid(state.subagent_win) then
+    pcall(vim.api.nvim_win_close, state.subagent_win, true)
+  end
+  state.subagent_win = nil
+  state.subagent_h   = 0
+end
+
+-- Open or update the bottom-pinned subagent switcher from state.subagents. Same
+-- bordered-card styling as the Task-plan widget (rounded, amber outline, titled,
+-- non-focusable), but pinned to the VERY bottom of the panel column — the Task
+-- card + chat bar + modals stack above it via subagent_height(). Hidden (closed)
+-- when no subagents exist. The caller reflows the other floats after.
+function Widgets.update_subagent_bar()
+  local subs = state.subagents
+  if not (subs and #subs > 0) then Widgets.close_subagent_bar(); return end
+  if not (state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)) then return end
+
+  local lines, hls = Widgets.render_subagent_lines()
+  local buf = state.subagent_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    buf = vim.api.nvim_create_buf(false, true)
+    state.subagent_buf = buf
+  end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  state.subagent_ns = state.subagent_ns or vim.api.nvim_create_namespace("claude_subagent")
+  vim.api.nvim_buf_clear_namespace(buf, state.subagent_ns, 0, -1)
+  for i, spans in ipairs(hls) do
+    for _, h in ipairs(spans) do
+      vim.api.nvim_buf_add_highlight(buf, state.subagent_ns, h[3], i - 1, h[1], h[2])
+    end
+  end
+  -- Footprint = content rows + 2 border, so subagent_height / float_bottom_row
+  -- reserve the full bordered height and everything stacks above the top border.
+  state.subagent_h = #lines + 2
+
+  local col, w = panel_float_geom()
+  local cfg = {
+    relative = "editor", anchor = "SW",
+    row = vim.o.lines - 2, col = col, width = math.max(w - 2, 1), height = #lines,
+    style = "minimal", focusable = false, zindex = 30,   -- below modals (default 50)
+    border = "rounded", title = " ◇ Subagents (↑/↓ · Enter) ", title_pos = "left",
+  }
+  if state.subagent_win and vim.api.nvim_win_is_valid(state.subagent_win) then
+    pcall(vim.api.nvim_win_set_config, state.subagent_win, cfg)
+  else
+    state.subagent_win = vim.api.nvim_open_win(buf, false, cfg)
+    vim.wo[state.subagent_win].winhl =
+      "Normal:ClaudeNormal,NormalNC:ClaudeNormal,FloatBorder:ClaudePermBorder,FloatTitle:ClaudePermBorder"
+    harden_float_scroll(state.subagent_win)
+    -- Pins to the panel bottom (like the Task card), so it needs its own resize
+    -- path: re-render at lines-2 + re-fit width, then reflow the cards/floats above.
+    vim.api.nvim_create_augroup("ClaudeSubagentResize", { clear = true })
+    vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
+      group = "ClaudeSubagentResize",
+      callback = function()
+        if not (state.subagent_win and vim.api.nvim_win_is_valid(state.subagent_win)) then
+          return true   -- gone → self-remove
+        end
+        Widgets.update_subagent_bar()
+        Widgets.reflow_bottom_floats()
+      end,
+    })
+    state.subagent_resize_teardown = function()
+      pcall(vim.api.nvim_del_augroup_by_name, "ClaudeSubagentResize")
     end
   end
 end

@@ -540,6 +540,7 @@ function Widgets.maybe_dismiss_subagents()
     if Widgets.subagents_all_done() then
       Widgets.close_subagent_view()
       Widgets.close_subagent_bar()
+      Widgets.wipe_subagent_buffers()
       state.subagents    = nil
       state.subagent_sel = 1
       Widgets.reflow_bottom_floats()
@@ -573,47 +574,98 @@ function Widgets.subagent_enter()
   return true
 end
 
--- Render a subagent's accumulated .events into readable drill-in lines. Not full
--- transcript fidelity — a compact live peek: text prose, tool headers, and dim
--- one-line tool-result corners. (The main transcript keeps the full inline render.)
-function Widgets.render_subagent_events(sub)
+-- Display lines (+ per-line hl spans) for ONE streamed subagent event. Compact
+-- peek: text prose, tool headers, thinking markers, one-line tool-result corners.
+-- Shared by the live appender and the full re-render.
+local function subagent_event_lines(ev)
   local lines, hls = {}, {}
   local function push(text, hl)
     lines[#lines + 1] = text
     hls[#lines]       = hl and { { 0, -1, hl } } or {}
   end
-  for _, ev in ipairs(sub.events or {}) do
-    if ev.type == "assistant" then
-      for _, b in ipairs((ev.message or {}).content or {}) do
-        if b.type == "text" and type(b.text) == "string" and b.text ~= "" then
-          for _, ln in ipairs(vim.split(b.text, "\n", { plain = true })) do
-            push("  " .. ln, nil)
-          end
-        elseif b.type == "thinking" then
-          push("  ▸ Thinking", "ClaudeDim")
-        elseif b.type == "tool_use" then
-          local a = b.input or {}
-          local arg = a.command or a.pattern or a.file_path or a.description or a.path or ""
-          push("  ● " .. (b.name or "tool") .. "(" .. trunc_display(tostring(arg), 60) .. ")", nil)
+  if ev.type == "assistant" then
+    for _, b in ipairs((ev.message or {}).content or {}) do
+      if b.type == "text" and type(b.text) == "string" and b.text ~= "" then
+        for _, ln in ipairs(vim.split(b.text, "\n", { plain = true })) do
+          push("  " .. ln, nil)
         end
+      elseif b.type == "thinking" then
+        push("  ▸ Thinking", "ClaudeDim")
+      elseif b.type == "tool_use" then
+        local a = b.input or {}
+        local arg = a.command or a.pattern or a.file_path or a.description or a.path or ""
+        push("  ● " .. (b.name or "tool") .. "(" .. trunc_display(tostring(arg), 60) .. ")", nil)
       end
-    elseif ev.type == "user" then
-      for _, b in ipairs((ev.message or {}).content or {}) do
-        if b.type == "tool_result" then
-          local body = b.content
-          if type(body) == "table" then
-            local parts = {}
-            for _, c in ipairs(body) do parts[#parts + 1] = c.text or "" end
-            body = table.concat(parts, " ")
-          end
-          body = tostring(body or ""):gsub("%s+", " ")
-          push("    └ " .. trunc_display(body, 70), "ClaudeDim")
+    end
+  elseif ev.type == "user" then
+    for _, b in ipairs((ev.message or {}).content or {}) do
+      if b.type == "tool_result" then
+        local body = b.content
+        if type(body) == "table" then
+          local parts = {}
+          for _, c in ipairs(body) do parts[#parts + 1] = c.text or "" end
+          body = table.concat(parts, " ")
         end
+        body = tostring(body or ""):gsub("%s+", " ")
+        push("    └ " .. trunc_display(body, 70), "ClaudeDim")
       end
     end
   end
-  if #lines == 0 then push("  (no inner activity captured yet)", "ClaudeDim") end
   return lines, hls
+end
+
+-- Full re-render of a subagent's accumulated .events (used to seed/rebuild a view).
+function Widgets.render_subagent_events(sub)
+  local lines, hls = {}, {}
+  for _, ev in ipairs(sub.events or {}) do
+    local l, h = subagent_event_lines(ev)
+    for k = 1, #l do lines[#lines + 1] = l[k]; hls[#lines] = h[k] end
+  end
+  if #lines == 0 then
+    lines = { "  (no inner activity captured yet)" }
+    hls   = { { { 0, -1, "ClaudeDim" } } }
+  end
+  return lines, hls
+end
+
+-- Append ONE streamed event to the subagent's OWN live buffer (created lazily). The
+-- drill-in view shows this buffer directly, so it updates live while open — and is
+-- already populated when opened later. Live-scrolls the view if it's showing this sub.
+function Widgets.append_subagent_event(sub, ev)
+  local lines, hls = subagent_event_lines(ev)
+  if #lines == 0 then return end
+  local buf = sub.buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    buf = vim.api.nvim_create_buf(false, true)
+    sub.buf    = buf
+    sub.buf_ns = vim.api.nvim_create_namespace("claude_sub_" .. tostring(buf))
+  end
+  -- A fresh scratch buffer holds one empty line — overwrite it on the first append.
+  local start = vim.api.nvim_buf_line_count(buf)
+  if start == 1 and (vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or "") == "" then start = 0 end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, start, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  for r, spans in ipairs(hls) do
+    for _, h in ipairs(spans) do
+      vim.api.nvim_buf_add_highlight(buf, sub.buf_ns, h[3], start + r - 1, h[1], h[2])
+    end
+  end
+  -- Live-follow if the drill-in is currently showing THIS subagent.
+  if state.subagent_view and state.subagents and state.subagents[state.subagent_view] == sub
+      and state.subagent_view_win and vim.api.nvim_win_is_valid(state.subagent_view_win) then
+    pcall(vim.api.nvim_win_set_cursor, state.subagent_view_win, { vim.api.nvim_buf_line_count(buf), 0 })
+  end
+end
+
+-- Delete the per-subagent live buffers (called before the session list is cleared).
+function Widgets.wipe_subagent_buffers()
+  for _, s in ipairs(state.subagents or {}) do
+    if s.buf and vim.api.nvim_buf_is_valid(s.buf) then
+      pcall(vim.api.nvim_buf_delete, s.buf, { force = true })
+    end
+    s.buf = nil
+  end
 end
 
 -- Close the drill-in view + its title tag.
@@ -667,22 +719,17 @@ function Widgets.open_subagent_view(i)
   if not sub then return end
   if not (state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)) then return end
 
-  local lines, hls = Widgets.render_subagent_events(sub)
-  local buf = state.subagent_view_buf
+  -- Show the subagent's OWN live buffer (append_subagent_event streams into it), so
+  -- the view updates live while open. Seed an empty one with a placeholder if the
+  -- subagent hasn't emitted anything yet.
+  local buf = sub.buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then
     buf = vim.api.nvim_create_buf(false, true)
-    state.subagent_view_buf = buf
-  end
-  vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].modifiable = false
-  state.subagent_view_ns = state.subagent_view_ns
-    or vim.api.nvim_create_namespace("claude_subagent_view")
-  vim.api.nvim_buf_clear_namespace(buf, state.subagent_view_ns, 0, -1)
-  for r, spans in ipairs(hls) do
-    for _, h in ipairs(spans) do
-      vim.api.nvim_buf_add_highlight(buf, state.subagent_view_ns, h[3], r - 1, h[1], h[2])
-    end
+    sub.buf    = buf
+    sub.buf_ns = vim.api.nvim_create_namespace("claude_sub_" .. tostring(buf))
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "  (waiting for subagent activity…)" })
+    vim.bo[buf].modifiable = false
   end
 
   -- Full-cover geometry: from the panel's top row down to just above the switcher,
@@ -698,16 +745,20 @@ function Widgets.open_subagent_view(i)
   }
   if state.subagent_view_win and vim.api.nvim_win_is_valid(state.subagent_view_win) then
     pcall(vim.api.nvim_win_set_config, state.subagent_view_win, cfg)
+    pcall(vim.api.nvim_win_set_buf, state.subagent_view_win, buf)   -- swap to this sub
   else
     state.subagent_view_win = vim.api.nvim_open_win(buf, true, cfg)   -- enter → q/Esc work
     vim.wo[state.subagent_view_win].winhl = "Normal:ClaudeNormal,NormalNC:ClaudeNormal"
-    for _, k in ipairs({ "q", "<Esc>" }) do
-      vim.keymap.set("n", k, function() Widgets.close_subagent_view() end,
-        { buffer = buf, noremap = true, silent = true, desc = "Claude: close subagent view" })
-    end
+  end
+  -- q/<Esc> close the view (set per shown buffer, idempotent).
+  for _, k in ipairs({ "q", "<Esc>" }) do
+    vim.keymap.set("n", k, function() Widgets.close_subagent_view() end,
+      { buffer = buf, noremap = true, silent = true, desc = "Claude: close subagent view" })
   end
   open_subagent_tag(sub, prow, col, math.max(w, 1))
   state.subagent_view = i
+  -- Land at the bottom (latest activity), like a live transcript.
+  pcall(vim.api.nvim_win_set_cursor, state.subagent_view_win, { vim.api.nvim_buf_line_count(buf), 0 })
 end
 
 return Widgets

@@ -74,8 +74,11 @@ end
 -- Commands the PANEL implements locally (not advertised by the CLI's system/init
 -- slash_commands, so they'd never appear otherwise). Merged into the menu list +
 -- prefix/exact checks so they filter and highlight like any other command; their
--- descriptions live in BUILTIN_DESC. `/effort` opens the reasoning-effort slider.
-local LOCAL_COMMANDS = { "effort" }
+-- descriptions live in BUILTIN_DESC. `/effort` opens the reasoning-effort slider;
+-- `/advisor` opens the advisor-model picker. The CLI does NOT advertise /advisor
+-- in slash_commands[] (it's a client-side modal, like /effort), so listing it here
+-- is the only way it appears in the menu.
+local LOCAL_COMMANDS = { "effort", "advisor" }
 
 -- Built-in + CLI-bundled commands have NO on-disk frontmatter file (they ship
 -- inside the claude binary), so their descriptions are hardcoded here. Anything
@@ -106,6 +109,7 @@ local BUILTIN_DESC = {
   recap           = "Recap recent work",
   insights        = "Show session insights",
   effort          = "Set the reasoning-effort level (opens a slider)",
+  advisor         = "Choose the advisor model (opens a picker)",
 }
 
 -- name → resolved first-sentence description, or false when we looked and found

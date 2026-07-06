@@ -143,6 +143,21 @@ Core.state = {
   host_ctx_last_path = nil,
   host_ctx_enabled = true,   -- overwritten from disk at module load
 
+  -- Goal 17: subagent (Agent/Task tool) sessions. When the model spawns a
+  -- subagent, its inner activity streams tagged with parent_tool_use_id = the
+  -- Agent tool_use id (main-session events carry null); dispatch() accumulates
+  -- those into the matching entry's .events sink so a focused drill-in view can
+  -- re-render just that subagent (buffer-swap "tabs"; the bottom switcher is the
+  -- selector). Inner events ALSO still render inline in main (reference-faithful,
+  -- FINDINGS § Q-SUBAGENT-STREAM). Entry:
+  --   { id=<Agent tool_use id>, task_id, desc, kind=subagent_type, model,
+  --     status="running"|"completed", events={<raw event>}, usage, summary }
+  -- id spaces: inner events + task_notification key on the Agent tool_use id;
+  -- task_updated keys on task_id (linked at task_started). Cleared on teardown.
+  -- subagent_sel = 1-based switcher selection (1 = the "main" pseudo-entry).
+  subagents        = nil,
+  subagent_sel     = 1,
+
   -- Messages the user typed while a turn was in flight, FIFO. Shown as shaded
   -- virtual lines at the panel bottom; drained one-by-one as each turn ends
   -- (each then echoes in the normal user colour when actually sent).

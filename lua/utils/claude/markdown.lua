@@ -16,9 +16,10 @@ local core = require(require_prefix .. "core")
 local panel_width = core.panel_width
 
 -- Decide the display text + highlight group for an inline `…` span. Priority:
---   1. Known file type → its nvim-web-devicons glyph + the language's DevIcon
---      highlight group (correct brand/theme colour), e.g. `init.lua` → " init.lua"
---      in DevIconLua blue. Falls back gracefully when devicons isn't loaded.
+--   1. Known file type → the name trailed by its nvim-web-devicons glyph + the
+--      language's DevIcon highlight group (correct brand/theme colour), e.g.
+--      `init.lua` → "init.lua " in DevIconLua blue. Falls back gracefully when
+--      devicons isn't loaded.
 --   2. [bracket] tag       → ClaudeBracket (pink)
 --   3. path (~ ./ or has /) → ClaudePath (green)
 --   4. anything else        → ClaudeCode (cyan)
@@ -31,7 +32,9 @@ local function span_style(inner)
     if ok then
       local icon, hl = dev.get_icon(fname, ext, { default = false })
       if icon and hl then
-        return icon .. " " .. inner, hl
+        -- Glyph trails the name (name<space>glyph) so it always reads to the
+        -- right of the file, matching file_glyph() in render.lua.
+        return inner .. " " .. icon, hl
       end
     end
   end
@@ -345,7 +348,8 @@ local function render_tree_line(line)
         if ok then icon, hl = dev.get_icon(fname, ext, { default = false }) end
       end
       if icon and hl then
-        local seg = icon .. " " .. tok
+        -- Glyph trails the filename token, same as everywhere else.
+        local seg = tok .. " " .. icon
         out[#out + 1] = seg
         hls[#hls + 1] = { blen, blen + #seg, hl }
         blen = blen + #seg

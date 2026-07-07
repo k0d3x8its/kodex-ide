@@ -258,8 +258,14 @@ H.check("U10 closing the view also closes the tag",
 local sbuf = claude.state.subagents[1].buf
 H.check("U11 subagent has its own live buffer", sbuf ~= nil and vim.api.nvim_buf_is_valid(sbuf))
 local ev_text = table.concat(vim.api.nvim_buf_get_lines(sbuf, 0, -1, false), "\n")
-H.check("U11 live buffer shows the inner Bash tool call",
-  ev_text:find("Bash(echo hi", 1, true) ~= nil, ev_text)
+-- Rich drill-in formatter (render.subagent_lines): the inner Bash renders as the
+-- main panel's cornered block — "● Running bash" header + a "└ echo hi" corner —
+-- not a truncated "Bash(echo hi)" one-liner. Assert both halves so a regression
+-- back to the basic formatter fails here.
+H.check("U11 live buffer shows the inner Bash tool call (rich header)",
+  ev_text:find("Running bash", 1, true) ~= nil, ev_text)
+H.check("U11 live buffer shows the Bash command on the corner",
+  ev_text:find("echo hi", 1, true) ~= nil, ev_text)
 H.check("U11 live buffer shows the tool result body (kept out of main, shown here)",
   ev_text:find("hello-from-subagent", 1, true) ~= nil)
 -- A further inner event appends live (buffer grows without reopening the view).
@@ -269,6 +275,18 @@ widgets.append_subagent_event(claude.state.subagents[1],
     type = "tool_use", name = "Read", input = { file_path = "/tmp/x.lua" } } } } })
 H.check("U11 live buffer grows as new events stream in",
   vim.api.nvim_buf_line_count(sbuf) > before)
+
+-- ── U11c: the rich formatter streams the FULL thinking body (not a bare stub) ──
+-- The basic formatter showed only "▸ Thinking"; render.subagent_lines expands the
+-- whole thinking body into the drill-in so the reasoning is readable there.
+widgets.append_subagent_event(claude.state.subagents[1],
+  { type = "assistant", message = { content = { {
+    type = "thinking", thinking = "step one figure out the flag\nstep two verify it" } } } })
+local think_text = table.concat(vim.api.nvim_buf_get_lines(sbuf, 0, -1, false), "\n")
+H.check("U11c drill-in shows the thinking header", think_text:find("Thought", 1, true) ~= nil)
+H.check("U11c drill-in shows the full thinking body (both lines)",
+  think_text:find("figure out the flag", 1, true) ~= nil
+  and think_text:find("step two verify it", 1, true) ~= nil, think_text)
 
 -- ── U11b: main nesting is CAPPED so a chatty subagent can't flood the transcript ─
 

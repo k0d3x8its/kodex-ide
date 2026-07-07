@@ -1117,6 +1117,13 @@ local function set_panel_keymaps(buf)
     { buffer = buf, noremap = true, silent = true, desc = "Claude: subagent switcher up" })
   vim.keymap.set("n", "<Down>", function() nav_or_default(1,  "<Down>") end,
     { buffer = buf, noremap = true, silent = true, desc = "Claude: subagent switcher down" })
+  -- <C-b> cycles main ↔ subagent views (like <C-o> expands). Falls through to the
+  -- default page-up scroll when no subagents exist.
+  vim.keymap.set("n", "<C-b>", function()
+    if not widgets.subagent_cycle() then
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-b>", true, false, true), "n", false)
+    end
+  end, { buffer = buf, noremap = true, silent = true, desc = "Claude: cycle subagent views" })
   -- <CR> (subagent view / chat bar) is bound above, folded into the permission handler.
 end
 

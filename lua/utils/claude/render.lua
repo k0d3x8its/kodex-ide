@@ -1337,6 +1337,75 @@ local function render_subagent_inline(event, sub)
   end
 end
 
+-- Body lines shown for a single subagent tool_result in the drill-in view before
+-- it's cut with a "… +N more" pointer. The drill-in is the FULL view (vs. the
+-- capped nested block in main), so this is generous — but still bounded so a
+-- subagent that reads a 2000-line file can't blow the buffer to that length.
+local SUBAGENT_VIEW_RESULT_CAP = 40
+
+-- Build the RICH, fully-expanded render of ONE subagent inner event for the
+-- drill-in view buffer. Reuses the main transcript's PURE formatters (tool_lines,
+-- tool_result_lines) so the drill-in matches the main panel's look — cornered ●/└
+-- tool blocks, full thinking bodies, wrapped coloured results — WITHOUT importing
+-- the main renderers' fold / expand / tool_meta machinery. That machinery keys off
+-- single-buffer global state (state.tool_meta line numbers, search_blocks, fold
+-- registry); routing the live INTERLEAVED main+subagent stream through it would
+-- corrupt it, and the drill-in view is read-only (no fold-toggle / expand keymaps),
+-- so those affordances can't fire there anyway. Returns (lines, hls) in the span
+-- format append_subagent_lines expects: hls[i] = { {startcol, endcol, group}, … }
+-- aligned to lines[i] (empty table = no highlight).
+local function subagent_lines(ev)
+  local lines, hls = {}, {}
+  local width = math.max(panel_width() - 2, 12)
+  local function push(text, group)
+    lines[#lines + 1] = text
+    hls[#lines]       = group and { { 0, -1, group } } or {}
+  end
+  if (ev.type or "") == "assistant" then
+    for _, b in ipairs((ev.message or {}).content or {}) do
+      local bt = b.type or ""
+      if bt == "text" and type(b.text) == "string" and b.text ~= "" then
+        for _, ln in ipairs(vim.split(b.text, "\n", { plain = true })) do
+          for _, wl in ipairs(wrap_disp(ln, width)) do push("  " .. wl, "ClaudeProse") end
+        end
+      elseif bt == "thinking" and type(b.thinking) == "string" and b.thinking ~= "" then
+        -- Full thinking body (was a bare "▸ Thinking" stub before). Not folded —
+        -- the read-only view has no toggle — so it renders fully expanded + dim.
+        push("▸ Thought", "ClaudeLabel")
+        for _, ln in ipairs(vim.split(b.thinking, "\n", { plain = true })) do
+          for _, wl in ipairs(wrap_disp(ln, width - 2)) do push("  " .. wl, "ClaudeThink") end
+        end
+      elseif bt == "tool_use" then
+        -- Same cornered ●/└ block the main panel renders (render_tool), minus the
+        -- eol randomizer row — reuse tool_lines so header verb / target match.
+        local header, detail = tool_lines(b.name or "tool", b.input or {})
+        push(header, TOOL_HL[TOOL_VERB[b.name] or b.name] or "ClaudeTool")
+        if detail and detail ~= "" then
+          local rows = wrap_disp(detail, math.max(width - 4, 8))
+          for wi, wl in ipairs(rows) do push((wi == 1 and "  └ " or "      ") .. wl, "ClaudeDim") end
+        end
+      end
+    end
+  elseif (ev.type or "") == "user" then
+    for _, b in ipairs((ev.message or {}).content or {}) do
+      if (b.type or "") == "tool_result" then
+        local body = tool_result_lines(b.content)
+        local grp  = (b.is_error == true) and "ClaudeError" or "ClaudeDim"
+        local shown = 0
+        for _, raw in ipairs(body) do
+          if shown >= SUBAGENT_VIEW_RESULT_CAP then
+            push("    … +" .. (#body - shown) .. " more lines", "ClaudeDim")
+            break
+          end
+          for _, wl in ipairs(wrap_disp(raw, math.max(width - 4, 8))) do push("    " .. wl, grp) end
+          shown = shown + 1
+        end
+      end
+    end
+  end
+  return lines, hls
+end
+
 -- ─── Stream-json event dispatcher (Goal 6.3) ──────────────────────────────────
 
 -- Dispatch one fully parsed stream-json event object.
@@ -1686,5 +1755,6 @@ local function dispatch(event)
   end
 end
 Render.dispatch = dispatch
+Render.subagent_lines = subagent_lines   -- rich drill-in formatter (widgets pulls via lazy require)
 
 return Render

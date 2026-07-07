@@ -285,6 +285,10 @@ function set_bottom_pad(rows)
     + (widgets.subagent_height and widgets.subagent_height() or 0)
   vim.api.nvim_buf_clear_namespace(buf, state.pad_ns, 0, -1)
   state.pad_rows = total
+  -- The open subagent drill-in view sizes to sit ABOVE this same reserve band, so a
+  -- growing reserve (e.g. the permission modal) pushes it up. set_bottom_pad is the one
+  -- choke point where pad_rows changes, so re-fit the view here (no-op when it's closed).
+  if widgets.fit_subagent_view then widgets.fit_subagent_view() end
   local is_panel = state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)
     and vim.api.nvim_win_get_buf(state.panel_win) == buf
   if total < 1 then

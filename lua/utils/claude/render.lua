@@ -1296,33 +1296,43 @@ end
 -- Bash/Read/etc. show as dim indented one-liners; its prose, thinking, and
 -- result bodies stay in the drill-in view so main isn't flooded with the full
 -- inner stream). Only tool_use blocks surface here.
--- Max inner tool lines shown nested under a subagent header in MAIN before it's
--- cut off (the full transcript lives in the drill-in view, ctrl+b). Keeps a
--- subagent from consuming unbounded vertical space in the main transcript.
+-- Max DISPLAY lines shown nested under a subagent header in MAIN before it's cut
+-- off (the full transcript lives in the drill-in view, ctrl+b). Tool text WRAPS
+-- rather than truncating, but the whole block stays ≤ this many rows so a chatty
+-- subagent can't consume unbounded vertical space.
 local SUBAGENT_MAIN_CAP = 6
+
+-- Emit the one-time "… (ctrl+b to view)" pointer when the nested block is full.
+local function subagent_cap_pointer(sub)
+  if sub.main_capped then return end
+  sub.main_capped = true
+  local ln = vim.api.nvim_buf_line_count(state.panel_buf)
+  buf_append({ "    … (ctrl+b to view)" })
+  hl_lines(ln, ln, "ClaudeDim")
+end
 
 local function render_subagent_inline(event, sub)
   if (event.type or "") ~= "assistant" then return end
   for _, b in ipairs((event.message or {}).content or {}) do
     if (b.type or "") == "tool_use" then
-      sub.main_count = (sub.main_count or 0) + 1
-      if sub.main_count > SUBAGENT_MAIN_CAP then
-        -- Past the cap: emit a single dim "…" pointer once, then stop cluttering main.
-        if sub.main_count == SUBAGENT_MAIN_CAP + 1 then
-          local ln = vim.api.nvim_buf_line_count(state.panel_buf)
-          buf_append({ "    … (ctrl+b to view)" })
-          hl_lines(ln, ln, "ClaudeDim")
-        end
-        return
+      if (sub.main_lines or 0) >= SUBAGENT_MAIN_CAP then subagent_cap_pointer(sub); return end
+      local a    = b.input or {}
+      local arg  = a.command or a.pattern or a.file_path or a.description or a.path or ""
+      local text = (b.name or "tool") .. "(" .. tostring(arg) .. ")"
+      -- First nested line of the block gets the └ connector under the header; later
+      -- tool calls align under it; wrapped continuation rows indent further.
+      local first_prefix = sub.main_started and "    " or "  └ "
+      sub.main_started   = true
+      -- Wrap to the panel width (accounting for the deepest indent) so nothing is
+      -- truncated; the block is still bounded by the display-line cap below.
+      local rows = wrap_disp(text, math.max(panel_width() - 6, 12))
+      for wi, wl in ipairs(rows) do
+        if (sub.main_lines or 0) >= SUBAGENT_MAIN_CAP then subagent_cap_pointer(sub); return end
+        local ln = vim.api.nvim_buf_line_count(state.panel_buf)
+        buf_append({ ((wi == 1) and first_prefix or "      ") .. wl })
+        hl_lines(ln, ln, "ClaudeDim")
+        sub.main_lines = (sub.main_lines or 0) + 1
       end
-      local a   = b.input or {}
-      local arg = a.command or a.pattern or a.file_path or a.description or a.path or ""
-      -- First nested line gets the └ connector under the header; the rest align
-      -- under it (matches the CC-TUI's indented subagent block).
-      local prefix = (sub.main_count == 1) and "  └ " or "    "
-      local ln  = vim.api.nvim_buf_line_count(state.panel_buf)
-      buf_append({ prefix .. (b.name or "tool") .. "(" .. corner_one_line(tostring(arg)) .. ")" })
-      hl_lines(ln, ln, "ClaudeDim")
     end
   end
 end

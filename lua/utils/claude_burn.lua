@@ -4,7 +4,11 @@
 -- as a statusline-syntax string for the Claude panel's winbar.
 --
 -- Data source: ~/.claude/kos-burn-bar-state.json
---   Written every turn by the StatusLine-hook tap (~/.claude/kos-burn-tap.sh).
+--   Written every turn by the StatusLine-hook tap. The tap script is VENDORED in
+--   this repo at scripts/neoclaude-token-tap.sh (install steps in its header) so
+--   the plugin owns it rather than depending on a script that only lives in the
+--   user's ~/.claude. See TODOS "self-contained burn bar" for the auto-install +
+--   state-file rename cutover.
 --   Claude Code's server-authoritative 5h/weekly usage
 --   (rate_limits.{five_hour,seven_day}.used_percentage + resets_at) arrives ONLY
 --   on the StatusLine hook's stdin and is never persisted by CC itself — the tap

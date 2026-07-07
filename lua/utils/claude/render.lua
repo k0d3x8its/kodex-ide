@@ -456,13 +456,12 @@ local function tool_lines(name, input)
     return "● Skill(" .. corner_one_line(skill or "") .. ")", nil
   elseif name == "Task" or name == "Agent" then
     -- Subagent spawn (headless build names the tool "Agent"; classic CC "Task").
-    -- Header names the short description; the corner names the agent type. The
-    -- subagent's final result renders as the body (foundation); a background
-    -- agent returns only a "launched" ack now and its output arrives later.
+    -- Header brands the subagent "neoclaude" + its short description, matching the
+    -- CC-TUI's "● <agent>(<desc>)" shape (their "claude" → our "neoclaude"). Inner
+    -- activity nests below (compact + capped, render_subagent_inline); the full
+    -- transcript is in the drill-in view (ctrl+b to cycle).
     local desc = input.description or input.subagent_type or "subagent"
-    local sub  = input.subagent_type
-    return "● Task(" .. corner_one_line(desc) .. ")",
-           sub and (sub .. " agent") or nil
+    return "● neoclaude(" .. corner_one_line(desc) .. ")", nil
   elseif name == "ExitPlanMode" then
     -- The proposed plan rides the tool INPUT (input.plan), not the result body;
     -- render a clean "● Plan" header + a one-line preview (the full plan text also
@@ -1297,14 +1296,32 @@ end
 -- Bash/Read/etc. show as dim indented one-liners; its prose, thinking, and
 -- result bodies stay in the drill-in view so main isn't flooded with the full
 -- inner stream). Only tool_use blocks surface here.
-local function render_subagent_inline(event)
+-- Max inner tool lines shown nested under a subagent header in MAIN before it's
+-- cut off (the full transcript lives in the drill-in view, ctrl+b). Keeps a
+-- subagent from consuming unbounded vertical space in the main transcript.
+local SUBAGENT_MAIN_CAP = 6
+
+local function render_subagent_inline(event, sub)
   if (event.type or "") ~= "assistant" then return end
   for _, b in ipairs((event.message or {}).content or {}) do
     if (b.type or "") == "tool_use" then
+      sub.main_count = (sub.main_count or 0) + 1
+      if sub.main_count > SUBAGENT_MAIN_CAP then
+        -- Past the cap: emit a single dim "…" pointer once, then stop cluttering main.
+        if sub.main_count == SUBAGENT_MAIN_CAP + 1 then
+          local ln = vim.api.nvim_buf_line_count(state.panel_buf)
+          buf_append({ "    … (ctrl+b to view)" })
+          hl_lines(ln, ln, "ClaudeDim")
+        end
+        return
+      end
       local a   = b.input or {}
       local arg = a.command or a.pattern or a.file_path or a.description or a.path or ""
+      -- First nested line gets the └ connector under the header; the rest align
+      -- under it (matches the CC-TUI's indented subagent block).
+      local prefix = (sub.main_count == 1) and "  └ " or "    "
       local ln  = vim.api.nvim_buf_line_count(state.panel_buf)
-      buf_append({ "    ● " .. (b.name or "tool") .. "(" .. corner_one_line(tostring(arg)) .. ")" })
+      buf_append({ prefix .. (b.name or "tool") .. "(" .. corner_one_line(tostring(arg)) .. ")" })
       hl_lines(ln, ln, "ClaudeDim")
     end
   end
@@ -1327,10 +1344,27 @@ local function dispatch(event)
   if parent then
     local sub = subagent_by_id(parent)
     if sub then
+      -- The subagent's model isn't in the spawn event — it first appears on its
+      -- inner assistant messages. Capture it once + rewrite the main-transcript
+      -- header in place (● neoclaude(desc) → ● <model>(desc)).
+      if (not sub.model) and event.type == "assistant"
+          and type((event.message or {}).model) == "string" then
+        sub.model = friendly_model(event.message.model)
+        if sub.header_lnum and state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf)
+            and sub.header_lnum < vim.api.nvim_buf_line_count(state.panel_buf) then
+          local hdr = "● " .. sub.model .. "(" .. corner_one_line(sub.desc or "") .. ")"
+          vim.bo[state.panel_buf].modifiable = true
+          pcall(vim.api.nvim_buf_set_lines, state.panel_buf,
+            sub.header_lnum, sub.header_lnum + 1, false, { hdr })
+          vim.bo[state.panel_buf].modifiable = false
+          hl_lines(sub.header_lnum, sub.header_lnum, "ClaudeTool")
+        end
+        widgets.update_subagent_bar()
+      end
       sub.events[#sub.events + 1] = event
       widgets.append_subagent_event(sub, event)   -- stream into the subagent's live buffer
       remove_typing_ph()
-      render_subagent_inline(event)               -- compact trail in main
+      render_subagent_inline(event, sub)          -- compact, capped trail in main
       return
     end
   end
@@ -1501,6 +1535,7 @@ local function dispatch(event)
       elseif btype == "tool_use" then
         local name  = block.name or ""
         local input = block.input or {}
+        local subagent_hdr_lnum = nil   -- Agent/Task header line, for model rewrite
         -- TodoWrite drives the bottom-pinned task widget, not an inline block:
         -- capture the full list (each call replaces it) and re-render the float.
         local sd = block.id and widgets.search_descriptor(name, input)
@@ -1518,6 +1553,10 @@ local function dispatch(event)
           -- rewrites; everything else renders inline now.
           render_search(sd, block.id)
         else
+          -- Header line of the tool block = the current end (render_tool appends it
+          -- first). Captured so an Agent/Task header can be rewritten in place once
+          -- the subagent reveals its model (not in the spawn event).
+          subagent_hdr_lnum = vim.api.nvim_buf_line_count(state.panel_buf)
           render_tool(name, input)
           -- A Write to a NEW file (doesn't exist on disk yet at request time) shows
           -- its content as a numbered, syntax-highlighted body — like Read/Edit do.
@@ -1541,15 +1580,16 @@ local function dispatch(event)
         if (name == "Agent" or name == "Task") and block.id then
           state.subagents = state.subagents or {}
           state.subagents[#state.subagents + 1] = {
-            id       = block.id,
-            task_id  = nil,
-            desc     = input.description or input.subagent_type or "subagent",
-            kind     = input.subagent_type,
-            model    = nil,
-            status   = "running",
-            events   = {},
-            usage    = nil,
-            summary  = nil,
+            id          = block.id,
+            task_id     = nil,
+            desc        = input.description or input.subagent_type or "subagent",
+            kind        = input.subagent_type,
+            model       = nil,
+            header_lnum = subagent_hdr_lnum,   -- main-transcript header, rewritten on model
+            status      = "running",
+            events      = {},
+            usage       = nil,
+            summary     = nil,
           }
           -- The switcher appears / grows a row → refresh it AND reflow (its height
           -- changed, so the Task card + chat bar must lift above it). 17.2.

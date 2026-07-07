@@ -77,8 +77,8 @@ H.check("U1 kind taken from subagent_type",
   subs and subs[1].kind == "general-purpose", subs and subs[1].kind)
 H.check("U1 status starts 'running'", subs and subs[1].status == "running")
 H.check("U1 events sink starts empty", subs and type(subs[1].events) == "table" and #subs[1].events == 0)
-H.check("U1 ● Task header still rendered inline in main",
-  panel_text():find("Task(", 1, true) ~= nil, "main buffer should keep the Task block")
+H.check("U1 neoclaude subagent header rendered inline in main",
+  panel_text():find("● neoclaude(", 1, true) ~= nil, "main buffer should keep the subagent header")
 
 -- ── U2: inner events (parent-tagged) accumulate into the sink AND hit main ─────
 
@@ -100,9 +100,9 @@ H.check("U2 both inner events accumulated into the sink",
   subs and #subs[1].events == 2, subs and #subs[1].events)
 H.check("U2 sink holds the raw inner tool_use event",
   subs and subs[1].events[1].message.content[1].name == "Bash")
--- Inner tool CALLS render as a compact nested one-liner in main.
+-- Inner tool CALLS render as a compact nested one-liner in main (└ connector).
 H.check("U2 inner tool call shows as a compact nested one-liner in main",
-  panel_text():find("    ● Bash(", 1, true) ~= nil, panel_text())
+  panel_text():find("  └ Bash(", 1, true) ~= nil, panel_text())
 H.check("U2 inner tool call added exactly one nested row", rows_after_call - rows0 == 1,
   tostring(rows_after_call - rows0))
 -- Inner tool RESULT bodies do NOT flood main (they live in the drill-in view only).
@@ -155,6 +155,18 @@ feed({ type = "assistant", parent_tool_use_id = "toolu_agent_B", message = { con
 H.check("U4 inner event routes to the CORRECT subagent (2, not 1)",
   #claude.state.subagents[2].events == 1 and #claude.state.subagents[1].events == 2)
 
+-- ── U4b: an inner assistant message reveals the model → header + switcher update ─
+
+feed({ type = "assistant", parent_tool_use_id = "toolu_agent_B", message = {
+  model = "claude-fable-5",
+  content = { { type = "text", text = "reviewing" } },
+} } )
+H.check("U4b subagent model captured from its inner message",
+  type(claude.state.subagents[2].model) == "string" and claude.state.subagents[2].model ~= "",
+  tostring(claude.state.subagents[2].model))
+H.check("U4b main header rewritten in place to show the model",
+  panel_text():find("● " .. claude.state.subagents[2].model .. "(", 1, true) ~= nil, panel_text())
+
 -- ── U6: the switcher bar renders (auto-opened during capture) ──────────────────
 
 local widgets = require("utils.claude.widgets")
@@ -169,9 +181,10 @@ H.check("U6 switcher window opened on capture",
 local bl = bar_lines()
 H.check("U6 row 1 is the 'main' pseudo-entry", bl[1] and bl[1]:find("main", 1, true) ~= nil, bl[1])
 H.check("U6 main is selected by default (● filled, sel=1)", bl[1] and bl[1]:find("●", 1, true) ~= nil, bl[1])
--- (desc may be truncated to fit a narrow panel — the kind prefix always survives.)
-H.check("U6 subagent row shows the agent kind",
-  bl[2] and bl[2]:find("general%-") ~= nil, bl[2])
+-- (desc may be truncated to fit a narrow panel — the name column always survives.)
+-- (name may be truncated to fit a narrow panel — the prefix always survives.)
+H.check("U6 subagent row shows the neoclaude name column (no model yet)",
+  bl[2] and bl[2]:find("neoclaud", 1, true) ~= nil, bl[2])
 H.check("U6 unselected subagent row uses hollow ○", bl[2] and bl[2]:find("○", 1, true) ~= nil, bl[2])
 H.check("U6 completed subagent meta shows token count",
   bl[2] and bl[2]:find("29.4k", 1, true) ~= nil, bl[2])
@@ -200,6 +213,20 @@ H.check("U9 nav down selects row 2", widgets.subagent_nav(1) == true and claude.
 H.check("U9 nav down selects row 3", widgets.subagent_nav(1) == true and claude.state.subagent_sel == 3)
 H.check("U9 nav down clamps at the last row (3)", widgets.subagent_nav(1) == true and claude.state.subagent_sel == 3)
 H.check("U9 nav up returns to row 2", widgets.subagent_nav(-1) == true and claude.state.subagent_sel == 2)
+
+-- ── U9b: ctrl+b cycles the selection AND opens/closes the view in one step ──────
+
+claude.state.subagent_sel = 1
+H.check("U9b cycle from main selects sub 1 and opens the view",
+  widgets.subagent_cycle() == true and claude.state.subagent_sel == 2
+  and claude.state.subagent_view_win ~= nil
+  and vim.api.nvim_win_is_valid(claude.state.subagent_view_win))
+widgets.subagent_cycle()   -- → sub 2
+widgets.subagent_cycle()   -- → main (wraps, closes the view)
+H.check("U9b cycle wraps back to main and closes the view",
+  claude.state.subagent_sel == 1
+  and (claude.state.subagent_view_win == nil
+       or not vim.api.nvim_win_is_valid(claude.state.subagent_view_win)))
 
 -- ── U10: Enter opens the drill-in view; main closes it ─────────────────────────
 
@@ -242,6 +269,16 @@ widgets.append_subagent_event(claude.state.subagents[1],
     type = "tool_use", name = "Read", input = { file_path = "/tmp/x.lua" } } } } })
 H.check("U11 live buffer grows as new events stream in",
   vim.api.nvim_buf_line_count(sbuf) > before)
+
+-- ── U11b: main nesting is CAPPED so a chatty subagent can't flood the transcript ─
+
+for k = 1, 8 do
+  feed({ type = "assistant", parent_tool_use_id = AGENT_ID, message = { content = { {
+    type = "tool_use", id = "bcap" .. k, name = "Bash", input = { command = "echo " .. k },
+  } } } })
+end
+H.check("U11b main caps the nested block with a ctrl+b pointer",
+  panel_text():find("… (ctrl+b to view)", 1, true) ~= nil, panel_text())
 
 -- ── U12: a long description truncates so the meta stays visible (overflow fix) ──
 

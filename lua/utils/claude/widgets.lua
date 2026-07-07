@@ -418,7 +418,8 @@ function Widgets.render_subagent_lines()
 
   add_row(1, "main", nil)
   for i, s in ipairs(subs) do
-    local label = (s.kind or "agent") .. "  " .. (s.desc or "")
+    -- Name column = the subagent's model once known (else the neoclaude brand).
+    local label = (s.model or "neoclaude") .. "  " .. (s.desc or "")
     local meta
     if s.status == "completed" and type(s.usage) == "table" then
       -- Final numbers from system/task_notification.usage (FINDINGS § Q-SUBAGENT-STREAM).
@@ -570,6 +571,23 @@ function Widgets.subagent_enter()
     Widgets.close_subagent_view()
   else
     Widgets.open_subagent_view((state.subagent_sel or 1) - 1)
+  end
+  return true
+end
+
+-- ctrl+b: cycle the selection main → sub1 → … → subN → main AND open/close the
+-- matching view in one keystroke (like ctrl+o expands). Returns false when no bar
+-- so the panel keymap can fall through to the default <C-b> (page up).
+function Widgets.subagent_cycle()
+  local subs = state.subagents
+  if not (subs and #subs > 0) then return false end
+  local n = #subs + 1
+  state.subagent_sel = ((state.subagent_sel or 1) % n) + 1   -- 1→2→…→n→1
+  Widgets.update_subagent_bar()
+  if (state.subagent_sel or 1) <= 1 then
+    Widgets.close_subagent_view()
+  else
+    Widgets.open_subagent_view(state.subagent_sel - 1)
   end
   return true
 end
@@ -755,6 +773,9 @@ function Widgets.open_subagent_view(i)
     vim.keymap.set("n", k, function() Widgets.close_subagent_view() end,
       { buffer = buf, noremap = true, silent = true, desc = "Claude: close subagent view" })
   end
+  -- ctrl+b keeps cycling while the view is focused (main → subs → main).
+  vim.keymap.set("n", "<C-b>", function() Widgets.subagent_cycle() end,
+    { buffer = buf, noremap = true, silent = true, desc = "Claude: cycle subagent views" })
   open_subagent_tag(sub, prow, col, math.max(w, 1))
   state.subagent_view = i
   -- Land at the bottom (latest activity), like a live transcript.

@@ -2371,6 +2371,11 @@ function mod.caveman_active()
   local data = vim.loop.fs_read(fd, 64, 0) or ""
   vim.loop.fs_close(fd)
   local mode = data:gsub("[\r\n]", ""):lower():match("^%s*(.-)%s*$")
+  -- A PRESENT-but-empty flag means the plugin's default level (full) — the CLI
+  -- badge (caveman-statusline.sh) treats `[ -z "$MODE" ]` as active and prints
+  -- [CAVEMAN]. Mirror that exactly, else the badge shows on the CLI but not the
+  -- panel whenever caveman is on in the default/full mode (the reported bug).
+  if mode == "" then return true end
   return CAVEMAN_MODES[mode] == true
 end
 

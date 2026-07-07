@@ -1038,4 +1038,25 @@ H.check("T27 slider opens", effort.active() == true)
 effort.close()
 H.check("T27 slider closes", effort.active() == false)
 
+-- T28: caveman badge detection mirrors the plugin's CLI badge (caveman-statusline.sh).
+local cav_dir = vim.fn.tempname()
+vim.fn.mkdir(cav_dir, "p")
+vim.env.CLAUDE_CONFIG_DIR = cav_dir
+local cav_flag = cav_dir .. "/.caveman-active"
+local function write_flag(s) local f = io.open(cav_flag, "w"); f:write(s); f:close() end
+os.remove(cav_flag)
+H.check("T28 no flag file → inactive", claude.caveman_active() == false)
+write_flag("full")
+H.check("T28 full → active", claude.caveman_active() == true)
+write_flag("lite")
+H.check("T28 lite → active", claude.caveman_active() == true)
+write_flag("wenyan-ultra")
+H.check("T28 wenyan-ultra → active", claude.caveman_active() == true)
+write_flag("")
+H.check("T28 present-but-empty flag → active (mirrors CLI default=full)", claude.caveman_active() == true)
+write_flag("bogus-mode")
+H.check("T28 invalid mode → inactive", claude.caveman_active() == false)
+os.remove(cav_flag)
+vim.env.CLAUDE_CONFIG_DIR = nil
+
 H.summary("claude")

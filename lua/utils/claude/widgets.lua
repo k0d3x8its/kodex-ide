@@ -714,10 +714,12 @@ function Widgets.close_subagent_view()
   end
   state.subagent_view_win = nil
   state.subagent_view     = nil
+  state.subagent_view_h   = nil
 end
 
--- Pin the green title tag to the top-right corner of the drill-in view. A tiny
--- non-focusable float ` <desc> ` over the view's top-right (zindex above it).
+-- Pin the green title tag to the BOTTOM-right corner of the drill-in view (just
+-- above the agent modal). A tiny non-focusable float ` <desc> ` right-aligned on the
+-- given border row (zindex above the view). Caller passes the view's bottom border row.
 local function open_subagent_tag(sub, view_row, view_col, view_w)
   -- The tag shows the subagent TITLE (its description), matching the CC-TUI.
   local title = sub.desc or sub.kind or "subagent"
@@ -744,10 +746,47 @@ local function open_subagent_tag(sub, view_row, view_col, view_w)
   end
 end
 
--- Open (or swap) the drill-in view: a FULL-COVER borderless float over the whole
--- panel transcript area (above the switcher), so it reads like a fresh Claude panel
--- showing just this subagent's session — with a green title tag pinned top-right.
--- Focusable + entered so q/<Esc> close it back to main.
+-- Geometry for the drill-in view: a GREEN rounded-border float spanning the panel
+-- column from its top row down to just ABOVE the bottom-float stack (agent modal /
+-- permission modal / switcher), which occupies state.pad_rows rows. Sizing to leave
+-- that band means those modals sit cleanly BELOW the view instead of a higher-zindex
+-- float punching through its middle — Option A: the view is pushed UP as the
+-- permission modal squeezes in between it and the agent modal. Returns
+-- (cfg, prow, total_h, col, w); total_h is the on-screen height INCLUDING the border,
+-- so the bottom border row is prow + total_h - 1 (where the tag pins).
+local function subagent_view_geom()
+  local col, w = panel_float_geom()
+  local prow    = vim.api.nvim_win_get_position(state.panel_win)[1]
+  local ph      = vim.api.nvim_win_get_height(state.panel_win)
+  local total_h = math.max(ph - (state.pad_rows or 0), 5)
+  local cfg = {
+    relative = "editor", anchor = "NW",
+    row = prow, col = col, width = math.max(w, 1), height = total_h - 2,   -- -2 = border
+    style = "minimal", zindex = 40, border = "rounded",
+  }
+  return cfg, prow, total_h, col, math.max(w, 1)
+end
+
+-- Re-fit the open drill-in view + its tag to the current bottom reserve. Hooked into
+-- set_bottom_pad (the single choke point where the reserve changes — chat bar,
+-- permission modal, widgets), so the view shrinks/grows to keep those modals below it.
+-- Guarded on total_h so a streaming main transcript (which re-pads on every append)
+-- doesn't churn the window config when nothing about the reserve actually changed.
+function Widgets.fit_subagent_view()
+  if not (state.subagent_view_win and vim.api.nvim_win_is_valid(state.subagent_view_win)) then return end
+  if not (state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)) then return end
+  local cfg, prow, total_h, col, w = subagent_view_geom()
+  if state.subagent_view_h == total_h then return end
+  state.subagent_view_h = total_h
+  pcall(vim.api.nvim_win_set_config, state.subagent_view_win, cfg)
+  local sub = state.subagents and state.subagents[state.subagent_view]
+  if sub then open_subagent_tag(sub, prow + total_h - 1, col, w) end
+end
+
+-- Open (or swap) the drill-in view: a green-bordered float over the panel transcript
+-- area, sitting ABOVE the bottom modals (agent modal + permission), so it reads like a
+-- separate agent "session" showing just this subagent — with a green title tag pinned
+-- to its BOTTOM-right border corner. Focusable + entered so q/<Esc> close it to main.
 function Widgets.open_subagent_view(i)
   local subs = state.subagents
   local sub  = subs and subs[i]
@@ -767,23 +806,15 @@ function Widgets.open_subagent_view(i)
     vim.bo[buf].modifiable = false
   end
 
-  -- Full-cover geometry: from the panel's top row down to just above the switcher,
-  -- the full panel-column width — an opaque fresh-panel look (no border).
-  local col, w = panel_float_geom()
-  local prow   = vim.api.nvim_win_get_position(state.panel_win)[1]
-  local ph     = vim.api.nvim_win_get_height(state.panel_win)
-  local height = math.max(ph - Widgets.subagent_height(), 3)
-  local cfg = {
-    relative = "editor", anchor = "NW",
-    row = prow, col = col, width = math.max(w, 1), height = height,
-    style = "minimal", zindex = 40, border = "none",
-  }
+  local cfg, prow, total_h, col, w = subagent_view_geom()
+  state.subagent_view_h = total_h
   if state.subagent_view_win and vim.api.nvim_win_is_valid(state.subagent_view_win) then
     pcall(vim.api.nvim_win_set_config, state.subagent_view_win, cfg)
     pcall(vim.api.nvim_win_set_buf, state.subagent_view_win, buf)   -- swap to this sub
   else
     state.subagent_view_win = vim.api.nvim_open_win(buf, true, cfg)   -- enter → q/Esc work
-    vim.wo[state.subagent_view_win].winhl = "Normal:ClaudeNormal,NormalNC:ClaudeNormal"
+    vim.wo[state.subagent_view_win].winhl =
+      "Normal:ClaudeNormal,NormalNC:ClaudeNormal,FloatBorder:ClaudeSubagentBorder"
   end
   -- q/<Esc> close the view (set per shown buffer, idempotent).
   for _, k in ipairs({ "q", "<Esc>" }) do
@@ -793,7 +824,7 @@ function Widgets.open_subagent_view(i)
   -- ctrl+b keeps cycling while the view is focused (main → subs → main).
   vim.keymap.set("n", "<C-b>", function() Widgets.subagent_cycle() end,
     { buffer = buf, noremap = true, silent = true, desc = "Claude: cycle subagent views" })
-  open_subagent_tag(sub, prow, col, math.max(w, 1))
+  open_subagent_tag(sub, prow + total_h - 1, col, w)   -- bottom-right border corner
   state.subagent_view = i
   -- Land at the bottom (latest activity), like a live transcript.
   pcall(vim.api.nvim_win_set_cursor, state.subagent_view_win, { vim.api.nvim_buf_line_count(buf), 0 })

@@ -139,6 +139,11 @@ return {
       -- of the full-cover subagent view (matches the switcher's green accent).
       vim.api.nvim_set_hl(0, "ClaudeSubagentTag", { fg = "#1e1e2e", bg = "#50FA7B", bold = true })
 
+      -- Subagent drill-in view OUTLINE — green rounded border round the full-cover
+      -- view so it reads as a distinct agent "session" (vs the amber ClaudePermBorder
+      -- of the main panel's status modals). Same green as the tag/switcher accent.
+      vim.api.nvim_set_hl(0, "ClaudeSubagentBorder", { fg = "#50FA7B", bold = true })
+
       -- Shaded/dim for type-ahead messages queued while Claude is working. They
       -- show muted + italic until the turn ends and they send in the normal user
       -- colour (ClaudeUser).

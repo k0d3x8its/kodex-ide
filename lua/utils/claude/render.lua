@@ -733,17 +733,6 @@ end
 -- affordance. Kept small so a big Read/Bash result is a preview, not a dump.
 local RESULT_HEAD_K = 5
 
--- Truncate a body line to ONE display row (width cells) with a trailing ellipsis.
--- The preview must never soft-wrap — a single wide line (e.g. a <system-reminder>
--- banner) would otherwise balloon 5 logical lines into a dozen display rows.
-local function result_row(s, width)
-  s = tostring(s):gsub("[\r\n\t]+", " ")
-  if vim.fn.strdisplaywidth(s) > width then
-    s = disp_take(s, math.max(width - 1, 1)) .. "…"
-  end
-  return s
-end
-
 -- Strip a `cat -n` leading line number ("    12  code" → "code") so a Read body
 -- parses cleanly as source when rendered through the code-block renderer.
 local function strip_line_numbers(body)
@@ -865,16 +854,27 @@ local function build_collapsed(entry)
   local group   = entry.is_error and "ClaudeError" or "ClaudeDim"
   local n_shown = math.min(#entry.body, RESULT_HEAD_K)
   local hidden  = #entry.body - n_shown
-  local avail   = math.max(panel_width() - 6, 20)   -- one-row budget after the prefix
+  local avail   = math.max(panel_width() - 6, 20)   -- wrap budget after the prefix
+  -- Word-wrap each previewed line (rather than clipping to one row with `…`) so a
+  -- tool result reads in full — the whole point of a preview. A ROW_BUDGET caps the
+  -- total display rows so a single very wide line (e.g. a <system-reminder> banner)
+  -- can't balloon the collapsed block: once the budget is hit, the remaining logical
+  -- lines fold into the "… +N lines" affordance below.
+  local ROW_BUDGET = 10
   local lines, hls = {}, {}
   for i = 1, n_shown do
-    -- corner_each: every line gets its own `└` (a file list reads best that way);
-    -- otherwise only the first line is cornered and the rest hang indented.
-    local corner = (i == 1 or entry.corner_each)
-    lines[i] = (corner and RES_CORNER or RES_INDENT) .. result_row(entry.body[i], avail)
-    hls[i]   = corner
-      and { { 0, #RES_CORNER, "ClaudeDim" }, { #RES_CORNER, -1, group } }
-      or  { { 0, -1, group } }
+    if #lines >= ROW_BUDGET then hidden = #entry.body - (i - 1); break end
+    local clean = tostring(entry.body[i]):gsub("[\r\n\t]+", " ")
+    for ri, r in ipairs(wrap_disp(clean, avail)) do
+      -- corner_each: every logical line gets its own `└` (a file list reads best that
+      -- way); otherwise only the first line is cornered. Wrapped continuation rows
+      -- (ri > 1) always hang at the indent, never re-cornered.
+      local corner = ri == 1 and (i == 1 or entry.corner_each)
+      lines[#lines + 1] = (corner and RES_CORNER or RES_INDENT) .. r
+      hls[#lines]       = corner
+        and { { 0, #RES_CORNER, "ClaudeDim" }, { #RES_CORNER, -1, group } }
+        or  { { 0, -1, group } }
+    end
   end
   if hidden > 0 then
     lines[#lines + 1] = string.format("%s… +%d %s (ctrl+o to expand)",

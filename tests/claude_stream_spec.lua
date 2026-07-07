@@ -430,10 +430,8 @@ feed({ type = "assistant", message = { content = { {
   input = { description = "Explore render code", subagent_type = "Explore",
             prompt = "find all render_ functions" },
 } } } })
-H.check("S16 Task header names the description",
-  panel_text():find("● Task(Explore render code)", 1, true) ~= nil, panel_text())
-H.check("S16 Task corner names the agent type",
-  panel_text():find("└ Explore agent", 1, true) ~= nil, panel_text())
+H.check("S16 subagent header brands neoclaude + the description (model fills in later)",
+  panel_text():find("● neoclaude(Explore render code)", 1, true) ~= nil, panel_text())
 feed({ type = "user", message = { content = { {
   type = "tool_result", tool_use_id = "tk1",
   content = "Found render_tool, render_prose, render_thinking.",
@@ -447,8 +445,8 @@ feed({ type = "assistant", message = { content = { {
   type = "tool_use", id = "ag1", name = "Agent",
   input = { description = "Audit float layout", subagent_type = "general-purpose" },
 } } } })
-H.check("S16 Agent tool_use also renders as a Task header",
-  panel_text():find("● Task(Audit float layout)", 1, true) ~= nil, panel_text())
+H.check("S16 Agent tool_use also renders the neoclaude subagent header",
+  panel_text():find("● neoclaude(Audit float layout)", 1, true) ~= nil, panel_text())
 
 -- ── S17: TodoWrite drives the bottom task widget, not an inline block ───────────
 -- render_todo_lines is pure: header counts + glyph rows + activeForm for the

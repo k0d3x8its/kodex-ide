@@ -595,7 +595,11 @@ end
 -- Display lines (+ per-line hl spans) for ONE streamed subagent event. Compact
 -- peek: text prose, tool headers, thinking markers, one-line tool-result corners.
 -- Shared by the live appender and the full re-render.
-local function subagent_event_lines(ev)
+-- Simple one-line-per-block fallback formatter for a subagent inner event. Kept
+-- as the fallback for subagent_event_lines when the rich render.subagent_lines
+-- formatter isn't reachable (it shouldn't happen at runtime — render is loaded by
+-- dispatch time — but keeps widgets self-sufficient if called in isolation).
+local function subagent_event_lines_basic(ev)
   local lines, hls = {}, {}
   local function push(text, hl)
     lines[#lines + 1] = text
@@ -630,6 +634,19 @@ local function subagent_event_lines(ev)
     end
   end
   return lines, hls
+end
+
+-- Format one subagent inner event into (lines, hls) for its drill-in buffer.
+-- Prefers render.subagent_lines (the RICH formatter — full thinking bodies,
+-- cornered ●/└ tool blocks, wrapped coloured results) so the drill-in matches the
+-- main panel. Pulled by LAZY require to dodge the top-level require cycle (render
+-- requires widgets, so widgets can't require render at load); render is already
+-- cached by the time any event streams, so this is a table lookup at runtime.
+-- Falls back to the basic one-liner formatter if render is somehow unreachable.
+local function subagent_event_lines(ev)
+  local ok, render = pcall(require, require_prefix .. "render")
+  if ok and render and render.subagent_lines then return render.subagent_lines(ev) end
+  return subagent_event_lines_basic(ev)
 end
 
 -- Full re-render of a subagent's accumulated .events (used to seed/rebuild a view).

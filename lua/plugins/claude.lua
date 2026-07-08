@@ -257,6 +257,10 @@ return {
       -- the only thing that pops — the fill blends into the surface.
       vim.api.nvim_set_hl(0, "ClaudeBarBorder",     { fg = "#D97757", bg = bar_bg })
       vim.api.nvim_set_hl(0, "ClaudeBarBorderPlan", { fg = "#61AFEF", bg = bar_bg })
+      -- Fable-mode indicator in the chat-bar title: neon purple (deliberately not
+      -- the clay/blue border tones so "Fable" pops as a distinct, persistent state).
+      -- The cursor is green, so purple reads as clearly "other". Tweak the hex here.
+      vim.api.nvim_set_hl(0, "ClaudeBarModeFable",  { fg = "#C77DFF", bg = bar_bg, bold = true })
       -- Permission card outline: amber/caution, deliberately distinct from the
       -- clay chat-bar border so the card never reads as the reply input.
       vim.api.nvim_set_hl(0, "ClaudePermBorder",    { fg = "#E5C07B", bg = bar_bg, bold = true })

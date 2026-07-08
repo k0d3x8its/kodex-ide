@@ -117,6 +117,17 @@ local BUILTIN_DESC = {
 -- menu open by ensure_descriptions().
 local desc_cache = nil
 
+-- Skill/command NAMES discovered by scanning the on-disk dirs (the same files the
+-- description index reads). Sourced INTO the menu so a skill appears the moment its
+-- file exists, WITHOUT waiting for the CLI to re-advertise slash_commands[] — that
+-- list is a point-in-time snapshot captured at session init and disk-cached, so a
+-- skill created after it never showed (the reported "new skills don't populate" bug).
+-- nil until the first scan; refreshed on menu OPEN (Slash.open), not per keystroke.
+-- disk_names_key is a signature of the last scan so we only rebuild the (heavier)
+-- description cache when the set actually changed.
+local disk_names     = nil
+local disk_names_key = nil
+
 -- Trim a raw description to a single leading sentence. Not length-capped — the
 -- menu word-wraps it across indented rows (see render_menu), so the whole sentence
 -- stays readable rather than being cut with an ellipsis.
@@ -246,6 +257,46 @@ function Slash._resolve_desc(name)
   return resolve(name)
 end
 
+-- The slash NAME each on-disk candidate file is invoked as: a skill's directory
+-- basename (~/.claude/skills/<name>/SKILL.md → "<name>"), a command file's basename
+-- (commands/<name>.md → "<name>"). These are the un-namespaced tokens typed after
+-- "/"; plugin skills the CLI advertises namespaced ("plugin:skill") de-dupe against
+-- these by suffix in all_commands(). Reuses candidate_files() (the description scan's
+-- own glob set), so names and descriptions always come from the same files.
+local function disk_command_names()
+  local names, seen = {}, {}
+  for _, path in ipairs(candidate_files()) do
+    local base = vim.fn.fnamemodify(path, ":t:r")           -- file stem
+    if base == "SKILL" then base = vim.fn.fnamemodify(path, ":h:t") end  -- dir name
+    if base ~= "" and not seen[base] then
+      seen[base] = true
+      names[#names + 1] = base
+    end
+  end
+  return names
+end
+Slash._disk_command_names = disk_command_names   -- test hook
+
+-- Rescan disk for skill/command names (called on menu open). When the set changed
+-- since the last scan (a skill was created/removed), drop the description cache so
+-- the next resolve rebuilds it — otherwise a freshly-created skill would list its
+-- name with no description until the session restarts.
+local function refresh_disk_names()
+  -- Slash._test_disk_names lets specs pin the disk-discovered set to a known list
+  -- (or {} to neutralise it) so menu-lifecycle assertions don't depend on whatever
+  -- skills happen to exist on the test machine. nil in normal use → real scan.
+  local fresh = Slash._test_disk_names or disk_command_names()
+  local sorted = vim.deepcopy(fresh)
+  table.sort(sorted)
+  local key = table.concat(sorted, "\n")
+  if key ~= disk_names_key then
+    disk_names_key = key
+    desc_cache = nil   -- force a rebuild so new skills also get their descriptions
+  end
+  disk_names = fresh
+end
+Slash._refresh_disk_names = refresh_disk_names   -- test hook
+
 -- ─── Menu float ────────────────────────────────────────────────────────────────
 
 local MAX_ROWS  = 12          -- screen-row budget for the visible menu. Items are
@@ -314,15 +365,27 @@ end
 -- Every menu/prefix/exact check goes through this so local commands behave like
 -- advertised ones.
 local function all_commands()
-  local out, seen = {}, {}
-  for _, name in ipairs(state.slash_commands or {}) do
-    out[#out + 1] = name; seen[name] = true
+  local out, seen, suffix_seen = {}, {}, {}
+  local function push(name)
+    if name and name ~= "" and not seen[name] then
+      seen[name] = true; out[#out + 1] = name
+    end
   end
-  for _, name in ipairs(LOCAL_COMMANDS) do
-    if not seen[name] then out[#out + 1] = name end
+  for _, name in ipairs(state.slash_commands or {}) do
+    push(name)
+    suffix_seen[name:match("([^:]+)$") or name] = true   -- "plugin:skill" ⇒ "skill"
+  end
+  for _, name in ipairs(LOCAL_COMMANDS) do push(name) end
+  -- Disk-discovered skills/commands (see disk_command_names): the source that makes
+  -- newly-created skills appear without a CLI re-advertise. Skip any name already
+  -- advertised exactly OR present as the suffix of a namespaced advertised name
+  -- ("caveman:caveman" already covers a disk "caveman"), so nothing shows twice.
+  for _, name in ipairs(disk_names or {}) do
+    if not suffix_seen[name] then push(name) end
   end
   return out
 end
+Slash._all_commands = all_commands   -- test hook (dedup / merge assertions)
 
 -- Prefix-filter the full command list by `query` (the text after "/"), sorted.
 local function filter_commands(query)
@@ -557,6 +620,10 @@ end
 --- picked (chat bar uses it to re-fit + refocus). Idempotent: safe to call on
 --- every keystroke.
 function Slash.open(ibuf, query, bar_rows, on_accept)
+  -- Rescan disk for skill/command names once per menu OPEN (this fn runs on every
+  -- keystroke while the menu is live, so gate on the not-yet-open state). Reopening
+  -- the menu after creating a skill re-globs and surfaces it — no restart needed.
+  if not Slash.active() then refresh_disk_names() end
   ensure_descriptions()
   Slash.ensure_commands()   -- seed from the disk cache if this session hasn't captured a list yet
   menu.items = filter_commands(query)

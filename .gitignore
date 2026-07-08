@@ -14,3 +14,7 @@ session-log.md
 !.work/FINDINGS.md
 !.work/PROGRESS.md
 !.work/PLAN.md
+# Fable-mode runtime marker + method scratch — local per-project state, never committed
+# (committing .fable-active would turn fable-mode ON for anyone who clones).
+/.work/.fable-active
+/.work/GATES.md

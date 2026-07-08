@@ -43,6 +43,10 @@ local set_bottom_pad
 local clear_bottom_pad
 local set_waiting_hint
 
+-- Forward decl: resolve_permission (defined first) drains the queue by re-invoking
+-- show_permission_card (defined further down). Assigned, not re-declared, below.
+local show_permission_card
+
 --- Inject init's spinner/hint/float helpers. Called once from init after they
 --- are defined (prompt_input arrives as a thunk since it is defined further down
 --- in init; float_bottom_row is widgets' — passed through rather than required
@@ -250,6 +254,18 @@ local function resolve_permission(kind)
     local recl = vim.api.nvim_buf_line_count(state.panel_buf)
     buf_append({ mark .. " " .. p.display .. " — " .. verb })
     hl_lines(recl, recl, kind == "deny" and "ClaudeDim" or "ClaudeQuestion")
+  end
+
+  -- Concurrent requests: Claude can emit parallel tool_use blocks in one turn, so
+  -- a second can_use_tool can arrive while this card is up (it was QUEUED, not shown
+  -- — see show_permission_card). Drain the next one NOW instead of resuming the turn
+  -- / reopening the chat bar: that next card owns the spinner+bar lifecycle, and the
+  -- turn is still paused (pause_turn is idempotent, so no double-pause). This is what
+  -- keeps the second modal from orphaning behind the first (the frozen-ghost bug).
+  if state.perm_queue and #state.perm_queue > 0 then
+    local nxt = table.remove(state.perm_queue, 1)
+    show_permission_card(nxt)
+    return
   end
 
   -- Resume the turn clock: fold the decision wait into the paused total so the
@@ -506,7 +522,18 @@ end
 -- Render a permission card from an inbound can_use_tool control_request and arm
 -- the lock. Pauses the spinner (Claude is genuinely blocked on us, so a spinner
 -- would lie); resolve_permission restarts it.
-local function show_permission_card(event)
+show_permission_card = function(event)
+  -- One card at a time. If a card is already up (parallel tool_use → concurrent
+  -- can_use_tool requests), QUEUE this event instead of overwriting state.perm and
+  -- opening a second float that orphans the first. resolve_permission drains the
+  -- queue when the current card is answered. The turn is already paused / spinner
+  -- already stopped by the visible card, so we just stash the raw event and return.
+  if state.perm then
+    state.perm_queue = state.perm_queue or {}
+    state.perm_queue[#state.perm_queue + 1] = event
+    return
+  end
+
   local req = event.request or {}
   local p = {
     request_id  = event.request_id,
@@ -539,7 +566,10 @@ local function show_permission_card(event)
   -- same panel column as the card, so leaving it open overlaps the card and steals
   -- focus/draw order — the card then can't be driven and falls through to a reject.
   -- Closing via the bar's own close() saves the draft; we reopen it on resolve.
-  state.perm_reopen_bar = false
+  -- NB: don't blindly reset perm_reopen_bar here — when this card is drained from
+  -- the queue after a prior card, the bar was already dismissed (chat_win is gone)
+  -- and the pending-reopen intent from the first card must survive to the last one.
+  -- Only set it when there's actually an open bar to dismiss now.
   if state.chat_win and vim.api.nvim_win_is_valid(state.chat_win) then
     state.perm_reopen_bar = true
     if state.chat_close then pcall(state.chat_close) end

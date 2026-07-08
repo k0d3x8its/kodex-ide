@@ -1124,4 +1124,62 @@ H.check("T28 invalid mode → inactive", claude.caveman_active() == false)
 os.remove(cav_flag)
 vim.env.CLAUDE_CONFIG_DIR = nil
 
+-- ── T29: Fable-mode chat-bar title indicator ──────────────────────────────────
+-- The bar title encodes fable-mode (persistent .work/.fable-active marker) as a
+-- neon-purple segment: REPLACES "Build Mode" with "Fable Mode", but only APPENDS a
+-- bare "Fable" in plan mode (keeps "Plan Mode" visible — read-only must not hide).
+local fable_dir = vim.fn.tempname()
+vim.fn.mkdir(fable_dir .. "/.work", "p")
+local prev_cwd = vim.fn.getcwd()
+local prev_root = claude.state.stored_root
+vim.cmd("cd " .. vim.fn.fnameescape(fable_dir))
+claude.state.stored_root = fable_dir   -- panel anchored here (fable_active reads it)
+claude.state.permission_mode = "default"
+
+local function chunks_text(c)
+  if type(c) ~= "table" then return tostring(c) end
+  local s = ""; for _, seg in ipairs(c) do s = s .. seg[1] end; return s
+end
+local function chunk_by_hl(c, hl)
+  if type(c) ~= "table" then return nil end
+  for _, seg in ipairs(c) do if seg[2] == hl then return seg[1] end end
+  return nil
+end
+
+-- No marker → unchanged plain-string title path.
+H.check("T29 no marker → fable_active false", claude._fable_active() == false)
+local t_off = claude._build_bar_title("Reply to Claude")
+H.check("T29 fable off → plain string title with 'Build Mode'",
+  type(t_off) == "string" and t_off:match("Build Mode") ~= nil, vim.inspect(t_off))
+
+-- Marker present (empty file) → detected.
+local mk = io.open(fable_dir .. "/.work/.fable-active", "w"); mk:close()
+H.check("T29 empty marker file → fable_active true", claude._fable_active() == true)
+
+-- Build + fable → "Fable Mode" REPLACES "Build Mode" (purple), "Build" gone.
+local t_build = claude._build_bar_title("Reply to Claude")
+H.check("T29 Build+fable → chunk list", type(t_build) == "table")
+H.check("T29 Build+fable → purple 'Fable Mode' segment",
+  chunk_by_hl(t_build, "ClaudeBarModeFable") == "Fable Mode ", vim.inspect(t_build))
+H.check("T29 Build+fable → 'Build Mode' replaced (word 'Build' absent)",
+  chunks_text(t_build):match("Build") == nil, chunks_text(t_build))
+
+-- Plan + fable → keep "Plan Mode", append bare "Fable" (no doubled "Mode").
+claude.state.permission_mode = "plan"
+local t_plan = claude._build_bar_title("Reply to Claude")
+H.check("T29 Plan+fable → keeps 'Plan Mode'",
+  chunks_text(t_plan):match("Plan Mode") ~= nil, chunks_text(t_plan))
+H.check("T29 Plan+fable → purple bare 'Fable' (no 'Mode')",
+  chunk_by_hl(t_plan, "ClaudeBarModeFable") == "Fable ", vim.inspect(t_plan))
+
+-- Marker removed → reverts to the plain "Plan Mode" string.
+os.remove(fable_dir .. "/.work/.fable-active")
+local t_rev = claude._build_bar_title("Reply to Claude")
+H.check("T29 marker removed → plain 'Plan Mode' string (reverts cleanly)",
+  type(t_rev) == "string" and t_rev:match("Plan Mode") ~= nil, vim.inspect(t_rev))
+
+claude.state.permission_mode = "default"
+claude.state.stored_root = prev_root
+vim.cmd("cd " .. vim.fn.fnameescape(prev_cwd))
+
 H.summary("claude")

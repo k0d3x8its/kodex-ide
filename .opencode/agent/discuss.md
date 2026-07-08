@@ -1,7 +1,7 @@
 ---
 description: Open-ended discussion — analyze selected code, explore ideas, think through problems. No file modifications. Prequel to Brainstorm.
 mode: primary
-model: deepseek/deepseek-v4-flash
+model: opencode/deepseek-v4-flash-free
 color: "#9b59b6"
 temperature: 0.6
 permission:

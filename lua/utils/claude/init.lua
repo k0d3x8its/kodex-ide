@@ -2174,6 +2174,13 @@ function mod.reset()
     pcall(vim.api.nvim_win_close, state.perm.win, true)
   end
   state.perm          = nil
+  -- Deny any permission requests still queued behind the card (parallel tool_use):
+  -- they hold an open control_request the CLI is blocked on, so leaving them unanswered
+  -- across a reset hangs the turn. Reset tears the session down anyway, so deny is safe.
+  for _, ev in ipairs(state.perm_queue or {}) do
+    gate.send_permission_response(ev.request_id, "deny", { message = "Session reset" })
+  end
+  state.perm_queue    = nil
   if state.diff_card and state.diff_card.win and vim.api.nvim_win_is_valid(state.diff_card.win) then
     pcall(vim.api.nvim_win_close, state.diff_card.win, true)
   end

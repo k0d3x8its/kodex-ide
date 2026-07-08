@@ -79,6 +79,9 @@ H.check("S3 a bogus command resolves to nil",
   slash._resolve_desc("definitely-not-a-command-xyz") == nil)
 
 -- ── S4: menu float lifecycle (open → move → select → close) ───────────────────
+-- Pin disk discovery to empty so the lifecycle assertions depend only on the known
+-- CLI+LOCAL set (real ~/.claude skills would otherwise reorder the sorted menu).
+slash._test_disk_names = {}
 local ibuf = vim.api.nvim_create_buf(false, true)
 H.check("S4 menu starts closed", slash.active() == false)
 
@@ -109,6 +112,48 @@ slash.open(ibuf, "zzz", 3, function() end)
 H.check("S4 no-match query opens an empty menu (no crash)",
   slash.active() == true and slash.selected() == nil)
 slash.close()
+
+-- ── S4b: disk-discovered skills populate the menu (new-skill auto-population) ───
+-- The reported bug: skills created AFTER the CLI advertised its slash_commands[]
+-- snapshot never showed. Fix: the menu also sources names from the on-disk skill/
+-- command files, merged + deduped in all_commands(). Proven three ways.
+
+-- (a) Real disk scan finds real skills (un-namespaced basenames).
+local disk = slash._disk_command_names()
+local function has(list, name)
+  for _, n in ipairs(list) do if n == name then return true end end
+  return false
+end
+H.check("S4b disk scan returns a non-empty name list",
+  type(disk) == "table" and #disk > 0, "n=" .. tostring(disk and #disk))
+H.check("S4b disk scan finds a real skill dir (diagnose)",
+  has(disk, "diagnose"), table.concat(disk or {}, ","))
+
+-- (b) A disk-only skill NOT in the CLI-advertised list still becomes a known command.
+claude.state.slash_commands = { "review", "compact" }   -- CLI list WITHOUT the skill
+slash._test_disk_names = { "my-brand-new-skill", "diagnose" }
+slash._refresh_disk_names()
+H.check("S4b disk-only skill is a known command (was absent from slash_commands)",
+  slash.is_command("my-brand-new-skill") == true)
+H.check("S4b disk-only skill appears in the merged command universe",
+  has(slash._all_commands(), "my-brand-new-skill"),
+  table.concat(slash._all_commands(), ","))
+
+-- (c) A disk name that duplicates a namespaced advertised command is NOT added twice.
+claude.state.slash_commands = { "caveman:caveman", "review" }
+slash._test_disk_names = { "caveman", "my-brand-new-skill" }
+slash._refresh_disk_names()
+local all = slash._all_commands()
+local caveman_count = 0
+for _, n in ipairs(all) do if n == "caveman" then caveman_count = caveman_count + 1 end end
+H.check("S4b disk name duplicating a namespaced command is deduped (no bare 'caveman')",
+  caveman_count == 0, "count=" .. caveman_count .. " all=" .. table.concat(all, ","))
+H.check("S4b the namespaced original is still present",
+  has(all, "caveman:caveman"))
+
+-- Restore neutralised disk discovery for the remaining specs.
+slash._test_disk_names = {}
+claude.state.slash_commands = { "brainstorm", "diagnose", "review", "compact", "changelog" }
 
 -- ── S5: prompt-prefixed integration (the real chat-bar path) ──────────────────
 -- REGRESSION: a prompt buffer keeps the "❯ " prompt AS part of the buffer line, so

@@ -520,6 +520,71 @@ H.check("T17 reject sends deny",
   r5 and r5.response.request_id == "req-bash-2"
     and r5.response.response.behavior == "deny", vim.inspect(r5))
 
+-- ── T17b: concurrent permission requests QUEUE (parallel tool_use) ────────────
+-- Claude can emit multiple tool_use blocks in one assistant turn; the canUseTool
+-- gate then fires a can_use_tool control_request PER tool, concurrently. The card
+-- is one-at-a-time, so a second request arriving while a card is up must QUEUE
+-- (not overwrite state.perm and orphan the first float — the frozen-ghost bug).
+claude.state.working = true
+claude.state.perm = nil
+claude.state.perm_queue = nil
+
+feed({
+  type = "control_request", request_id = "req-par-a",
+  request = { subtype = "can_use_tool", tool_name = "Bash",
+              input = { command = "ls /a" } },
+})
+feed({  -- arrives while card A is still open → must queue, NOT overwrite
+  type = "control_request", request_id = "req-par-b",
+  request = { subtype = "can_use_tool", tool_name = "Bash",
+              input = { command = "ls /b" } },
+})
+H.check("T17b first request stays on the card (not overwritten by the second)",
+  claude.state.perm ~= nil and claude.state.perm.request_id == "req-par-a",
+  vim.inspect(claude.state.perm))
+H.check("T17b second request is queued",
+  type(claude.state.perm_queue) == "table" and #claude.state.perm_queue == 1,
+  vim.inspect(claude.state.perm_queue))
+-- Only ONE permission float exists (the second did not open an orphan).
+local function perm_float_count()
+  local n = 0
+  for _, w in ipairs(vim.api.nvim_list_wins()) do
+    local ok, cfg = pcall(vim.api.nvim_win_get_config, w)
+    if ok and cfg and cfg.relative ~= "" and cfg.title then
+      for _, seg in ipairs(cfg.title) do
+        if type(seg) == "table" and tostring(seg[1]):match("Permission required") then
+          n = n + 1
+        end
+      end
+    end
+  end
+  return n
+end
+H.check("T17b exactly one permission float open (no orphan)",
+  perm_float_count() == 1, "floats=" .. perm_float_count())
+
+-- Resolve A → response for req-par-a, then the queued B auto-shows.
+claude._resolve_permission("once")
+local ra = last_control_response()
+H.check("T17b resolving first sends response for req-par-a",
+  ra and ra.response.request_id == "req-par-a"
+    and ra.response.response.behavior == "allow", vim.inspect(ra))
+H.check("T17b queued second auto-shows after first resolves",
+  claude.state.perm ~= nil and claude.state.perm.request_id == "req-par-b"
+    and #(claude.state.perm_queue or {}) == 0, vim.inspect(claude.state.perm))
+H.check("T17b still exactly one permission float after drain",
+  perm_float_count() == 1, "floats=" .. perm_float_count())
+
+-- Resolve B → response for req-par-b, everything cleared.
+claude._resolve_permission("deny")
+local rb = last_control_response()
+H.check("T17b resolving second sends response for req-par-b",
+  rb and rb.response.request_id == "req-par-b"
+    and rb.response.response.behavior == "deny", vim.inspect(rb))
+H.check("T17b all cleared after both resolved",
+  claude.state.perm == nil and #(claude.state.perm_queue or {}) == 0
+    and perm_float_count() == 0, vim.inspect(claude.state.perm))
+
 -- ── T18: AskUserQuestion card — vertical selector, answers map round-trip ─────
 -- AskUserQuestion rides the SAME can_use_tool gate but is NOT allow/reject: it
 -- carries up to 4 questions and the pick rides back in updatedInput.answers (keyed

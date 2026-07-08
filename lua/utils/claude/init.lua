@@ -1327,6 +1327,55 @@ end
 -- it reads flush. The newest output is kept visible above the bar by reserving its
 -- footprint as bottom padding (set_bottom_pad); the over-scroll clamp adds that pad
 -- so it doesn't fight the push-up.
+-- The chat/selection bar's border colour: clay for the default (Build) permission
+-- mode, plan-blue for plan mode. Shared by the title builder + the winhighlight.
+local function mode_border_hl()
+  return (state.permission_mode == "plan") and "ClaudeBarBorderPlan" or "ClaudeBarBorder"
+end
+
+-- True when fable-mode is active for THIS project: /fable-mode writes a persistent
+-- marker at .work/.fable-active (it survives across sessions — which is exactly why
+-- a visible indicator is wanted). Read fresh on each bar open so a mid-session
+-- toggle shows up the next time the bar opens.
+local function fable_active()
+  -- Use the panel's anchored root (where claude actually runs), falling back to cwd
+  -- before the panel has opened — so the badge tracks the SAME project the session
+  -- runs in, not whatever a stray :cd left getcwd() at.
+  local root = state.stored_root or vim.fn.getcwd()
+  return vim.fn.filereadable(root .. "/.work/.fable-active") == 1
+end
+mod._fable_active = fable_active
+
+-- Build the value passed as the chat/selection float's `title`. Encodes the
+-- permission mode as text AND fable-mode as a neon-purple segment:
+--   fable OFF        → plain string, whole title in the border colour (unchanged).
+--   fable ON + Build → "Fable Mode" REPLACES "Build Mode" (Build is the safe default
+--                      and the clay border still signals it) → chunk list.
+--   fable ON + Plan  → "Plan Mode" is KEPT (read-only mode must stay visible) and a
+--                      bare "Fable" is APPENDED (the "Mode" in "Plan Mode" already
+--                      carries it, so "Fable Mode" here would double up) → chunk list.
+-- Returns a string when off (common case untouched) or a {{text,hl},…} chunk list
+-- when on (per-segment colour; nvim ≥0.9).
+local function build_bar_title(base)
+  local border_hl = mode_border_hl()
+  local plan = (state.permission_mode == "plan")
+  if not fable_active() then
+    local mode_label = plan and " - Plan Mode" or " - Build Mode"
+    return " " .. base .. mode_label .. " "
+  end
+  if plan then
+    return {
+      { " " .. base .. " - Plan Mode - ", border_hl },
+      { "Fable ",                         "ClaudeBarModeFable" },
+    }
+  end
+  return {
+    { " " .. base .. " - ", border_hl },
+    { "Fable Mode ",        "ClaudeBarModeFable" },
+  }
+end
+mod._build_bar_title = build_bar_title
+
 local function open_chat_float(title, callback, opts)
   opts = opts or {}
   -- When persist_draft is set, the bar's unsent text survives a hide/show via
@@ -1347,11 +1396,9 @@ local function open_chat_float(title, callback, opts)
   -- Same filetype as the panel buffer so the modal statusline keys off it.
   vim.bo[ibuf].filetype  = "claude"
 
-  -- Surface the active permission mode in the bar's title: "Plan Mode" when
-  -- planning (read-only gate), "Build Mode" for the default (edits apply). Mirrors
-  -- the border color (ClaudeBarBorderPlan vs ClaudeBarBorder) below.
-  local mode_label = (state.permission_mode == "plan") and " - Plan Mode" or " - Build Mode"
-  local label      = title .. mode_label
+  -- Bar title: permission mode ("Build"/"Plan") + a neon-purple "Fable" segment
+  -- when fable-mode is active (build_bar_title owns the replace-vs-append logic).
+  local bar_title = build_bar_title(title)
   local meter_ns = vim.api.nvim_create_namespace("claude_bar_meters")
 
   -- Render the meters as a virtual line attached below the LAST input line.
@@ -1380,14 +1427,14 @@ local function open_chat_float(title, callback, opts)
     height    = 1,                 -- grown to input rows + meter row below
     border    = "rounded",
     style     = "minimal",
-    title     = " " .. label .. " ",
+    title     = bar_title,
     title_pos = "left",
   })
 
   -- Flush surface: interior + border share the CursorLine gray (ClaudeBarBg /
   -- ClaudeBarBorder) so the rounded box reads as one solid bar against the panel,
   -- with only the clay (or plan-blue) outline standing out.
-  local border_hl = (state.permission_mode == "plan") and "ClaudeBarBorderPlan" or "ClaudeBarBorder"
+  local border_hl = mode_border_hl()
   vim.wo[win].winhighlight = "FloatBorder:" .. border_hl
     .. ",FloatTitle:" .. border_hl
     .. ",NormalFloat:ClaudeBarBg"
@@ -1618,8 +1665,7 @@ end
 -- bottom-pad, no panel-column resize tracking (all of which couple the chat bar
 -- to the panel). On submit the caller (ask_selection) opens/answers in the panel.
 local function open_selection_float(title, callback)
-  local mode_label = (state.permission_mode == "plan") and " - Plan Mode" or " - Build Mode"
-  local label      = title .. mode_label
+  local bar_title = build_bar_title(title)
 
   -- Fit inside the current (file) window, clamped to a comfortable range.
   local win_w   = vim.api.nvim_win_get_width(0)
@@ -1643,12 +1689,12 @@ local function open_selection_float(title, callback)
     height    = 1,
     border    = "rounded",
     style     = "minimal",
-    title     = " " .. label .. " ",
+    title     = bar_title,
     title_pos = "left",
     zindex    = 60,
   })
 
-  local border_hl = (state.permission_mode == "plan") and "ClaudeBarBorderPlan" or "ClaudeBarBorder"
+  local border_hl = mode_border_hl()
   vim.wo[win].winhighlight = "FloatBorder:" .. border_hl
     .. ",FloatTitle:" .. border_hl
     .. ",NormalFloat:ClaudeBarBg"

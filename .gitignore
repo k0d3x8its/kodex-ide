@@ -6,6 +6,10 @@ venv/
 RELEASE-NOTES.md
 session-log.md
 
+# Clawd overlay sprites — AGPL-3.0 upstream, fetched at setup, never vendored
+# (scripts/fetch-clawd-assets.sh). Committing them would spread copyleft.
+/assets/clawd/
+
 # Un-ignore planning files so git-crypt can track them (overrides global gitignore)
 !TODOS.md
 !.memory/SESSION-LOG.md

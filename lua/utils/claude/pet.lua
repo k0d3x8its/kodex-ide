@@ -123,6 +123,17 @@ M.state     = "sleep"   -- last resolved state (what the renderer is showing)
 -- Default is a no-op recorder so requiring the module never needs a terminal.
 M.render = function(_, _) end
 
+-- Default monotonic clock (seconds). The idle progression needs a `now` on the
+-- events that (re)start its timer (chat_open / result-success / user_action) and
+-- on advance(); the wiring seams don't thread one, so emit() falls back to this.
+-- Uses the SAME source the real advance-pump timer will use (vim.loop.now() ms →
+-- s) so elapsed math is consistent. Tests inject an explicit `now` and never hit
+-- this. Guarded for the headless spec runner where vim.loop may be absent.
+M.now = function()
+  if vim and vim.loop and vim.loop.now then return vim.loop.now() / 1000 end
+  return os.time()
+end
+
 -- ── Resolver ─────────────────────────────────────────────────────────────────
 -- Map a state NAME to whether its condition is currently active. Encodes the
 -- priority list's semantics; PRIORITY just fixes the scan order.
@@ -159,7 +170,10 @@ local function refresh()
   if next_state ~= M.state then
     local prev = M.state
     M.state = next_state
-    M.render(next_state, prev)
+    -- pcall: emit runs on the hot stream-json dispatch path (which also renders
+    -- the transcript). The renderer is a no-op stub today, but once the image.nvim
+    -- renderer lands a throw here must NOT propagate up and break dispatch.
+    pcall(M.render, next_state, prev)
   end
   return M.state
 end
@@ -187,12 +201,15 @@ end
 function M.emit(event, data)
   data = data or {}
   local c = M.cond
+  -- Idle-restart events need a clock consistent with advance(); tests inject one
+  -- via data.now, the wiring seams don't → fall back to the default clock.
+  local now = data.now or M.now()
 
   if event == "chat_open" then
     -- Bar opened = user is here. Clear stale results, wake to idle, restart the
     -- progression clock (a user action). Keep awake while the bar is visible.
     c.flash = nil
-    enter_idle(data.now)
+    enter_idle(now)
 
   elseif event == "chat_submit" then
     -- User sent a prompt: Claude is about to work. The pet must NOT sleep in the
@@ -231,12 +248,26 @@ function M.emit(event, data)
     c.diff  = nil
     c.flash = data.accepted and "diff_approved" or "diff_rejected"
 
+  elseif event == "diff_close" then
+    -- Safety-net clear. on_diff_close is the single choke point EVERY diff resolve
+    -- path funnels through — the card, the prewrite gate, AND the winbar
+    -- <leader>ca/cx fallback that bypasses diff_resolve. Without this, a winbar-
+    -- resolved post-write diff would latch diff_wait forever (it's priority #2, so
+    -- it masks every later state). Deliberately sets NO flash: the resolve paths
+    -- that know accept vs reject already set diff_approved/rejected before this
+    -- fires, so clearing c.diff here leaves that flash intact.
+    c.diff = nil
+
   elseif event == "result" then
     c.work = nil
+    -- Turn end ⇒ no subagent is still juggling. Clear it defensively so a dropped
+    -- final task_notification (which would leave state.subagents marked "running")
+    -- can't strand the pet in `subagent` — it outranks happy/idle in the resolver.
+    c.subagent = false
     if data.ok then
       -- Turn succeeded: flash happy, then hand off to the idle progression.
       c.flash = "happy"
-      enter_idle(data.now)
+      enter_idle(now)
     else
       c.flash      = "error"
       c.idle_phase = nil
@@ -246,7 +277,7 @@ function M.emit(event, data)
   elseif event == "user_action" then
     -- Any interaction that resets the idle progression (panel focus, keymap,
     -- diff interaction). Only meaningful while idling; ignored mid-turn.
-    if M.idle_from ~= nil then enter_idle(data.now) end
+    if M.idle_from ~= nil then enter_idle(now) end
 
   elseif event == "sleep" or event == "reset" then
     -- Session ended / panel closed: hard floor.

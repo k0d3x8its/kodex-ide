@@ -42,6 +42,8 @@ local float_bottom_row
 local set_bottom_pad
 local clear_bottom_pad
 local set_waiting_hint
+-- Clawd pet event sink (init injects pet.emit). nil = pet disabled → no-op.
+local pet_emit
 
 -- Forward decl: resolve_permission (defined first) drains the queue by re-invoking
 -- show_permission_card (defined further down). Assigned, not re-declared, below.
@@ -60,6 +62,7 @@ function Gate.wire(hooks)
   set_bottom_pad   = hooks.set_bottom_pad
   clear_bottom_pad = hooks.clear_bottom_pad
   set_waiting_hint = hooks.set_waiting_hint
+  pet_emit         = hooks.pet_emit
 end
 
 local function send_permission_response(request_id, decision, o)
@@ -163,6 +166,7 @@ function Gate.on_prewrite_resolve(accepted)
   local p = state.prewrite
   if not p then return end
   state.prewrite = nil
+  if pet_emit then pet_emit("diff_resolve", { accepted = accepted }) end  -- Clawd
   if accepted then
     send_permission_response(p.request_id, "allow", { input = p.input })
   else
@@ -645,6 +649,11 @@ local function resolve_diff_card(kind)
   local d = state.diff_card
   if not d then return end
   close_diff_card()
+  -- Clawd: post-write diff resolved via the card. (Prewrite Edit/Write resolve
+  -- through on_prewrite_resolve above; the winbar <leader>ca/cx fallback for a
+  -- post-write diff bypasses this and misses only the brief approved/rejected
+  -- flash — the pet is hidden by gated() during the diff regardless.)
+  if pet_emit then pet_emit("diff_resolve", { accepted = kind == "accept" }) end
   local diff = require("utils.claude_diff")
   if kind == "accept" then diff.accept_all() else diff.reject_all() end
 end

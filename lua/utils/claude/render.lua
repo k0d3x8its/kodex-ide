@@ -62,6 +62,9 @@ local fmt_think_dur       -- ms → "3.2s" / "1m 04s"
 local FLAVOR_DONE         -- past-tense flavour words for the turn "done" line
 local maybe_send_next     -- drain one type-ahead queue item after a turn ends
 local patch_banner        -- fill the banner's version/model lines on system/init
+-- Clawd pet event sink (init injects pet.emit). nil = pet disabled → no-op, so
+-- dispatch never hard-couples to the pet. Every emit is guarded `if pet_emit`.
+local pet_emit
 
 --- Inject init's spinner/hint/pad/banner helpers + the FLAVOR_DONE table. Called
 --- once from init after those are defined. maybe_send_next comes from the process
@@ -78,6 +81,7 @@ function Render.wire(hooks)
   FLAVOR_DONE      = hooks.FLAVOR_DONE
   maybe_send_next  = hooks.maybe_send_next
   patch_banner     = hooks.patch_banner
+  pet_emit         = hooks.pet_emit
 end
 
 -- ─── Tool verb table (port of ingest.py _TOOL_VERB) ──────────────────────────
@@ -1281,6 +1285,20 @@ local function subagent_by_id(id)
   return nil
 end
 
+-- Clawd: is any subagent still running? Drives the pet's `subagent` condition,
+-- which must stay true from spawn until the last one finishes (a diff-review or
+-- reading can interleave, but the resolver prioritises subagent over them). Emit
+-- active=this after every subagent lifecycle change (spawn / status / final).
+local function any_subagent_running()
+  for _, s in ipairs(state.subagents or {}) do
+    if s.status == "running" then return true end
+  end
+  return false
+end
+local function emit_subagent_state()
+  if pet_emit then pet_emit("subagent", { active = any_subagent_running() }) end
+end
+
 -- Resolve by task_id (task_updated keys on this; linked to the Agent id at
 -- task_started). Separate id space from the tool_use id above.
 local function subagent_by_task(task_id)
@@ -1504,6 +1522,7 @@ local function dispatch(event)
       sub.status = event.patch.status
       widgets.update_subagent_bar()          -- status word → glyph/meta refresh
       widgets.maybe_dismiss_subagents()      -- all finished → auto-hide the switcher
+      emit_subagent_state()   -- Clawd: clear juggling once the last one finishes
     end
 
   elseif ev_type == "system" and event.subtype == "task_notification" then
@@ -1517,6 +1536,7 @@ local function dispatch(event)
       if type(event.status) == "string" then sub.status = event.status end
       widgets.update_subagent_bar()          -- final tokens/duration → meta refresh
       widgets.maybe_dismiss_subagents()      -- all finished → auto-hide the switcher
+      emit_subagent_state()   -- Clawd: clear juggling on the final subagent close
     end
 
   elseif ev_type == "stream_event" then
@@ -1532,6 +1552,7 @@ local function dispatch(event)
       state.think_start  = vim.loop.now()
       state.think_idx    = se.index          -- which block index is the thinking one
       state.think_tokens = 0                 -- reset the per-block live token count
+      if pet_emit then pet_emit("thinking") end   -- Clawd: reasoning phase
     elseif st == "content_block_stop" and state.think_start
         and se.index == state.think_idx then
       -- Thinking finished: freeze the duration for render_thinking to stamp on the
@@ -1603,6 +1624,7 @@ local function dispatch(event)
       local btype = block.type or ""
       if btype == "text" then
         render_prose(block.text or "")
+        if pet_emit then pet_emit("typing") end   -- Clawd: Claude generating output
       elseif btype == "thinking" then
         render_thinking(block.thinking or "")
       elseif btype == "server_tool_use" and (block.name == "advisor") then
@@ -1614,6 +1636,10 @@ local function dispatch(event)
       elseif btype == "tool_use" then
         local name  = block.name or ""
         local input = block.input or {}
+        -- Clawd: classify the tool → reading/cleaning/debugging (pet's own map;
+        -- Agent/Task classify to nil here and are handled by the subagent emit
+        -- at the spawn block below).
+        if pet_emit then pet_emit("tool_use", { name = name, input = input }) end
         local subagent_hdr_lnum = nil   -- Agent/Task header line, for model rewrite
         -- TodoWrite drives the bottom-pinned task widget, not an inline block:
         -- capture the full list (each call replaces it) and re-render the float.
@@ -1674,6 +1700,7 @@ local function dispatch(event)
           -- changed, so the Task card + chat bar must lift above it). 17.2.
           widgets.update_subagent_bar()
           widgets.reflow_bottom_floats()
+          emit_subagent_state()   -- Clawd: juggling while a subagent runs
         end
         -- MG 14.2: pre-load the edit target so the FileChangedShell interceptor
         -- catches the CLI's write (covers new + unloaded files). tool_use always
@@ -1708,6 +1735,10 @@ local function dispatch(event)
     end
     state.working = false
     stop_spinner()
+    -- Clawd: turn closed → happy (success) or error. is_error marks a failed turn
+    -- (error_max_turns / error_during_execution); success flashes happy then the
+    -- pet hands off to the idle progression.
+    if pet_emit then pet_emit("result", { ok = event.is_error ~= true }) end
     if state.diff_pending then
       -- Hold queued messages until the edit is reviewed (on_diff_close drains).
       set_hint("⚠ Awaiting review — <leader>ca accept  <leader>cx reject", "ClaudeLabel")

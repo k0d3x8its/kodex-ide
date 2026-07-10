@@ -40,6 +40,7 @@ local render = require(require_prefix .. "render")
 local slash = require(require_prefix .. "slash")
 local effort = require(require_prefix .. "effort")
 local advisor = require(require_prefix .. "advisor")
+local pet = require(require_prefix .. "pet")
 
 -- Full path required — ~/.local/bin is only on PATH in interactive bash, never
 -- in Neovim's environment. Matches the OPENCODE_BIN pattern in opencode.lua
@@ -803,6 +804,16 @@ end
 -- it stays here). Inject those + the FLAVOR_DONE table; maybe_send_next comes from
 -- the process module; patch_banner is init's banner buffer-patch. This is placed
 -- after every dep (incl. patch_banner just above) is defined.
+-- Clawd pet event sink: a thin wrapper over pet.emit shared by render.wire and
+-- gate.wire. Routing through init (rather than each module requiring pet) keeps
+-- the "nil pet = no-op" contract at the seam and gives one place to disable the
+-- pet. The pet's renderer is a no-op stub until the image.nvim renderer lands
+-- (spec step 7), so emitting now only drives the pure state machine — safe and
+-- headless-testable.
+local function pet_emit(event, data)
+  pet.emit(event, data)
+end
+
 render.wire({
   set_hint         = set_hint,
   clear_hint       = clear_hint,
@@ -814,6 +825,7 @@ render.wire({
   FLAVOR_DONE      = FLAVOR_DONE,
   maybe_send_next  = process.maybe_send_next,
   patch_banner     = patch_banner,
+  pet_emit         = pet_emit,
 })
 
 -- Re-export the render module's mod._* / public hooks (the <C-o> keymap calls
@@ -859,6 +871,7 @@ gate.wire({
   -- (the diff/prewrite/question gates keep the spinner running, so their tick
   -- shows it directly — this covers the one gate that halts the tick).
   set_waiting_hint = function() set_hint(waiting_label(), "ClaudeInput") end,
+  pet_emit         = pet_emit,   -- Clawd: diff accept/reject → diff_* pet states
 })
 
 -- Re-source the gate helpers init still calls directly (event dispatcher, chat bar)
@@ -1431,6 +1444,10 @@ local function open_chat_float(title, callback, opts)
     title_pos = "left",
   })
 
+  -- Clawd: the reply bar opened = user is present → wake to idle + reset the idle
+  -- progression clock (so the pet doesn't drift to sleep while the user types).
+  pet_emit("chat_open")
+
   -- Flush surface: interior + border share the CursorLine gray (ClaudeBarBg /
   -- ClaudeBarBorder) so the rounded box reads as one solid bar against the panel,
   -- with only the clay (or plan-blue) outline standing out.
@@ -1622,6 +1639,9 @@ local function open_chat_float(title, callback, opts)
   vim.fn.prompt_setcallback(ibuf, function(text)
     submitted = true
     if persist_draft then state.chat_draft = "" end   -- sent → drop the saved draft
+    -- Clawd: a real prompt was sent → hold awake and stop the idle clock so the
+    -- pet can't sleep in the gap before Claude's first thinking/typing event.
+    if text ~= "" then pet_emit("chat_submit") end
     close()
     callback(text ~= "" and text or nil)
   end)
@@ -2216,6 +2236,11 @@ function mod.reset()
   widgets.wipe_subagent_buffers()
   state.subagents     = nil
   state.subagent_sel  = 1
+  -- Clawd: hard-floor the pet to sleep. The session's state.subagents /
+  -- diff_pending / prewrite are cleared here but the pet's own latched conditions
+  -- (subagent / diff / error flash) would otherwise survive a close/reopen — only
+  -- reset/sleep clear them. Reset now so the next panel view starts asleep.
+  pet.reset()
   if state.perm and state.perm.win and vim.api.nvim_win_is_valid(state.perm.win) then
     pcall(vim.api.nvim_win_close, state.perm.win, true)
   end
@@ -2524,6 +2549,7 @@ end
 -- Claude with a half-applied change still on disk.
 function mod.on_diff_open(info)
   state.diff_pending = true
+  pet_emit("diff_open")   -- Clawd: notification sprite while review is pending
   set_hint("⚠ Awaiting review — <leader>ca accept  <leader>cx reject", "ClaudeLabel")
   local path = info and info.path
   if path then
@@ -2541,6 +2567,10 @@ end
 --- Called by claude_diff when the current diff is resolved — unlocks input.
 function mod.on_diff_close()
   state.diff_pending = false
+  -- Clawd: clear the pet's diff_wait. This is the single choke point ALL resolve
+  -- paths reach (card, prewrite, and the winbar <leader>ca/cx fallback) — without
+  -- it, a winbar-resolved post-write diff would latch diff_wait for the session.
+  pet_emit("diff_close")
   -- The card may still be up if the diff resolved via the winbar/<leader>ca/cx
   -- fallback rather than the card itself — drop it either way.
   close_diff_card()

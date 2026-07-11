@@ -189,25 +189,25 @@ end
 -- to a real panel/chat window and must NOT float free without one (that's how a
 -- raw `:q` on the panel would otherwise orphan a ghost pet).
 -- Per-asset left-shift (cells) so every sprite's VISUAL right edge lines up with
--- groove's ~12px window-edge buffer (the reference position, user-picked). Assets
--- differ in transparent right margin INSIDE their canvas, so a uniform pad would
--- misalign them — groove itself needs 0 (its margin is baked in). Derived from
--- measured content-bbox right gaps: pad = max(0, round((12.3px - gap_screen)/cw)).
+-- happy's ~30px window-edge buffer (the reference position, user-picked 2026-07-11:
+-- happy is the widest box and cannot move right without clipping, so it defines the
+-- common column). Assets differ in transparent right margin INSIDE their canvas, so
+-- a uniform pad would misalign them. pad = max(0, round((30px - gap_screen)/cw)).
 local X_PAD = {
-  ["idle"]              = 1,
-  ["building"]          = 1,
-  ["debugger"]          = 0,
-  ["error"]             = 1,
+  ["idle"]              = 3,
+  ["building"]          = 2,
+  ["debugger"]          = 1,
+  ["error"]             = 2,
   ["happy"]             = 0,
-  ["headphones-groove"] = 0,
-  ["idle-reading"]      = 1,
-  ["juggling"]          = 1,
-  ["notification"]      = 1,
-  ["react-annoyed"]     = 0,
-  ["sleeping"]          = 1,
-  ["sweeping"]          = 1,
-  ["thinking"]          = 1,
-  ["typing"]            = 1,
+  ["headphones-groove"] = 2,
+  ["idle-reading"]      = 3,
+  ["juggling"]          = 3,
+  ["notification"]      = 3,
+  ["react-annoyed"]     = 1,
+  ["sleeping"]          = 3,
+  ["sweeping"]          = 2,
+  ["thinking"]          = 3,
+  ["typing"]            = 3,
 }
 
 local function placed_geom(mode, wrow, wcol, ww, wh, pw, ph, pad)

@@ -56,7 +56,12 @@ readonly STATES=(
 # evenly-spaced ~16 so the animation stays smooth but the cache stays under 1 MB.
 readonly TARGET_FRAMES=16
 # Render size (px). Sprites are 302×300; the pet shows at ~120px in the float.
-readonly FRAME_SIZE=120
+# 127 (prime) on purpose: image.nvim only pre-resizes when the requested pixel
+# width differs from the file's native width (a width-only check). A canvas whose
+# width can never equal cols*cell_width guarantees the resize path for every asset —
+# otherwise width-exact sprites ship the raw file and Ghostty renders them at native
+# height, dipping ~0.35 rows below the anchor (live-diagnosed 2026-07-11).
+readonly FRAME_SIZE=127
 
 force=0
 rebuild=0
@@ -204,8 +209,19 @@ extract_frames() {
 
   # Normalize each visible frame to the common bottom baseline. The 120x120 canvas
   # stays fixed; only transparent bottom padding is rolled to the top.
+  # First strip the baked-in drop shadow: some source sprites (idle, typing) draw a
+  # pure-black bar under the feet in the bottom rows, which renders as a black box
+  # on the statusline/chat bar. Pure black never appears legitimately that low
+  # (face/keyboard blacks sit higher), so erase it in the bottom band only — BEFORE
+  # the baseline roll, so the feet (not the shadow) become the flush bottom edge.
+  local shadow_band=8
+  local band_y=$(( FRAME_SIZE - shadow_band ))
   local frame metrics trim_h trim_y page_h bottom_pad
   for frame in "$tmp"/src_*.png; do
+    convert "$frame" \
+      \( +clone -crop "${FRAME_SIZE}x${shadow_band}+0+${band_y}" +repage \
+         -fuzz 10% -transparent black \) \
+      -geometry "+0+${band_y}" -compose Copy -composite "$frame"
     metrics="$(convert "$frame" -alpha extract -trim \
       -format '%h %[fx:page.y] %[fx:page.height]' info:)"
     read -r trim_h trim_y page_h <<< "$metrics"

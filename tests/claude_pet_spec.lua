@@ -115,22 +115,38 @@ H.check("P-SUB2 subagent clear falls back to typing",
 reset()
 pet.emit("result", { ok = true, now = 0 })   -- happy + idle clock starts at 0
 H.check("P-IDLE1 t=0 happy", pet.state == "happy")
+-- Schedule: idle 0–15s, groove 15–45s (30s), idle 45–60s, sleep 60s+.
 H.check("P-IDLE2 t=10 → idle (happy dropped)", pet.advance(10) == "idle")
-H.check("P-IDLE3 t=60 → headphones_groove", pet.advance(60) == "headphones_groove")
-H.check("P-IDLE4 t=120 → idle", pet.advance(120) == "idle")
-H.check("P-IDLE5 t=180 → sleep", pet.advance(180) == "sleep")
+H.check("P-IDLE3 t=20 → headphones_groove", pet.advance(20) == "headphones_groove")
+H.check("P-IDLE4 t=50 → idle (post-groove)", pet.advance(50) == "idle")
+H.check("P-IDLE5 t=65 → sleep", pet.advance(65) == "sleep")
 
 -- User action mid-progression resets the clock back to idle.
 pet.emit("user_action", { now = 200 })
 H.check("P-IDLE6 user_action resets to idle", pet.state == "idle")
 H.check("P-IDLE7 clock reset — t=210 still idle (only +10)", pet.advance(210) == "idle")
-H.check("P-IDLE8 t=270 groove again (60 past reset)", pet.advance(270) == "headphones_groove")
+H.check("P-IDLE8 t=220 groove again (20 past reset)", pet.advance(220) == "headphones_groove")
 
 -- advance() is a no-op when not idling (mid-turn).
 reset()
 pet.emit("typing")
 local before = pet.state
 H.check("P-IDLE9 advance no-op mid-turn", pet.advance(999) == before)
+
+-- ── Permission / question modal → building | notification (P-PERM) ────────────
+-- Edit/Write permission → building; any other modal → notification; both outrank
+-- the underlying work state and clear back to it on resolve.
+reset()
+pet.emit("tool_use", { name = "Read", input = { file_path = "/x" } })
+H.check("P-PERM0 reading before modal", pet.state == "reading")
+pet.emit("permission", { active = true, build = true })
+H.check("P-PERM1 edit perm → building", pet.state == "building")
+pet.emit("permission", { active = false })
+H.check("P-PERM2 resolve → reading resurfaces", pet.state == "reading")
+pet.emit("permission", { active = true, build = false })
+H.check("P-PERM3 other modal → notification", pet.state == "notification")
+pet.emit("permission", { active = false })
+H.check("P-PERM4 resolve → reading again", pet.state == "reading")
 
 -- ── Render fires only on change (P-RND) ──────────────────────────────────────
 reset()

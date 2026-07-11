@@ -28,6 +28,15 @@ return {
         command_palette = true,
         long_message_to_split = true,
       },
+      views = {
+        -- LSP progress ("Diagnosing…", workspace loading) renders in the mini
+        -- view, whose default position is the SCREEN's bottom-right — inside the
+        -- Claude panel (and on top of the Clawd pet's corner) whenever the panel
+        -- is open. Pin it bottom-LEFT so it always lands over the editor side.
+        mini = {
+          position = { row = -1, col = 0 },
+        },
+      },
     })
   end,
 }

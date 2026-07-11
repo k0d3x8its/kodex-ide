@@ -3,9 +3,9 @@
 -- pet kitty writes race nvim's TUI output on fd 1 (two libuv tty handles, no
 -- coordination — proven by a PTY A/B capture: APC writer on = interrupted CSIs +
 -- literal ";NNNm" fragments, off = clean). The fix suppresses pet writes during
--- panel scroll storms. This spec pins the INIT side: every panel scroll site
--- (wheel-down pre-empt, wheel-up map, clamp_scroll's bounce correction) must
--- refresh pet_render.hold_writes.
+-- panel scroll storms. This spec pins the INIT side: the wheel maps (real user
+-- storms) must refresh pet_render.hold_writes, and clamp_scroll corrections must
+-- NOT (they also fire for programmatic pad re-anchors — see SH3).
 -- Run: nvim --headless -u NONE --cmd "set runtimepath+=." -c "luafile tests/claude_scroll_hold_spec.lua"
 
 local H = dofile("tests/helpers.lua")
@@ -66,9 +66,11 @@ H.check("SH2 wheel-up holds pet writes", holds >= 1, "holds=" .. holds)
 H.check("SH2b wheel-up scrolls the view up", top_after < top_before,
   "before=" .. top_before .. " after=" .. top_after)
 
--- SH3: clamp_scroll bounce correction refreshes the hold. Force an over-scroll:
--- <C-e> past the end drags the LAST line up above its resting band (gap > limit),
--- which is exactly the state the WinScrolled clamp corrects with a bounce.
+-- SH3: clamp_scroll corrections must NOT arm the hold. Corrections also fire on
+-- PROGRAMMATIC scrolls (set_bottom_pad re-anchor on chat/modal open, streaming
+-- auto-follow); arming there chained rolling holds that delayed the anchor-switch
+-- sprite repaint ~1s (live regression 2026-07-11). Only the wheel maps — actual
+-- user storms — may arm it. Force a correction and assert zero holds.
 holds = 0
 vim.api.nvim_win_call(claude.state.panel_win, function()
   vim.cmd("keepjumps normal! G")
@@ -79,6 +81,7 @@ vim.api.nvim_win_call(claude.state.panel_win, function()
   vim.wo[claude.state.panel_win].scrolloff = so
 end)
 claude._clamp_scroll()
-H.check("SH3 clamp bounce correction holds pet writes", holds >= 1, "holds=" .. holds)
+H.check("SH3 clamp correction does NOT hold pet writes (programmatic scrolls)",
+  holds == 0, "holds=" .. holds)
 
 H.summary("claude_scroll_hold_spec")

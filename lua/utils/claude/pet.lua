@@ -29,6 +29,9 @@ local M = {}
 -- subagent is the dominant activity — left as a deliberate config knob below.
 local PRIORITY = {
   "error",
+  "building",        -- an Edit/Write permission is up → building sprite
+  "notification",    -- any other permission/question modal is up → notification sprite
+                     -- (both outrank reading etc. so the modal-wait state always wins)
   "diff_wait",
   "diff_rejected",
   "diff_approved",
@@ -49,10 +52,10 @@ local PRIORITY = {
 -- when scanning wins. Begins ONLY after Claude finishes answering (or the chat
 -- bar opens); any user action resets the clock to 0.
 local IDLE_STAGES = {
-  { at = 180, phase = "sleep" },
-  { at = 120, phase = "idle" },
-  { at = 60,  phase = "headphones_groove" },
-  { at = 0,   phase = "idle" },
+  { at = 60, phase = "sleep" },              -- after the full cycle: sleep until active
+  { at = 45, phase = "idle" },               -- 15s idle again (45→60)
+  { at = 15, phase = "headphones_groove" },  -- 30s of groove (15→45)
+  { at = 0,  phase = "idle" },               -- 15s idle first (0→15)
 }
 
 -- ── Tool → state classification (spec §Heuristics) ───────────────────────────
@@ -112,6 +115,7 @@ local function fresh_conditions()
     diff       = nil,   -- "wait" while a diff/prewrite review is pending
     flash      = nil,   -- transient: error|happy|diff_approved|diff_rejected
     idle_phase = nil,   -- idle|headphones_groove|sleep, or nil while working
+    permission = nil,   -- "build" (Edit/Write perm) | "notify" (other modal) | nil
   }
 end
 
@@ -139,6 +143,8 @@ end
 -- priority list's semantics; PRIORITY just fixes the scan order.
 local function active(name, c)
   if name == "error"          then return c.flash == "error" end
+  if name == "building"       then return c.permission == "build" end
+  if name == "notification"   then return c.permission == "notify" end
   if name == "diff_wait"      then return c.diff == "wait" end
   if name == "diff_rejected"  then return c.flash == "diff_rejected" end
   if name == "diff_approved"  then return c.flash == "diff_approved" end
@@ -236,6 +242,18 @@ function M.emit(event, data)
     c.flash = nil
     local st = classify(data.name, data.input)
     if st then c.work = st end  -- nil (Edit/Write/…) keeps the current state
+
+  elseif event == "permission" then
+    -- A permission/question modal is up (blocks the turn, waits on the user). An
+    -- Edit/Write file request → the building sprite (Clawd constructing code); any
+    -- other permission or a question modal → the notification sprite. Cleared when
+    -- the last modal resolves. Does NOT touch idle/work state — those resurface
+    -- underneath once the modal clears (e.g. reading → building → reading).
+    if data.active then
+      c.permission = data.build and "build" or "notify"
+    else
+      c.permission = nil
+    end
 
   elseif event == "subagent" then
     c.subagent = data.active and true or false

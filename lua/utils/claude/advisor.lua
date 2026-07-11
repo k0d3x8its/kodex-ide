@@ -43,11 +43,15 @@ local RECO  = "Recommended: Sonnet as the main model with Opus as the advisor."
 -- Init-owned float helpers, injected by Advisor.wire{} at load time.
 local panel_float_geom
 local harden_float_scroll
+local pet_attach_surface -- Clawd hops onto the modal's top border while it's open
+local pet_attach_panel   -- …and back to the panel corner on close
 
 --- Inject init's float helpers. Called once from init after they are defined.
 function Advisor.wire(hooks)
   panel_float_geom    = hooks.panel_float_geom
   harden_float_scroll = hooks.harden_float_scroll
+  pet_attach_surface  = hooks.pet_attach_surface
+  pet_attach_panel    = hooks.pet_attach_panel
 end
 
 -- Live modal state (only ever one at a time). sel = 1-based index into OPTIONS,
@@ -157,6 +161,7 @@ function Advisor.close()
     pcall(vim.api.nvim_set_current_win, modal.prev_win)
   end
   modal.win, modal.buf, modal.ns, modal.on_confirm, modal.prev_win = nil, nil, nil, nil, nil
+  if pet_attach_panel then pet_attach_panel() end
 end
 
 -- Move the selection (±1), clamped, and redraw.
@@ -196,6 +201,7 @@ function Advisor.open(on_confirm)
   })
   vim.wo[modal.win].winhighlight = "NormalFloat:ClaudeSlashBg,FloatBorder:ClaudeSlashBorder"
   harden_float_scroll(modal.win)
+  if pet_attach_surface then pet_attach_surface(modal.win) end
 
   local function map(lhs, fn)
     vim.keymap.set("n", lhs, fn, { buffer = modal.buf, nowait = true, silent = true })

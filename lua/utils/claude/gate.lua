@@ -44,6 +44,8 @@ local clear_bottom_pad
 local set_waiting_hint
 -- Clawd pet event sink (init injects pet.emit). nil = pet disabled → no-op.
 local pet_emit
+local pet_attach_surface
+local pet_attach_panel
 
 -- Forward decl: resolve_permission (defined first) drains the queue by re-invoking
 -- show_permission_card (defined further down). Assigned, not re-declared, below.
@@ -63,6 +65,8 @@ function Gate.wire(hooks)
   clear_bottom_pad = hooks.clear_bottom_pad
   set_waiting_hint = hooks.set_waiting_hint
   pet_emit         = hooks.pet_emit
+  pet_attach_surface = hooks.pet_attach_surface
+  pet_attach_panel   = hooks.pet_attach_panel
 end
 
 local function send_permission_response(request_id, decision, o)
@@ -249,6 +253,7 @@ local function resolve_permission(kind)
   if p.win and vim.api.nvim_win_is_valid(p.win) then
     pcall(vim.api.nvim_win_close, p.win, true)
   end
+  if pet_attach_panel then pet_attach_panel() end
 
   -- One-line receipt in the transcript so the scrollback shows what was decided.
   local mark = (kind == "deny") and "✗" or "✓"
@@ -271,6 +276,11 @@ local function resolve_permission(kind)
     show_permission_card(nxt)
     return
   end
+
+  -- Clawd: no more queued cards → the modal is truly gone. Clear the building/notify
+  -- state so the work/idle state underneath resurfaces. (A drained card above returned
+  -- early after re-emitting active, so this only fires on the LAST resolve.)
+  if pet_emit then pet_emit("permission", { active = false }) end
 
   -- Resume the turn clock: fold the decision wait into the paused total so the
   -- cumulative turn timer + "✻ …for Ns" done line exclude it (mirrors the tick).
@@ -412,8 +422,14 @@ local function open_permission_float(p)
   -- the user sees what will run, not just a paraphrase of it. Rendered LAST so it
   -- is the scrollable tail of the float.
   for _, cl in ipairs(perm_input_lines(p.input)) do
-    lines[#lines + 1] = "  ▎ " .. cl
-    body_hl[#body_hl + 1] = { #lines - 1, "ClaudeCode" }
+    -- A multi-line value (e.g. a Write's file content) arrives as ONE string with
+    -- embedded "\n". nvim_buf_set_lines rejects items containing newlines, so split
+    -- each into its own buffer line — otherwise the whole card throws and the request
+    -- goes unanswerable (visible-crash + silent-accept-on-<CR>).
+    for _, sub in ipairs(vim.split(cl, "\n", { plain = true })) do
+      lines[#lines + 1] = "  ▎ " .. sub
+      body_hl[#body_hl + 1] = { #lines - 1, "ClaudeCode" }
+    end
   end
   if p.rules and #p.rules > 0 then
     lines[#lines + 1] = "  Patterns: " .. table.concat(p.rules, ", ")
@@ -460,6 +476,7 @@ local function open_permission_float(p)
     zindex    = 60,
   })
   p.win = win
+  if pet_attach_surface then pet_attach_surface(win) end
   -- Amber outline so the card is clearly NOT the clay chat bar; interior shares
   -- ClaudeBarBg so the box reads flush, only the outline pops.
   vim.wo[win].winhighlight =
@@ -580,6 +597,13 @@ show_permission_card = function(event)
   end
 
   state.perm = p
+  -- Clawd: a permission modal is up. Edit/Write file requests → building sprite;
+  -- every other tool → notification sprite (see pet.lua `permission` event).
+  if pet_emit then
+    local build = p.tool == "Edit" or p.tool == "Write"
+      or p.tool == "MultiEdit" or p.tool == "NotebookEdit"
+    pet_emit("permission", { active = true, build = build })
+  end
   open_permission_float(p)
   render_perm_choice_row()
   -- The spinner is stopped for the perm card, so paint the frozen "Waiting…" hint
@@ -638,6 +662,7 @@ local function close_diff_card()
   if d.win and vim.api.nvim_win_is_valid(d.win) then
     pcall(vim.api.nvim_win_close, d.win, true)
   end
+  if pet_attach_panel then pet_attach_panel() end
 end
 Gate.close_diff_card = close_diff_card
 
@@ -701,6 +726,7 @@ local function open_diff_card_float(d)
     zindex    = 60,
   })
   d.win = win
+  if pet_attach_surface then pet_attach_surface(win) end
   -- Same amber outline as the permission card — both are "your decision needed"
   -- cards; a distinct colour per card type would read as two different systems.
   vim.wo[win].winhighlight =

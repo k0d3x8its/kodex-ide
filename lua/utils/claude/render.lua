@@ -1553,6 +1553,14 @@ local function dispatch(event)
       state.think_idx    = se.index          -- which block index is the thinking one
       state.think_tokens = 0                 -- reset the per-block live token count
       if pet_emit then pet_emit("thinking") end   -- Clawd: reasoning phase
+    elseif st == "content_block_start" and (se.content_block or {}).type == "text" then
+      -- Clawd: text block STARTED = Claude is now generating prose. This is the true
+      -- typing signal — the other `typing` emit (assistant text block below) only
+      -- fires once the AGGREGATED text lands, i.e. AFTER compose finishes, so the pet
+      -- never animated typing during the live stream the transcript shows `Typing`
+      -- for. Firing on the start (not the TTFT gap before any block, not the
+      -- aggregated end) keeps the pet in step with the streamed text.
+      if pet_emit then pet_emit("typing") end
     elseif st == "content_block_stop" and state.think_start
         and se.index == state.think_idx then
       -- Thinking finished: freeze the duration for render_thinking to stamp on the

@@ -570,10 +570,33 @@ local function ensure_frames(asset)
   return frames, key
 end
 
+-- ── Scroll-storm write hold ──────────────────────────────────────────────────
+-- Kitty escapes go out on image.nvim's OWN libuv tty handle (backends/kitty/
+-- helpers.lua), uncoordinated with nvim's TUI thread writing the same fd. Under
+-- scroll-storm redraw pressure the TUI flush goes out in partial writes, and an
+-- APC landing mid-CSI corrupts the terminal state — the CSI dies, its tail
+-- (";97H") prints literally, and leaked SGR bg bands paint into the neighbour
+-- window (PTY A/B-proven: APC writer on = interrupted CSIs, off = clean). The
+-- race is unfixable from plugin land (no TUI flush lock), but it only bites when
+-- both writers overlap — so the panel's scroll sites arm a rolling hold and
+-- swap_to skips its writes while it runs. The shown frame simply persists (no
+-- clear happens), and the ≤100 ms swap tick repaints once the hold expires.
+local SCROLL_HOLD_MS = 250
+local write_hold_until = 0
+local function hold_writes(now_ms)
+  write_hold_until = (now_ms or vim.loop.now()) + SCROLL_HOLD_MS
+end
+local function writes_held(now_ms)
+  return (now_ms or vim.loop.now()) < write_hold_until
+end
+M.hold_writes  = hold_writes  -- called from init's panel scroll sites
+M._writes_held = writes_held  -- test seam (injectable clock)
+
 -- Render the next frame BEFORE clearing the previous one (anti-flicker order).
 local last_traced_asset
 local function swap_to(img)
   if not img or img == shown_img then return end
+  if writes_held() then return end -- scroll storm: skip the kitty write this tick
   pcall(function() img:render() end)
   if shown_img then pcall(function() shown_img:clear(true) end) end
   shown_img = img

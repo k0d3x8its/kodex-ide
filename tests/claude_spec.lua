@@ -585,6 +585,34 @@ H.check("T17b all cleared after both resolved",
   claude.state.perm == nil and #(claude.state.perm_queue or {}) == 0
     and perm_float_count() == 0, vim.inspect(claude.state.perm))
 
+-- ── T17c: newline-carrying request fields must not crash the card ─────────────
+-- nvim_buf_set_lines throws on ANY item containing "\n"; description/display are
+-- CLI-supplied and can be multi-line (live crash 2026-07-11: card never populated,
+-- request invisible). Every body insert must be split into real buffer lines.
+feed({
+  type = "control_request", request_id = "req-nl-1",
+  request = {
+    subtype      = "can_use_tool",
+    tool_name    = "Bash",
+    display_name = "Run command",
+    description  = "line one\nline two\nline three",
+    input        = { command = "echo a\necho b" },
+  },
+})
+H.check("T17c multi-line desc/input still opens the card",
+  claude.state.perm ~= nil and claude.state.perm.request_id == "req-nl-1"
+    and perm_float_count() == 1,
+  vim.inspect(claude.state.perm))
+H.check("T17c card buffer holds the split description lines",
+  (function()
+    local b = claude.state.perm and claude.state.perm.buf
+    if not (b and vim.api.nvim_buf_is_valid(b)) then return false end
+    local txt = table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\1")
+    return txt:find("line two", 1, true) ~= nil
+  end)())
+claude._resolve_permission("deny")
+H.check("T17c cleanup", claude.state.perm == nil and perm_float_count() == 0)
+
 -- ── T18: AskUserQuestion card — vertical selector, answers map round-trip ─────
 -- AskUserQuestion rides the SAME can_use_tool gate but is NOT allow/reject: it
 -- carries up to 4 questions and the pick rides back in updatedInput.answers (keyed

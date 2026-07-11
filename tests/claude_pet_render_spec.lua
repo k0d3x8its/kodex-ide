@@ -76,4 +76,21 @@ H.check("PR-SCALE2 idle remains bottom-right", ix == 6 and iy == 6)
 local _, _, sw, sh = pr._frame_placement("sleeping", 96, 64, 8, 16)
 H.check("PR-SCALE3 sleep uses its per-asset scale", sw == 9 and sh == 3)
 
+-- ── Scroll-storm write hold (PR-HOLD) ────────────────────────────────────────
+-- Regression for the over-scroll escape-stream corruption (TODOS 2026-07-11 [BUG]):
+-- kitty writes go out on a SECOND libuv tty handle (image.nvim helpers.lua) that
+-- races nvim's TUI thread; under scroll-storm redraw pressure a partial TUI flush
+-- lets an APC land mid-CSI — the terminal drops the CSI, prints its tail (";97H")
+-- literally, and leaks SGR bands into the neighbour window. The mitigation gates
+-- swap_to behind a rolling hold that the panel scroll sites refresh; these checks
+-- pin the pure clock semantics (injectable now, ms).
+H.check("PR-HOLD0 hold_writes exposed", type(pr.hold_writes) == "function")
+H.check("PR-HOLD1 not held before any hold", pr._writes_held(0) == false)
+pr.hold_writes(1000)
+H.check("PR-HOLD2 held inside the window", pr._writes_held(1100) == true)
+H.check("PR-HOLD3 released after the window", pr._writes_held(1000 + 251) == false)
+pr.hold_writes(2000)
+pr.hold_writes(2200) -- storm: each event re-arms the rolling window
+H.check("PR-HOLD4 re-arm extends the hold", pr._writes_held(2300) == true)
+
 H.summary("claude_pet_render_spec")

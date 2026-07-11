@@ -1969,10 +1969,13 @@ local function clamp_scroll()
     if gap > limit then target = limit
     elseif gap < floor then target = floor end
     if target then
-      -- A correction firing = the bounce is live = redraw storm. Hold the pet's
-      -- kitty writes so they can't interleave into the TUI flush (see
-      -- pet_render hold_writes for the escape-corruption mechanism).
-      pcall(pet_render.hold_writes)
+      -- NB: this branch must NOT arm pet_render.hold_writes. Corrections also
+      -- fire for PROGRAMMATIC scrolls — set_bottom_pad re-anchoring on every
+      -- chat-bar/modal open, streaming auto-follow — and holding there chained
+      -- rolling holds that delayed the anchor-switch sprite repaint ~1s (live
+      -- regression 2026-07-11). The wheel maps arm the hold per notch, which
+      -- covers the real corruption repro (mouse storm); a keyboard scroll
+      -- settles in one discrete correction and is low-risk.
       local so = vim.wo[win].scrolloff
       vim.wo[win].scrolloff = 0
       vim.cmd("keepjumps normal! Gzb")

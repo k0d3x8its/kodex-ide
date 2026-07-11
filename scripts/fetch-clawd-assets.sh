@@ -28,7 +28,7 @@
 # Idempotent: re-running skips GIFs and frame sets already present. Pass --force
 # to re-download and re-extract everything.
 #
-# Usage:  bash scripts/fetch-clawd-assets.sh [--force]
+# Usage:  bash scripts/fetch-clawd-assets.sh [--force|--rebuild]
 #         CLAWD_SKIN=calico bash scripts/fetch-clawd-assets.sh   # alt skin
 set -euo pipefail
 
@@ -49,6 +49,7 @@ skin="${CLAWD_SKIN:-clawd}"
 readonly STATES=(
   sleeping idle thinking typing idle-reading debugger sweeping
   error juggling notification happy react-annoyed headphones-groove
+  building
 )
 
 # Target frame count per state. The source GIFs are 45–48 frames; we keep an
@@ -58,7 +59,11 @@ readonly TARGET_FRAMES=16
 readonly FRAME_SIZE=120
 
 force=0
-if [[ "${1:-}" == "--force" ]]; then force=1; fi
+rebuild=0
+case "${1:-}" in
+  --force) force=1 ;;
+  --rebuild) rebuild=1 ;;
+esac
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 # Repo root = the parent of this script's dir (scripts/..), resolved absolutely
@@ -149,8 +154,8 @@ extract_frames() {
   local gif="$ASSET_DIR/$skin-$state.gif"
   local out="$SKIN_CACHE_DIR/$state"
 
-  # Idempotent: a populated frame dir is left alone unless --force.
-  if [[ -d "$out" && -n "$(ls -A "$out" 2>/dev/null)" && "$force" -eq 0 ]]; then
+  # Idempotent unless --force or --rebuild (local GIFs, no download).
+  if [[ -d "$out" && -n "$(ls -A "$out" 2>/dev/null)" && "$force" -eq 0 && "$rebuild" -eq 0 ]]; then
     echo "  · $state frames present (skip)"
     return
   fi
@@ -160,7 +165,11 @@ extract_frames() {
   # `.staging` dir — never a half-populated `$out` that the skip check above
   # would mistake for a complete set on the next run (contract 4).
   local staging="$out.staging"
-  rm -rf "$out" "$staging"
+  # Leave any existing $out IN PLACE during the (slow) build — a live renderer keeps
+  # reading the old frames until the new set is ready. Removing $out up front instead
+  # opened a multi-second window where the frames were gone and a running nvim's cached
+  # image objects hit "No such file" on every swap tick (see the back-to-back swap below).
+  rm -rf "$staging"
   mkdir -p "$staging"
 
   # Coalesce (flatten GIF disposal so every frame is a full image), scale
@@ -171,8 +180,40 @@ extract_frames() {
   tmp="$(mktemp -d)"
   # shellcheck disable=SC2064  # expand tmp now so the trap cleans this exact dir
   trap "rm -rf '$tmp' '$staging'" RETURN
-  convert "$gif" -coalesce -filter point -resize "${FRAME_SIZE}x${FRAME_SIZE}" \
+  # Crop OUT the transparent padding before scaling. The source sprites occupy a small
+  # patch (~102x66) of a 302x300 canvas; without cropping, image.nvim fits the WHOLE
+  # padded frame into the pet float, so the visible sprite is tiny and swims in empty
+  # space (which, over the chat bar, reads as the pet covering the bar, and makes the
+  # float size barely affect the apparent sprite size). Crop every frame to the UNION
+  # content bounding box across the whole animation — one shared window, so the sprite
+  # animates WITHIN it rather than each frame jittering/rescaling to its own bbox — THEN
+  # scale to the pet size so the sprite fills the frame.
+  local bbox
+  bbox="$(convert "$gif" -coalesce -background none -format '%@\n' info: 2>/dev/null | \
+    awk -F'[x+]' 'NR==1{minx=$3;miny=$4;maxx=$3+$1;maxy=$4+$2;next}
+      {if($3<minx)minx=$3; if($4<miny)miny=$4;
+       if($3+$1>maxx)maxx=$3+$1; if($4+$2>maxy)maxy=$4+$2}
+      END{if(NR>0) printf "%dx%d+%d+%d",maxx-minx,maxy-miny,minx,miny}')"
+  local -a crop_args=()
+
+  if [[ -n "$bbox" ]]; then crop_args=(-crop "$bbox" +repage); fi
+  convert "$gif" -coalesce -background none "${crop_args[@]}" \
+    -filter point -resize "${FRAME_SIZE}x${FRAME_SIZE}" \
+    -gravity southeast -extent "${FRAME_SIZE}x${FRAME_SIZE}" \
     "$tmp/src_%04d.png"
+
+  # Normalize each visible frame to the common bottom baseline. The 120x120 canvas
+  # stays fixed; only transparent bottom padding is rolled to the top.
+  local frame metrics trim_h trim_y page_h bottom_pad
+  for frame in "$tmp"/src_*.png; do
+    metrics="$(convert "$frame" -alpha extract -trim \
+      -format '%h %[fx:page.y] %[fx:page.height]' info:)"
+    read -r trim_h trim_y page_h <<< "$metrics"
+    bottom_pad=$(( page_h - trim_y - trim_h ))
+    if [[ "$bottom_pad" -gt 0 ]]; then
+      convert "$frame" -background none -roll "+0+$bottom_pad" "$frame"
+    fi
+  done
 
   local -a all_frames
   # Sorted glob → deterministic frame order.
@@ -197,9 +238,11 @@ extract_frames() {
     cp "${all_frames[$src_index]}" "$dest"
     kept=$(( kept + 1 ))
   done
-  # Atomic publish: the complete staging set becomes $out in one rename. The
-  # RETURN trap only removes $staging if it still exists (i.e. we failed before
-  # this line), so a successful mv is safe.
+  # Publish: drop the old set and rename the complete staging set into place
+  # BACK-TO-BACK, so the window where $out is absent (and a live renderer could see a
+  # missing frame) is milliseconds, not the whole convert. The RETURN trap only removes
+  # $staging if it still exists (i.e. we failed before this line), so this is safe.
+  rm -rf "$out"
   mv "$staging" "$out"
   echo "  → $state: $kept frames (from $total)"
 }

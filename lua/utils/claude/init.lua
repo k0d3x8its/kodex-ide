@@ -548,7 +548,8 @@ local function tick_typing_ph()
     -- which fires `typing` at its own seam (render.lua). Emitting typing here for
     -- those states was what stopped the reading sprite from ever showing.
     local w = pet.cond and pet.cond.work
-    local sticky = (w == "reading" or w == "cleaning" or w == "debugging")
+    local sticky = (w == "reading" or w == "cleaning" or w == "debugging"
+      or w == "building")
     if not state.think_start and not state.advisor_pending and not sticky then
       pet.emit("typing")
     end
@@ -611,12 +612,15 @@ local function attach_pet(win)
   vim.schedule(function()
     if not (win and vim.api.nvim_win_is_valid(win)) then return end
     if not pet_render_primed then
-      -- NO `gated` predicate: the pet must stay VISIBLE on top of permission/question
-      -- modals (user request). It used to hide while a decision surface was up (spec
-      -- Q2 avoided the kitty sprite bleeding over a card), but the desired behaviour
-      -- is the opposite — Clawd sits on top of the modal. The opaque carrier shares
-      -- the modal's bar_bg (ClaudeNormal) so the box blends in. (gated() still drives the turn
-      -- timer freeze / "Waiting…" spinner independently — that is untouched.)
+      -- NO `gated` predicate: Clawd stays visible on EVERY surface, including
+      -- while the slash "/" menu is open — the menu float rides zindex 300
+      -- (slash.lua), above the pet carrier/patch, so the compositor can't erase
+      -- its glyphs, and the kitty sprite composites above text at the terminal
+      -- layer → menu renders BEHIND Clawd (user-picked ideal, 2026-07-11; a
+      -- gate-hide was tried and rejected as "completely disappeared").
+      -- Permission/question modals stay below the carrier — Clawd sits on them.
+      -- (The decision-surface gated() still drives the turn timer freeze /
+      -- "Waiting…" spinner independently — that is untouched.)
       pet_render.setup({})
       pet_render_primed = true
     end
@@ -972,6 +976,8 @@ mod._slash = slash   -- test hook
 effort.wire({
   panel_float_geom    = panel_float_geom,
   harden_float_scroll = harden_float_scroll,
+  pet_attach_surface  = function(win) pcall(pet_render.attach_to_surface, win) end,
+  pet_attach_panel    = function() pcall(pet_render.attach_to_panel, state.panel_win) end,
 })
 mod._effort = effort   -- test hook
 
@@ -982,6 +988,8 @@ mod._effort = effort   -- test hook
 advisor.wire({
   panel_float_geom    = panel_float_geom,
   harden_float_scroll = harden_float_scroll,
+  pet_attach_surface  = function(win) pcall(pet_render.attach_to_surface, win) end,
+  pet_attach_panel    = function() pcall(pet_render.attach_to_panel, state.panel_win) end,
 })
 mod._advisor = advisor   -- test hook
 
@@ -2158,6 +2166,24 @@ local function open_panel_window(buf)
       if _saved_gc then
         vim.o.guicursor = _saved_gc
         _saved_gc = nil
+      end
+    end,
+  })
+  -- BACKSTOP: the hidden guicursor is a GLOBAL option, and the pairwise
+  -- save/restore above (plus the chat bar's scheduled re-hide) has leak paths —
+  -- e.g. a WinEnter that fired while already hidden leaves _saved_gc nil, so the
+  -- next WinLeave restores nothing and the EDITOR is left with the dark hidden
+  -- cursor (live-reported 2026-07-11). Whenever any window that is NOT the panel
+  -- gains focus while the hidden cursor is active, put the real cursor back.
+  -- (Our image floats are non-focusable and can't trigger this; the chat bar
+  -- restores the visible cursor itself on open, so this firing there is a no-op
+  -- by value.)
+  vim.api.nvim_create_autocmd("WinEnter", {
+    group = vim.api.nvim_create_augroup("ClaudeCursorBackstop", { clear = true }),
+    callback = function()
+      if vim.o.guicursor == "a:ver1-ClaudeCursorHidden"
+          and vim.api.nvim_get_current_buf() ~= state.panel_buf then
+        vim.o.guicursor = state.real_guicursor or "a:block,a:blinkon0"
       end
     end,
   })

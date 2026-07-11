@@ -646,7 +646,15 @@ function Slash.open(ibuf, query, bar_rows, on_accept)
       relative = "editor", anchor = "SW",
       row = row, col = col, width = width, height = 1,
       border = "rounded", style = "minimal", focusable = false,
-      zindex = 65,   -- above the chat bar, below permission/question cards (70+)
+      -- ABOVE the Clawd pet carrier (250) + its border patch (251): a winblend
+      -- float ERASES the glyphs of any float below it in the nvim compositor, so
+      -- with the menu underneath, the pet carrier bit a rectangle out of the menu
+      -- border/text (live 2026-07-11). With the menu on top its cells win the
+      -- grid; the kitty SPRITE still composites above all text (terminal layer),
+      -- so Clawd stands on the chat bar in front of the menu — the wanted look.
+      -- image.nvim window_overlap_clear is default-off, so the higher menu float
+      -- does not make it hide the sprite. Cards stay at 60/70: Clawd sits on them.
+      zindex = 300,
     })
     vim.wo[menu.win].winhighlight =
       "NormalFloat:ClaudeSlashBg,FloatBorder:ClaudeSlashBorder"

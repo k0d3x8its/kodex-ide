@@ -402,11 +402,20 @@ local function open_permission_float(p)
   -- Body lines (display / desc / command / patterns), a spacer, the button-row
   -- placeholder, and a dim nav-hint line that wraps inside the box.
   local lines, body_hl = {}, {}
-  lines[#lines + 1] = "  " .. p.display
-  body_hl[#body_hl + 1] = { #lines - 1, "ClaudeProse" }
+  -- EVERY body insert goes through push(): any CLI-supplied string (display,
+  -- description, rules — not just Write file content) can carry embedded "\n",
+  -- and nvim_buf_set_lines throws on a newline in any item, killing the whole
+  -- card (request invisible until a redraw retries it — live 2026-07-11 with a
+  -- multi-line tool description; the round-4 fix had only covered the command).
+  local function push(text, hl)
+    for _, sub in ipairs(vim.split(text, "\n", { plain = true })) do
+      lines[#lines + 1] = sub
+      if hl then body_hl[#body_hl + 1] = { #lines - 1, hl } end
+    end
+  end
+  push("  " .. p.display, "ClaudeProse")
   if p.desc ~= "" and p.desc ~= p.display then
-    lines[#lines + 1] = "  " .. p.desc
-    body_hl[#body_hl + 1] = { #lines - 1, "ClaudeProse" }
+    push("  " .. p.desc, "ClaudeProse")
   end
   -- Button row + nav hint go ABOVE the command, not below it. The float height is
   -- capped (see geometry) so a long command can't fill the screen; keeping the
@@ -423,17 +432,14 @@ local function open_permission_float(p)
   -- is the scrollable tail of the float.
   for _, cl in ipairs(perm_input_lines(p.input)) do
     -- A multi-line value (e.g. a Write's file content) arrives as ONE string with
-    -- embedded "\n". nvim_buf_set_lines rejects items containing newlines, so split
-    -- each into its own buffer line — otherwise the whole card throws and the request
-    -- goes unanswerable (visible-crash + silent-accept-on-<CR>).
+    -- embedded "\n" — push() splits it into buffer lines (see above). The gutter
+    -- prefixes every produced row so wrapped content keeps the code-block look.
     for _, sub in ipairs(vim.split(cl, "\n", { plain = true })) do
-      lines[#lines + 1] = "  ▎ " .. sub
-      body_hl[#body_hl + 1] = { #lines - 1, "ClaudeCode" }
+      push("  ▎ " .. sub, "ClaudeCode")
     end
   end
   if p.rules and #p.rules > 0 then
-    lines[#lines + 1] = "  Patterns: " .. table.concat(p.rules, ", ")
-    body_hl[#body_hl + 1] = { #lines - 1, "ClaudeDim" }
+    push("  Patterns: " .. table.concat(p.rules, ", "), "ClaudeDim")
   end
 
   -- Geometry: full panel-column width minus borders, anchored to the panel's real

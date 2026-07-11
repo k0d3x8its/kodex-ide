@@ -1969,6 +1969,10 @@ local function clamp_scroll()
     if gap > limit then target = limit
     elseif gap < floor then target = floor end
     if target then
+      -- A correction firing = the bounce is live = redraw storm. Hold the pet's
+      -- kitty writes so they can't interleave into the TUI flush (see
+      -- pet_render hold_writes for the escape-corruption mechanism).
+      pcall(pet_render.hold_writes)
       local so = vim.wo[win].scrolloff
       vim.wo[win].scrolloff = 0
       vim.cmd("keepjumps normal! Gzb")
@@ -1982,7 +1986,8 @@ local function clamp_scroll()
   clamping = false
 end
 
--- Test seam: drive the over-scroll clamp directly in the headless spec.
+-- Test seams: drive the over-scroll clamp + wheel handlers directly in the
+-- headless specs (claude_spec + claude_scroll_hold_spec).
 mod._clamp_scroll = clamp_scroll
 mod._SCROLL_TAIL  = SCROLL_TAIL
 
@@ -1999,6 +2004,7 @@ local function panel_wheel_down()
   local buf = state.panel_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   if vim.api.nvim_win_get_buf(win) ~= buf then return end
+  pcall(pet_render.hold_writes) -- wheel stream = redraw storm; hold pet kitty writes
   pcall(vim.api.nvim_win_call, win, function()
     local step  = WHEEL_STEP
     local gap   = free_below(win, buf)
@@ -2016,6 +2022,24 @@ local function panel_wheel_down()
     vim.wo[win].scrolloff = so
   end)
 end
+
+-- Mouse-wheel-up twin. Scrolling history stays unrestricted (no clamp math), but
+-- the wheel stream is the same redraw storm as wheel-down — the over-scroll
+-- corruption repro STARTS with a wheel-up past the limit — so it must arm the
+-- pet write hold too. Scrolls the panel by the same notch native scrolling would.
+local function panel_wheel_up()
+  local win = state.panel_win
+  if not (win and vim.api.nvim_win_is_valid(win)) then return end
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if vim.api.nvim_win_get_buf(win) ~= buf then return end
+  pcall(pet_render.hold_writes)
+  pcall(vim.api.nvim_win_call, win, function()
+    vim.cmd("keepjumps normal! " .. WHEEL_STEP .. "\025")  -- WHEEL_STEP × <C-y>
+  end)
+end
+mod._panel_wheel_down = panel_wheel_down
+mod._panel_wheel_up   = panel_wheel_up
 
 -- ─── Panel window placement ───────────────────────────────────────────────────
 
@@ -2133,6 +2157,11 @@ local function open_panel_window(buf)
   -- and bounce. Buffer-local so it only governs the panel; wheel-up stays native.
   if state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf) then
     vim.keymap.set("n", "<ScrollWheelDown>", panel_wheel_down,
+      { buffer = state.panel_buf, silent = true })
+    -- Wheel-up was native until the escape-corruption fix: the up-stream is the
+    -- same redraw storm, so it goes through panel_wheel_up to arm the pet write
+    -- hold. Scroll behavior is unchanged (same notch, no clamp on the way up).
+    vim.keymap.set("n", "<ScrollWheelUp>", panel_wheel_up,
       { buffer = state.panel_buf, silent = true })
   end
 

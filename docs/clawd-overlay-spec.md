@@ -1,217 +1,157 @@
 # Clawd Overlay Spec for Kodex IDE
 
+> **Revision 2 (2026-07-07).** Adapted to the post-Goal-15 `lua/utils/claude/`
+> package, licensing resolved (AGPL fetch-at-setup), rendering path proven in a
+> Ghostty spike, `wake` dropped, `thinking` added. Change log at the bottom.
+
 ## Purpose
 
-Add a Clawd-style animated pet overlay to the existing Claude Code integration in Kodex IDE.
-
-The overlay should render the original animation assets from the Clawd repo rather than an ASCII approximation.
-The goal is to make the pet feel like a first-class companion to the Claude panel:
+Add a Clawd-style animated pet overlay to the existing Claude Code integration in
+Kodex IDE. The overlay renders the original Clawd animation assets (not an ASCII
+approximation) and behaves as a first-class companion to the Claude panel:
 
 - sleep when Claude is inactive
-- wake when the Claude chat bar appears
+- wake (→ idle) when the Claude chat bar appears
 - reflect Claude's real work states while Claude is processing
-- show a progressive idle loop when Claude is done and nobody interacts
+- run a staged idle loop when Claude is done and nobody interacts
 
-This document is intentionally implementation-oriented so another LLM can review it and then turn it into code.
+This document is implementation-oriented: an implementer should be able to turn it
+into code without re-deriving the architecture.
 
 ## Non-Goals
 
 - Do not replace the existing Claude panel or chat bar.
 - Do not redraw the pet as ASCII art.
-- Do not couple the pet to arbitrary editor activity outside the Claude workflow unless explicitly noted.
-- Do not change the current Claude state machine unless the pet integration requires a narrow hook.
-- Do not assume SVG is the primary runtime animation format.
+- Do not couple the pet to arbitrary editor activity outside the Claude workflow.
+- Do not change the Claude state machine except via the narrow, additive event
+  hooks named below (the `.wire{}` injection pattern — see Event Sources).
+- Do not **vendor** the Clawd assets into the repo (see Licensing).
+- Do not tie the pet's "typing" animation to the *user* typing.
 
-## Current Repository Context
+## Licensing & Assets (resolved — READ FIRST)
 
-The existing Claude integration already has enough state to drive the pet:
+The upstream assets (`rullerzhou-afk/clawd-on-desk`, `assets/gif`) are **AGPL-3.0**.
+To keep kodex-ide's own license clean, the assets are **fetched at setup, never
+committed**:
 
-- [`lua/utils/claude.lua`](/home/k0d3x/dev/kodex-ide/lua/utils/claude.lua)
-- [`lua/plugins/claude.lua`](/home/k0d3x/dev/kodex-ide/lua/plugins/claude.lua)
-- [`lua/plugins/ui.lua`](/home/k0d3x/dev/kodex-ide/lua/plugins/ui.lua)
+- kodex-ide ships **only** `lua/utils/claude_pet.lua` (+ a fetch script). No art in
+  the repo.
+- `scripts/fetch-clawd-assets.sh` downloads the needed GIFs from the upstream repo
+  into `assets/clawd/` on the user's machine.
+- `assets/clawd/` is **git-ignored**. The extracted PNG frame cache (below) lives in
+  `stdpath("cache")/kodex_clawd/` — also never committed.
+- The pet module degrades gracefully (renders nothing, logs once) when assets are
+  absent, so a fresh clone without the fetch step still loads.
 
-The current Claude implementation already exposes:
+Asset facts (from the upstream `clawd-*` set): **302×300 px, 45–48 frames each**,
+~900 KB for the 13 states used here. There are three skins upstream (`clawd-*`,
+`calico-*`, `cloudling-*`); `clawd-*` is the default, the skin is a config option.
 
-- `state.claude_active`
-- `state.panel_win`
-- `state.job_id`
-- `state.working`
-- `state.diff_pending`
-- `state.system_ready`
-- `state.session_cost`
-- `state.model_display`
-- `dispatch(event)`
-- `open_chat_float(...)`
-- `prompt_input()`
-- `toggle()`
-- `open_panel_window(buf)`
-- `on_diff_open()`
-- `on_diff_close()`
-- `interrupt()`
+**Pixel-art scaling rule (spike finding):** these are pixel sprites. Scale with
+**nearest-neighbour** (`convert -filter point …`, or chafa without smoothing) and
+feed full-resolution sources. Smooth/bilinear scaling blurs the hard edges (this
+caused the only artifact seen in the spike).
 
-That means the pet can be driven from existing Claude lifecycle events rather than from global editor state.
+## Current Repository Context (updated for the package)
 
-## Assets
+The Claude integration was refactored (Goal 15) from the old monolith
+`lua/utils/claude.lua` into a package. **All references below are to the current
+tree:**
 
-The Clawd repo uses SVGs and GIFs.
+| Concern | Module |
+|---|---|
+| Public surface, state, chat bar, panel window, toggle | [`lua/utils/claude/init.lua`](/home/k0d3x/dev/kodex-ide/lua/utils/claude/init.lua) |
+| Shared state table (`state.*`) | [`lua/utils/claude/core.lua`](/home/k0d3x/dev/kodex-ide/lua/utils/claude/core.lua) |
+| Stream-json renderers + `dispatch(event)` | [`lua/utils/claude/render.lua`](/home/k0d3x/dev/kodex-ide/lua/utils/claude/render.lua) |
+| Permission/diff/prewrite cards + accept/reject | [`lua/utils/claude/gate.lua`](/home/k0d3x/dev/kodex-ide/lua/utils/claude/gate.lua) |
+| Subagent switcher/drill-in + `state.subagents` | [`lua/utils/claude/widgets.lua`](/home/k0d3x/dev/kodex-ide/lua/utils/claude/widgets.lua) |
+| Process spawn / stdin-stdout | [`lua/utils/claude/process.lua`](/home/k0d3x/dev/kodex-ide/lua/utils/claude/process.lua) |
+| Post-write vimdiff review hooks | [`lua/utils/claude_diff.lua`](/home/k0d3x/dev/kodex-ide/lua/utils/claude_diff.lua) |
+| Plugin spec / highlights / startup | [`lua/plugins/claude.lua`](/home/k0d3x/dev/kodex-ide/lua/plugins/claude.lua) |
 
-For this integration:
+State the pet reads (all present in `core.lua`): `claude_active`, `panel_win`,
+`job_id`, `working`, `diff_pending`, `system_ready`, `session_cost`,
+`model_display`, `subagents`, `activity_t0`, `stored_root`, `permission_mode`.
 
-- use GIFs as the runtime animation source
-- treat SVGs as source art or static fallback assets
-- do not design the implementation around SVG playback unless a renderer-specific proof succeeds
+## Rendering (spike-proven — decided)
 
-Reasoning:
+**Terminal:** Ghostty 1.2.3, which implements the **Kitty graphics protocol**.
 
-- GIFs are the most direct fit for animated runtime behavior.
-- SVG is better suited to source art, static art, or conversion pipelines.
-- The user explicitly wants the original look preserved, and GIFs are the closest match to that requirement in a terminal image overlay.
+**Mechanism (locked by the L1–L3 spikes, 2026-07-07):**
 
-## Rendering Assumption
+- **Placement layer = `image.nvim`** (kitty backend, `magick_cli` processor → uses
+  the `convert` CLI; the `magick` luarock is optional). It renders a **static** PNG
+  in a Neovim floating window and coordinates with nvim's redraw. **Proven:** the pet
+  renders in a bottom-right float over the transcript, and repositions cleanly on
+  move/resize with no ghosting (spike Q1, Q3).
+- **Animation = timer frame-swap of pre-extracted PNGs.** `image.nvim` does **not**
+  animate GIFs (its processor takes frame `[0]` only), and its `clear()` wipes the
+  transmit cache — so animation is driven by us: at fetch time expand each GIF to a
+  numbered PNG sequence (`convert -coalesce -filter point` — **nearest-neighbour**,
+  the pixel-art rule) into the cache dir; a `vim.loop` timer swaps frames.
+- **Anti-flicker rule (load-bearing):** on each tick **render the next frame first,
+  then clear the previous** — a frame is always on screen, so there is no blank gap.
+  This made steady-state animation smooth in the spike. ~10 fps and ~16 frames/state
+  is ample for an idle desk-pet and halves retransmit cost.
+- **Known residual:** a brief **startup flicker** while the first loop cold-processes
+  each PNG through `convert`. Fixes (in priority): warm all of the active state's
+  frames off-screen before showing the pet; or hold a static first frame ~1 s; or
+  (endgame) drop to **raw kitty protocol** — transmit each frame once with a
+  persistent id and swap *placements* (zero retransmit, zero startup cost). Not a
+  blocker; polish.
 
-Use a terminal image rendering bridge inside Neovim.
+**Z-ORDER — critical constraint (spike Q2):** kitty-graphics images composite
+**ABOVE** nvim text floats regardless of `zindex`. The pet **bled through on top of a
+mock permission card**. Therefore the pet **must explicitly hide** (clear its image)
+whenever a decision surface is up — drive this off the existing `gated()` predicate
+(`state.perm | prewrite | qask | diff_card | diff_pending`, `init.lua`): `gated()`
+true → `pet:hide()`, false → restore. Do **not** rely on window stacking.
 
-The working assumption is:
+Frame cache cost (measured): ~16 PNGs/state (downsampled from 45–48) at ~120 px,
+~1.3 KB/frame → well under 1 MB total for all 13 states.
 
-- Ghostty terminal
-- Neovim image overlay support via a renderer such as `image.nvim`
-- floating window placement for the pet
+**The renderer must:** place at a float's screen cell, animate via the render-before-
+clear frame swap, hide on `gated()`, reposition on resize, and tear down without
+leaving artifacts (kitty delete). It must **never** degrade to ASCII.
 
-The renderer must support:
+**Runtime deps:** ImageMagick (`convert`) + `image.nvim`. `chafa` proved the protocol
+in the L1/L2 spike but is **not** used at runtime. **Zero token cost** — all
+client-side.
 
-- floating windows
-- animated image display or frame swapping
-- repositioning on resize
-- clean teardown without leaving artifacts
+## State Model
 
-If a renderer cannot animate GIFs directly, the fallback is to advance frames manually from the GIF source or pre-extract frames into image assets. The implementation should not degrade to ASCII unless there is no viable image path.
+`wake` is **removed** — it was mapped to the idle GIF, so it is just `idle` with a
+freshly-reset idle timer. `thinking` is **added** (the panel already tracks a
+distinct thinking phase via `--include-partial-messages`).
 
-## Core Behavior
+### States → assets (`clawd-*` skin)
 
-The pet is a state-driven overlay, not a decorative widget.
+| State | Asset (`clawd-…gif`) | Meaning |
+|---|---|---|
+| `sleep` | `sleeping` | no active work or recent interaction |
+| `idle` | `idle` | at rest / just woke (chat bar opened) |
+| `thinking` | `thinking` | Claude reasoning (thinking block active) |
+| `typing` | `typing` | Claude generating output text |
+| `reading` | `idle-reading` | Read / NotebookRead tool |
+| `debugging` | `debugger` | tests / logs / traces / failure analysis |
+| `cleaning` | `sweeping` | delete / rename / move / prune |
+| `error` | `error` | assistant reports failure, or turn ended failed |
+| `subagent` | `juggling` | a subagent task is running |
+| `diff_wait` | `notification` | a diff/prewrite review is pending |
+| `diff_approved` | `happy` | diff accepted |
+| `happy` | `happy` | turn completed successfully |
+| `diff_rejected` | `react-annoyed` | diff rejected |
+| `headphones_groove` | `headphones-groove` | idle-progression 60–120 s |
 
-It should represent:
-
-- Claude being inactive
-- Claude waking up
-- Claude typing
-- Claude reading files
-- Claude debugging
-- Claude cleaning files or directories
-- Claude handling errors
-- Claude waiting on diff approval
-- Claude being approved
-- Claude being rejected
-- Claude subagent activity
-- Claude idle time
-
-## Key Behavioral Correction
-
-This is the most important revision to the earlier concept:
-
-- the pet must **not** use user typing in the chat bar as the typing animation trigger
-- the pet typing animation should represent **Claude typing / Claude working**
-- once the user presses Enter and the chat bar disappears, the pet should **not** immediately sleep if Claude is still answering
-- the pet should transition to sleep only **after Claude is done typing and has produced an answer**
-
-So the correct high-level sequence is:
-
-1. user opens chat bar
-2. pet wakes
-3. user types in chat bar, but the pet does **not** switch to typing just because the user is typing
-4. user presses Enter and the chat bar closes
-5. Claude starts responding
-6. pet shows Claude typing / work-state animations
-7. Claude finishes and provides an answer
-8. pet transitions to idle
-9. idle timer progression begins
-10. eventually pet sleeps
-
-## Idle Progression Requirement
-
-After Claude finishes answering and the system returns to idle, the pet must follow this progression:
-
-- `0s` to `60s`: idle
-- `60s` to `120s`: headphones groove
-- `120s` to `180s`: idle again
-- `180s+`: sleep
-
-The sleep state remains active until a new user action surfaces.
-
-This means the idle loop is not one static timeout. It is a staged progression.
-
-## Definition of User Action
-
-The phrase “until a new action by the user is surfaced” should be interpreted as one or more of:
-
-- opening the Claude chat bar
-- focusing the Claude panel
-- starting a new Claude prompt
-- sending a new Claude prompt
-- triggering a Claude-specific keymap
-- interacting with a diff approval flow
-
-The implementation should reset the idle progression on these events.
-
-## Animation Mapping
-
-The overlay should choose a state based on the strongest current condition.
-
-Use the Clawd GIF assets directly for these states:
-
-- `sleep` -> sleeping GIF
-- `wake` -> Clawd idle GIF
-- `idle` -> Clawd idle GIF
-- `typing` -> typing GIF
-- `reading` -> reading GIF
-- `debugging` -> debugging GIF
-- `cleaning` -> cleaning GIF
-- `error` -> error GIF
-- `diff_wait` -> notifications GIF
-- `diff_approved` -> Clawd happy GIF
-- `diff_rejected` -> Clawd react annoyed GIF
-- `subagent` -> subagent / juggling GIF
-- `headphones_groove` -> Clawd headphones groove GIF
-- `happy` -> Clawd happy GIF
-
-### Primary States
-
-- `sleep`
-- `wake`
-- `idle`
-- `typing`
-- `reading`
-- `debugging`
-- `cleaning`
-- `error`
-- `diff_wait`
-- `diff_approved`
-- `diff_rejected`
-- `subagent`
-- `headphones_groove`
-- `happy`
-
-### Suggested Visual Meaning
-
-- `sleep`: sleeping GIF, used when there is no active Claude work or recent interaction
-- `wake`: Clawd idle GIF, used when the chat bar just opened or Claude has just become active
-- `typing`: typing GIF, used when Claude is actively generating output
-- `reading`: reading GIF, used when Claude is inspecting files
-- `debugging`: debugging GIF, used when Claude is investigating failures, tests, traces, or logs
-- `cleaning`: cleaning GIF, used when Claude is removing or reorganizing files and directories
-- `error`: error GIF, used when Claude hit an error or failed task
-- `diff_wait`: notifications GIF, used while diff approval is pending
-- `diff_approved`: Clawd happy GIF, used when the user accepts the diff
-- `diff_rejected`: Clawd react annoyed GIF, used when the user rejects the diff
-- `subagent`: subagent / juggling GIF, used while subagents are actively running
-- `headphones_groove`: Clawd headphones groove GIF, used during the long-idle groove state after 60 seconds
-- `happy`: Clawd happy GIF, used when Claude completed successfully and the turn is done
+The machine keeps three conceptual lifecycles (collapsible into one enum):
+**UI** (sleep / chat-open / chat-closed), **Claude work** (idle / thinking / typing
+/ reading / debugging / cleaning / subagent / error / diff_* / happy), and **idle
+progression** (idle → groove → idle → sleep).
 
 ## Priority Model
 
-Because multiple states can overlap, the overlay should use a priority resolver.
-
-Recommended priority from highest to lowest:
+Multiple conditions can be true at once; a resolver picks the highest-priority
+active state:
 
 1. `error`
 2. `diff_wait`
@@ -220,353 +160,218 @@ Recommended priority from highest to lowest:
 5. `debugging`
 6. `cleaning`
 7. `reading`
-8. `subagent`
-9. `typing`
-10. `happy`
-11. `headphones_groove`
-12. `idle`
-13. `sleep`
+8. `subagent`  *(consider promoting above reading/cleaning when a subagent is the dominant activity — the Goal-17 drill-in makes subagents prominent)*
+9. `thinking`
+10. `typing`
+11. `happy`
+12. `headphones_groove`
+13. `idle`
+14. `sleep`
 
-Rationale:
+Rationale unchanged from rev 1: errors and diff-review states must never be hidden;
+specific tool activity beats generic generation; groove only appears via the idle
+progression; sleep is the floor.
 
-- error should never be visually hidden
-- diff review states should be obvious and stable
-- debugging should override generic activity
-- reading and cleaning are more specific than generic typing
-- subagent activity should be visible when it is the dominant behavior
-- headphones groove should only appear as part of the idle progression
-- sleep is the base state when nothing is happening
+## Idle Progression
 
-## Event Sources In The Existing Claude Code Path
+Begins **only after Claude finishes answering** and the UI returns to idle:
 
-The pet should be driven from Claude-specific events, not from generic editor state.
+- `t = 0s` → `idle`
+- `t = 60s` → `headphones_groove`
+- `t = 120s` → `idle`
+- `t = 180s` → `sleep`
 
-### 1. Chat Bar Lifecycle
+Implemented with `vim.loop` timers, **cancelled and restarted on any user
+interaction** (see Definition of User Action). Sleep persists until the next user
+action.
 
-The chat float is created in `open_chat_float()` in [`lua/utils/claude.lua`](/home/k0d3x/dev/kodex-ide/lua/utils/claude.lua).
+### Definition of User Action (resets the progression)
 
-This is where the pet should:
+- opening the Claude chat bar
+- focusing the Claude panel
+- starting / sending a Claude prompt
+- a Claude-specific keymap
+- interacting with a diff-review flow
 
-- wake when the bar opens
-- reposition to the top-right of the bar
-- remain awake while the bar is visible
-- stop counting toward sleep while user interaction is active
+## Critical Timing Semantics (unchanged — the key correction)
 
-The submit callback in that function is where the pet should transition away from the bar lifecycle and back to Claude work / idle lifecycle.
+1. user presses Enter → chat bar closes
+2. Claude keeps responding
+3. pet **stays in Claude work states** until Claude is actually done
+4. only after Claude produces its answer → `idle`
+5. only then does the 60/120/180 progression start
 
-### 2. Claude Turn Lifecycle
+The pet must **not** sleep the moment the user sends a prompt. `typing` represents
+**Claude** generating, never the user typing in the chat bar.
 
-The stream-json dispatcher in [`lua/utils/claude.lua`](/home/k0d3x/dev/kodex-ide/lua/utils/claude.lua) already sees:
+## Event Sources (mapped to the current modules)
 
-- `system.init`
-- `assistant`
-- `result`
+The pet is driven by a single injected callback, `pet.on(...)`, wired into existing
+seams via the codebase's `.wire{}` dependency-injection pattern (the same way
+`render.wire{}`, `gate.wire{}`, `question.wire{}`, `process.wire{}` already work).
+No module hard-couples to the pet; a nil `pet` is a no-op.
 
-This is the correct place to drive Claude-specific working animations.
+### 1. Chat-bar lifecycle — `init.lua`
 
-Suggested mapping:
+`open_chat_float()` and its submit callback:
+- bar opens → `pet.on("chat_open")` → wake to `idle`, reset idle progression, keep
+  awake while the bar is visible
+- submit → `pet.on("chat_submit")` → hand off to the Claude-work lifecycle (do
+  **not** sleep)
 
-- `assistant` with `thinking` or active generation -> `typing`
-- `assistant` with `tool_use` reading files -> `reading`
-- `assistant` with `tool_use` cleaning files/directories -> `cleaning`
-- `assistant` with `tool_use` debugging / tests / logs -> `debugging`
-- `assistant` with `tool_use` subagent work -> `subagent`
-- `result` success -> `happy`
-- `result` failure or error text -> `error`
+### 2. Claude turn lifecycle — `render.lua` `dispatch(event)`
 
-### 3. Diff Lifecycle
+The dispatcher already parses stream-json (`system.init`, partial `thinking`
+deltas, `assistant`, tool_use, `result`). Emit:
+- thinking block active → `thinking`
+- assistant generating text → `typing`
+- `tool_use` → classify (below) → `reading` / `cleaning` / `debugging` / `subagent`
+- `result` success → `happy` (then idle progression)
+- `result` failure / error → `error`
 
-The existing diff hooks are:
+**Tool classification is partly free:** `render.lua` already maps tool verbs
+(`Read`→Reading, `Bash`→Running, `Grep`/`WebSearch`→Searching) with highlight
+groups. Reuse that. `cleaning` and `debugging` are **not** distinguished today and
+need content heuristics on the command/tool input (see Heuristics).
 
-- `on_diff_open()`
-- `on_diff_close()`
+### 3. Diff lifecycle — `gate.lua` + `claude_diff.lua`
 
-These should drive:
+**Accept/reject signals already exist** (this was open question Q4 in rev 1 — now
+resolved, no new plumbing):
+- `on_diff_open()` / `state.diff_pending` → `diff_wait`
+- `gate.resolve_diff_card("accept")` and `gate.on_prewrite_resolve(true)` → `diff_approved`
+- `gate.resolve_diff_card("reject")` and `gate.on_prewrite_resolve(false)` → `diff_rejected`
 
-- `diff_wait` while the review is pending
-- `diff_approved` on acceptance
-- `diff_rejected` on rejection
+### 4. Subagents — `widgets.lua` + `state.subagents`
 
-If the current code does not distinguish accept vs reject at close time, the pet integration will need that signal added to the diff path so it can choose the correct animation.
+Subagent lifecycle is already tracked (Goal 17). Emit `subagent` while
+`state.subagents` has active entries.
 
-### 4. Idle Timers
+### 5. Idle timers — `claude_pet.lua`
 
-The idle progression should begin only after Claude is done answering and the UI has returned to an idle state.
+Owned by the pet module; started on the transition into idle, reset on user action.
 
-Recommended timer sequence:
+## Heuristics for State Classification
 
-- at `t = 0s`, set `idle`
-- at `t = 60s`, set `headphones_groove`
-- at `t = 120s`, set `idle`
-- at `t = 180s`, set `sleep`
+Reuse `render.lua`'s existing verb map for `reading`/generic; add content checks for
+the two states the stream doesn't label:
 
-These timers should be canceled and restarted whenever the user interacts with Claude again.
+- **cleaning** — tool input matches remove/rename/move/prune/`rm`/`rmdir`/`mv`, or a
+  Bash command whose head is a destructive filesystem op.
+- **debugging** — tool activity around tests/logs/traces (test runners, `grep` of
+  logs, stack-trace inspection, repeated edits to the same file after a failure).
+- **error** — assistant explicitly reports failure, tool output is a hard failure, a
+  tool crashes, or the turn ends failed.
+- **subagent** — `state.subagents` active / explicit subagent events.
+- **typing** — Claude's own generation only. Never user chat-bar typing.
 
-## Critical Timing Semantics
+Heuristics are best-effort; when ambiguous, fall to the generic tool state
+(`reading`) rather than guessing `cleaning`/`debugging`.
 
-The following timing interpretation is the one the implementation should preserve:
+## Placement & Z-Order (resolved by the L3 spike)
 
-- user presses Enter
-- chat bar disappears
-- Claude continues responding
-- pet stays in Claude work states until Claude is actually done
-- only after Claude produces its answer should the pet return to `idle`
-- only then should the 60/120/180-second idle progression start
+Two anchor positions:
+- **Claude idle / working, no chat bar:** bottom-right of the Claude column
+  (`state.panel_win`).
+- **Chat bar open:** top-right of the chat bar float; track its position/width/resize.
 
-This avoids the incorrect behavior where the pet sleeps immediately when the user sends the prompt.
+**Reposition is clean** — moving the pet float and resizing the terminal leave no
+ghost (spike Q3). Repaint the current frame after a `nvim_win_set_config`.
 
-## Suggested State Machine
+**Cards: hide, don't stack.** `zindex` does **not** help — kitty graphics draw ABOVE
+text floats, so a lower `zindex` still bleeds the pet on top of a card (spike Q2). The
+rule is therefore behavioural, not geometric: **hide the pet while any decision
+surface is up.** Drive it off `gated()` (`init.lua`): on every relevant event and on
+card open/close, if `gated()` → `pet:hide()`, else restore to the correct anchor.
+This also covers the chat bar overlap for free (a card dismisses the bar anyway).
 
-The pet should have a simple internal model:
-
-### UI States
-
-- `sleep`
-- `wake`
-- `chat_open`
-- `chat_closed`
-
-### Claude Work States
-
-- `idle`
-- `typing`
-- `reading`
-- `debugging`
-- `cleaning`
-- `error`
-- `subagent`
-- `diff_wait`
-- `diff_approved`
-- `diff_rejected`
-- `happy`
-
-### Idle Progress States
-
-- `idle_0`
-- `idle_60`
-- `idle_120`
-- `sleep`
-
-The implementation can collapse these into a single enum, but the state machine should preserve the conceptual separation:
-
-- UI lifecycle
-- Claude work lifecycle
-- idle progression lifecycle
-
-## Placement Rules
-
-The pet should appear in two main places:
-
-### When Claude Is Idle
-
-- the bottom-right of the Claude column if the panel exists
-
-### When Chat Bar Is Open
-
-- top-right of the chat bar
-
-The pet should track the float position, width, and resize behavior of the chat bar.
-
-If the chat bar is not present:
-
-- keep the pet in the bottom-right idle position
-
-## Integration Strategy
-
-Create a dedicated overlay module, for example:
-
-- [`lua/utils/claude_pet.lua`](/home/k0d3x/dev/kodex-ide/lua/utils/claude_pet.lua)
-
-Responsibilities:
-
-- load animation assets
-- define animation names and frame sources
-- create the overlay window
-- position the overlay relative to Claude UI
-- switch animation state
-- manage idle timers
-- hide / show on lifecycle changes
-- clean up resources on close or reset
-
-Do not embed this logic directly into the panel renderer unless the final implementation is tiny. The overlay should stay independently testable.
-
-## Suggested Module API
-
-The reviewer / implementer can use an API like this:
+## Module API
 
 ```lua
-pet.setup(opts)
-pet.show()
-pet.hide()
-pet.attach_to_panel(win_id)
-pet.attach_to_chat(win_id)
-pet.set_state("sleep")
-pet.set_state("wake")
-pet.set_state("idle")
-pet.set_state("typing")
-pet.set_state("reading")
-pet.set_state("debugging")
-pet.set_state("cleaning")
-pet.set_state("error")
-pet.set_state("subagent")
-pet.set_state("diff_wait")
-pet.set_state("diff_approved")
-pet.set_state("diff_rejected")
-pet.set_state("happy")
-pet.set_state("headphones_groove")
+pet.setup(opts)              -- assets dir, skin, size, fps, enable flag
+pet.show() / pet.hide()
+pet.attach_to_panel(win_id)  -- bottom-right idle anchor
+pet.attach_to_chat(win_id)   -- top-right of the chat bar
+pet.set_state(name)          -- direct (mostly for tests)
+pet.on(event, data)          -- the wired entry point (classifies + resolves)
 pet.begin_idle_progression()
 pet.cancel_idle_progression()
 pet.reset_idle_progression()
-pet.handle_user_interaction()
-pet.handle_claude_event(event)
+pet.teardown()               -- kitty delete + timers + windows
 ```
 
-## Heuristics For State Classification
+## Testability (new — separate the pure core from the renderer)
 
-Not every Claude event will map perfectly to a single asset. The implementation should classify tool output heuristically.
+Split the module so the logic is headless-testable (this repo has strong
+`tests/*_spec.lua` coverage; the pet must fit it):
 
-### Reading
-
-Use `reading` when Claude is clearly inspecting files:
-
-- file read tools
-- file open tools
-- content inspection
-- path-targeted reads
-
-### Cleaning
-
-Use `cleaning` when Claude is reorganizing or removing things:
-
-- delete
-- rename
-- move
-- cleanup
-- prune
-- remove directory / file
-
-### Debugging
-
-Use `debugging` when Claude is investigating broken behavior:
-
-- tests
-- logs
-- traces
-- stack traces
-- reproduction steps
-- fix attempts
-- failure analysis
-
-### Error
-
-Use `error` when:
-
-- the assistant explicitly reports failure
-- the tool output indicates a hard failure
-- a tool call crashes or returns an error condition
-- the turn ends in a failed state
-
-### Subagents
-
-Use `subagent` / juggling when:
-
-- a subagent is running
-- the system emits explicit subagent activity
-- the task is delegated to another agent process
-
-### Typing
-
-Use `typing` only for Claude's own generation activity.
-
-Important:
-
-- do not map user typing in the chat bar to `typing`
-- user typing should be a UI event, not a Claude work event
-
-## Chat Bar Behavior
-
-The chat bar disappearing on Enter should not cause the pet to sleep immediately.
-
-Correct sequence:
-
-1. user opens chat bar
-2. pet wakes
-3. user types
-4. user presses Enter
-5. chat bar disappears
-6. Claude starts responding
-7. pet stays in Claude work animation states
-8. Claude finishes and produces an answer
-9. pet returns to idle
-10. idle progression begins
-11. pet eventually sleeps after 180 seconds without interaction
-
-This is the behavior the implementation must preserve.
-
-## Suggested File Responsibilities
-
-### `lua/utils/claude.lua`
-
-Keep the Claude state machine here and emit pet-relevant events from:
-
-- chat open
-- chat close
-- send
-- assistant events
-- result events
-- diff open / close
-- interrupt
-- reset
-
-### `lua/plugins/claude.lua`
-
-Initialize the pet overlay module here if the plugin spec owns Claude startup.
-
-### `lua/plugins/ui.lua`
-
-Keep this limited to statusline / UI theme work. Do not put the pet renderer here unless there is a strong reason.
-
-### `lua/utils/claude_pet.lua`
-
-Own the pet overlay implementation here.
+- **Pure state machine** — priority resolver + idle-progression timers + event
+  classification. No windows, no images. Unit-tested headless: feed events, assert
+  the resolved state and timer transitions. Fake the clock (inject `now()`).
+- **Renderer** — the only image/window code, hidden behind a small interface
+  (`render_state(name, geom)` / `clear()`), stubbed in tests. The spec's rendering
+  risk lives entirely here and is validated by the L3 spike, not unit tests.
 
 ## Recommended Implementation Order
 
-1. Prove that a GIF can render in a floating window in Ghostty.
-2. Add a pet module with a simple show/hide and state switch API.
-3. Hook chat open and chat close into wake / idle transitions.
-4. Hook Claude turn lifecycle events into `typing`, `reading`, `debugging`, `cleaning`, `error`, `subagent`, and `happy`.
-5. Add diff approval / rejection states.
-6. Implement the 60 / 120 / 180-second idle progression.
-7. Add repositioning and resize handling.
-8. Add cleanup logic for reset / close / teardown.
+1. ~~L3 spike~~ **DONE** (2026-07-07): renders + animates + repositions in a float;
+   z-order needs hide-on-`gated()` (see Rendering/Placement).
+2. `scripts/fetch-clawd-assets.sh` + git-ignore `assets/clawd/`; frame pre-extraction
+   into the cache dir (`convert -coalesce -filter point`, ~16 frames/state).
+3. `claude_pet.lua`: **pure state machine** (priority resolver + idle progression +
+   classification) behind a **stub renderer** + `pet.on`. Headless spec. ← next
+4. Wire chat open/close (`init.lua`) → idle/hide.
+5. Wire turn lifecycle (`render.lua dispatch`) → thinking/typing/reading/cleaning/
+   debugging/subagent/happy/error.
+6. Wire diff accept/reject (`gate.lua`) → diff_* states; hide on `gated()`.
+7. Real `image.nvim` renderer behind the interface: render-before-clear frame swap,
+   placement + resize repaint, hide-on-gated.
+8. Idle progression timers (60/120/180) + teardown (kitty delete, timers, windows).
 
-## Review Questions For Another LLM
+## Open Questions (updated)
 
-Before implementation, the reviewer should verify:
+Resolved: **Q4** (accept/reject signals exist), **rendering feasibility** (L1–L3
+spikes), **z-order** (hide-on-`gated()`), **animation driver** (image.nvim + timer
+frame-swap, render-before-clear), **licensing** (fetch-at-setup).
 
-1. Can the chosen renderer display animated GIFs correctly in Ghostty?
-2. Should the pet overlay be a single persistent window or recreated per state change?
-3. Is the current Claude event stream enough to classify reading, cleaning, debugging, and subagent activity?
-4. Do diff acceptance and rejection need distinct event signals added to the Claude diff flow?
-5. Should the idle progression be reset by panel focus, or only by explicit Claude actions?
-6. Does the pet need to remain visible while Claude is working but the chat bar is closed?
+Still open:
+1. **Startup flicker** polish: off-screen warm-up vs static-first-frame vs raw-kitty
+   persistent-transmit. (Bounded; not a blocker.)
+2. Should panel *focus* reset the idle progression, or only explicit Claude actions?
+3. Exact idle-anchor when the panel is narrow (pet size vs column width).
 
 ## Final Design Summary
 
-The preferred design is:
+- Kitty-graphics rendering in Ghostty (**spike-proven**), pixel-art nearest-neighbour
+  scaling.
+- Assets **fetched at setup** from the AGPL upstream, never vendored; repo stays
+  license-clean.
+- Separate `claude_pet` module: **pure state machine + stubbed renderer**, wired into
+  existing seams via `.wire{}`.
+- Claude state machine (`core.lua` state + `render.lua` dispatch) is the source of
+  truth; `typing` = Claude output, never user input.
+- `wake` dropped (== idle); `thinking` added.
+- Diff accept/reject use the **already-existing** `gate.lua` signals.
+- Pet **hides on `gated()`** (kitty images draw above text floats — can't stack under
+  cards); reposition is clean.
+- Renderer: `image.nvim` static placement + **render-before-clear** timer frame-swap.
+- Staged idle: idle → groove (60 s) → idle (120 s) → sleep (180 s), reset on user
+  action.
 
-- runtime GIFs
-- image overlay in Neovim
-- Ghostty as the terminal environment
-- separate pet overlay module
-- Claude state machine as the source of truth
-- typing tied to Claude's output, not user input
-- sleep only after Claude finishes answering and the idle progression completes
-- staged idle behavior:
-  - idle for 60 seconds
-  - headphones groove for the next 60 seconds
-  - idle again for the next 60 seconds
-  - sleep after 180 seconds total
+## Change Log
 
-That preserves the visual intent of the Clawd assets while fitting the architecture already present in Kodex IDE.
+- **Rev 3 (2026-07-08):** L3 spike complete — locked renderer to `image.nvim` +
+  timer frame-swap (image.nvim doesn't animate GIFs; its `clear()` wipes the transmit
+  cache); **render-before-clear** anti-flicker rule (steady-state smooth; startup
+  cold-processing flicker is bounded polish); **z-order resolved** — kitty graphics
+  composite above text floats, so the pet must **hide on `gated()`** rather than stack
+  (spike Q2); reposition clean (Q3). Runtime dep = `image.nvim` + ImageMagick; `chafa`
+  used only to prove the protocol.
+
+- **Rev 2 (2026-07-07):** adapted every file reference to the `lua/utils/claude/`
+  package; resolved licensing (AGPL → fetch-at-setup, no vendoring); recorded the
+  Ghostty render spike (L1/L2 pass) + pixel-art scaling rule; dropped `wake`; added
+  `thinking`; noted accept/reject signals already exist; added the state-machine ↔
+  renderer split for testability; expanded placement into explicit card z-order
+  coexistence; reordered implementation to spike L3 (card coexistence) first.
+- **Rev 1:** original concept (pre-refactor, monolithic `claude.lua` references).

@@ -97,9 +97,16 @@ local function classify(name, input)
     -- Non-destructive, non-test shell command: generic activity.
     return "reading"
   end
-  -- Edit/Write/MultiEdit and unknown tools: no dedicated state. Returning nil
-  -- lets the machine keep whatever it was showing (typically `typing`) rather
-  -- than flip to a misleading sprite.
+  if name == "Edit" or name == "Write"
+      or name == "MultiEdit" or name == "NotebookEdit" then
+    -- Clawd constructs code while the file is actually being written — the same
+    -- sprite the Edit/Write permission card and the pending diff review use, so
+    -- the whole edit lifecycle (perm → write → diff wait) reads as one activity.
+    return "building"
+  end
+  -- Unknown tools: no dedicated state. Returning nil lets the machine keep
+  -- whatever it was showing (typically `typing`) rather than flip to a
+  -- misleading sprite.
   return nil
 end
 M.classify = classify  -- exposed for the spec
@@ -143,7 +150,11 @@ end
 -- priority list's semantics; PRIORITY just fixes the scan order.
 local function active(name, c)
   if name == "error"          then return c.flash == "error" end
-  if name == "building"       then return c.permission == "build" end
+  -- building fires for BOTH the Edit/Write permission card AND the write itself
+  -- (classify maps Edit/Write/MultiEdit/NotebookEdit to work="building"): the
+  -- sprite is the same, so the higher (permission) slot covers both without a
+  -- second PRIORITY entry.
+  if name == "building"       then return c.permission == "build" or c.work == "building" end
   if name == "notification"   then return c.permission == "notify" end
   if name == "diff_wait"      then return c.diff == "wait" end
   if name == "diff_rejected"  then return c.flash == "diff_rejected" end

@@ -36,6 +36,9 @@ local stop_spinner
 local clear_hint
 local prompt_input
 local set_waiting_hint
+local pet_emit
+local pet_attach_surface
+local pet_attach_panel
 
 --- Inject init's float/pad/spinner/permission helpers. Called once from init after
 --- they are defined.
@@ -51,6 +54,9 @@ function Question.wire(hooks)
   clear_hint                = hooks.clear_hint
   prompt_input              = hooks.prompt_input
   set_waiting_hint          = hooks.set_waiting_hint
+  pet_emit                  = hooks.pet_emit   -- Clawd: question modal → notification
+  pet_attach_surface        = hooks.pet_attach_surface
+  pet_attach_panel          = hooks.pet_attach_panel
 end
 
 -- ─── Question card (AskUserQuestion) ──────────────────────────────────────────
@@ -230,10 +236,13 @@ local function close_question_card(receipt, receipt_hl)
   local q = state.qask
   if not q then return end
   state.qask = nil                                   -- before close → WinClosed no-ops
+  -- Clawd: question modal gone → clear the notification sprite (work/idle resurfaces).
+  if pet_emit then pet_emit("permission", { active = false }) end
   if q.resize_close then pcall(q.resize_close) end   -- drop the resize-track augroup
   if q.win and vim.api.nvim_win_is_valid(q.win) then
     pcall(vim.api.nvim_win_close, q.win, true)
   end
+  if pet_attach_panel then pet_attach_panel() end
   -- Drop the footprint pad the card reserved. If a dismissed chat bar is about to
   -- reopen (qask_reopen_bar) it re-sets its own pad on open, so this clear is safe.
   clear_bottom_pad()
@@ -513,6 +522,7 @@ local function open_question_float(q)
     zindex    = 60,
   })
   q.win = win
+  if pet_attach_surface then pet_attach_surface(win) end
   vim.wo[win].winhighlight =
     "FloatBorder:ClaudeBarBorder,FloatTitle:ClaudeBarBorder,NormalFloat:ClaudeBarBg"
   vim.wo[win].wrap        = true
@@ -584,6 +594,8 @@ local function show_question_card(event)
   end
 
   state.qask = q
+  -- Clawd: a question modal is up → notification sprite (not build; that's Edit/Write).
+  if pet_emit then pet_emit("permission", { active = true, build = false }) end
   open_question_float(q)
   render_question_card()
   -- Spinner is stopped for the question card, so paint the frozen "Waiting…" hint

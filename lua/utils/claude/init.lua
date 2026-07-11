@@ -41,6 +41,7 @@ local slash = require(require_prefix .. "slash")
 local effort = require(require_prefix .. "effort")
 local advisor = require(require_prefix .. "advisor")
 local pet = require(require_prefix .. "pet")
+local pet_render = require(require_prefix .. "pet_render")
 
 -- Full path required — ~/.local/bin is only on PATH in interactive bash, never
 -- in Neovim's environment. Matches the OPENCODE_BIN pattern in opencode.lua
@@ -535,6 +536,22 @@ end
 local function tick_typing_ph()
   if in_typing_phase() then
     if state.typing_ph then update_typing_ph() else add_typing_ph() end
+    -- Clawd: mirror the transcript's activity WORD onto the pet. When the word reads
+    -- "Typing" (the compute band that is NOT thinking/consulting — incl. the INITIAL
+    -- pre-thinking TTFT band, which the stream text-block-start seam can't catch since
+    -- no text block has started yet), keep the pet typing. Thinking is emitted at its
+    -- own block-start seam (render.lua). pet.refresh dedupes, so re-emitting each
+    -- 110ms tick is a no-op once the pet already reflects the phase.
+    -- Don't clobber a sticky TOOL work-state. After a Read/Bash finishes there is a
+    -- compose gap where the transcript word reads "Typing", but the pet should LINGER
+    -- on reading/cleaning/debugging (the last tool action) until real text streams —
+    -- which fires `typing` at its own seam (render.lua). Emitting typing here for
+    -- those states was what stopped the reading sprite from ever showing.
+    local w = pet.cond and pet.cond.work
+    local sticky = (w == "reading" or w == "cleaning" or w == "debugging")
+    if not state.think_start and not state.advisor_pending and not sticky then
+      pet.emit("typing")
+    end
   else
     remove_typing_ph()
   end
@@ -583,6 +600,30 @@ local function gated()
     or state.diff_card ~= nil or state.diff_pending == true
 end
 mod._gated = gated
+
+-- Clawd pet renderer: lazily prime image.nvim on the FIRST panel open (never at
+-- startup) and pin the pet bottom-right of the panel. Deferred through
+-- vim.schedule so a cold image.nvim/`convert` load can't add latency to opening
+-- the panel. setup() runs once (a non-graphics terminal just leaves it disabled);
+-- attach + render run every open so a reopened panel gets its pet back.
+local pet_render_primed = false
+local function attach_pet(win)
+  vim.schedule(function()
+    if not (win and vim.api.nvim_win_is_valid(win)) then return end
+    if not pet_render_primed then
+      -- NO `gated` predicate: the pet must stay VISIBLE on top of permission/question
+      -- modals (user request). It used to hide while a decision surface was up (spec
+      -- Q2 avoided the kitty sprite bleeding over a card), but the desired behaviour
+      -- is the opposite — Clawd sits on top of the modal. The opaque carrier shares
+      -- the modal's bar_bg (ClaudeNormal) so the box blends in. (gated() still drives the turn
+      -- timer freeze / "Waiting…" spinner independently — that is untouched.)
+      pet_render.setup({})
+      pet_render_primed = true
+    end
+    pet_render.attach_to_panel(win)
+    pet_render.render_state(pet.state)
+  end)
+end
 
 -- The frozen "Waiting…" hint shown in place of the climbing spinner while a
 -- decision modal owns the panel. The braille frame still animates so the panel
@@ -872,6 +913,8 @@ gate.wire({
   -- shows it directly — this covers the one gate that halts the tick).
   set_waiting_hint = function() set_hint(waiting_label(), "ClaudeInput") end,
   pet_emit         = pet_emit,   -- Clawd: diff accept/reject → diff_* pet states
+  pet_attach_surface = function(win) pcall(pet_render.attach_to_surface, win) end,
+  pet_attach_panel   = function() pcall(pet_render.attach_to_panel, state.panel_win) end,
 })
 
 -- Re-source the gate helpers init still calls directly (event dispatcher, chat bar)
@@ -960,6 +1003,9 @@ question.wire({
   clear_hint                = clear_hint,
   prompt_input              = function() mod.prompt_input() end,
   set_waiting_hint          = function() set_hint(waiting_label(), "ClaudeInput") end,
+  pet_emit                  = pet_emit,   -- Clawd: question modal → notification sprite
+  pet_attach_surface        = function(win) pcall(pet_render.attach_to_surface, win) end,
+  pet_attach_panel          = function() pcall(pet_render.attach_to_panel, state.panel_win) end,
 })
 -- Re-export the question card's test hooks so the `mod._question*` spec references
 -- resolve; they moved to claude/question.lua (Goal 15.4). The dispatch call site
@@ -1626,15 +1672,36 @@ local function open_chat_float(title, callback, opts)
     if vim.api.nvim_win_is_valid(win) then
       vim.api.nvim_win_close(win, true)
     end
+    -- Restore focus to the Claude panel. Closing the float does NOT do this for us —
+    -- nvim falls back to the PREVIOUS window (the left editor), so <CR> after the bar
+    -- closed would land in the editor. The comment above ("focus returns to panel")
+    -- was aspirational; this makes it true.
+    if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+      pcall(vim.api.nvim_set_current_win, state.panel_win)
+      -- Re-hide the cursor AFTER focus lands on the panel. Closing the prompt buffer
+      -- fires an insert→normal transition that resets guicursor to a visible block;
+      -- scheduling the hide makes it win over that late reset (the panel is a focusable
+      -- read-only surface, so its cursor must stay invisible).
+      vim.schedule(function()
+        if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)
+            and vim.api.nvim_get_current_win() == state.panel_win then
+          vim.o.guicursor = "a:ver1-ClaudeCursorHidden"
+        end
+      end)
+    end
     -- Drop the live-bar handles so the permission card won't try to close a dead
     -- window. Guard against a stale closure clobbering a newer bar's handle.
     if state.chat_win == win then
       state.chat_win, state.chat_buf, state.chat_close = nil, nil, nil
     end
+    -- Clawd: bar gone → return the pet to its panel (idle) anchor.
+    pcall(pet_render.attach_to_panel, state.panel_win)
   end
   -- Publish the live handles so show_permission_card can dismiss this bar before
   -- opening the card (see state.chat_win docs).
   state.chat_win, state.chat_buf, state.chat_close = win, ibuf, close
+  -- Clawd: pin the pet top-right of the chat bar while it's up (spec § Placement).
+  pcall(pet_render.attach_to_surface, win)
 
   vim.fn.prompt_setcallback(ibuf, function(text)
     submitted = true
@@ -2002,6 +2069,11 @@ local function open_panel_window(buf)
   vim.wo[win].foldcolumn = "0"
   vim.wo[win].signcolumn = "no"
 
+  -- Clawd: prime + pin the pet to this panel (deferred; no-op without image.nvim
+  -- or a graphics terminal). The panel is laid out (place_vertical ran) so the
+  -- bottom-right anchor geometry is final.
+  attach_pet(win)
+
   -- smoothscroll: scroll by SCREEN rows, so the chat-bar push-up (anchor_last_line)
   -- and clamp can lift a partially-wrapped line precisely instead of snapping to
   -- whole-line boundaries. scrolloff=0: nothing holds the last line off the bottom,
@@ -2137,6 +2209,13 @@ function mod.toggle(root_override)
       and vim.api.nvim_win_is_valid(state.panel_win) then
     stop_process()
     widgets.close_todo_widget()
+    -- Clawd: hard-floor the pet machine before tearing down the renderer. Panel
+    -- close = sleep floor (spec § Event API); without reset the pet's latched
+    -- conditions (thinking/subagent/diff) survive and the reopened panel would
+    -- render the stale state with no live stream to ever clear it.
+    pet.reset()
+    -- Clawd: tear down the pet renderer (its float is anchored to this panel window).
+    pcall(pet_render.teardown)
     vim.api.nvim_win_close(state.panel_win, true)
     state.panel_win    = nil
     state.claude_active = false
@@ -2241,6 +2320,9 @@ function mod.reset()
   -- (subagent / diff / error flash) would otherwise survive a close/reopen — only
   -- reset/sleep clear them. Reset now so the next panel view starts asleep.
   pet.reset()
+  -- Clawd: tear down the renderer too (kitty delete + timers + float) so no image
+  -- artifact survives the reset; the fresh panel re-attaches its own pet.
+  pcall(pet_render.teardown)
   if state.perm and state.perm.win and vim.api.nvim_win_is_valid(state.perm.win) then
     pcall(vim.api.nvim_win_close, state.perm.win, true)
   end

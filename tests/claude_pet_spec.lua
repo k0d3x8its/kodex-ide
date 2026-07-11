@@ -36,8 +36,11 @@ H.check("P-CLS8 debugging beats nothing; test+rm resolves to debugging first",
   pet.classify("Bash", { command = "cargo test && rm target/x" }) == "debugging")
 H.check("P-CLS9 plain Bash → reading (generic)",
   pet.classify("Bash", { command = "ls -la" }) == "reading")
-H.check("P-CLS10 Edit → nil (no dedicated sprite)", pet.classify("Edit", {}) == nil)
-H.check("P-CLS11 Write → nil", pet.classify("Write", {}) == nil)
+H.check("P-CLS10 Edit → building", pet.classify("Edit", {}) == "building")
+H.check("P-CLS11 Write → building", pet.classify("Write", {}) == "building")
+H.check("P-CLS12 MultiEdit → building", pet.classify("MultiEdit", {}) == "building")
+H.check("P-CLS13 NotebookEdit → building", pet.classify("NotebookEdit", {}) == "building")
+H.check("P-CLS14 unknown tool → nil (keep prior state)", pet.classify("Task", {}) == nil)
 
 -- ── Priority resolver (P-PRI) ────────────────────────────────────────────────
 -- Stack several simultaneous conditions; the highest priority must win.
@@ -86,8 +89,10 @@ H.check("P-EVT6 tool_use Read → reading",
   pet.emit("tool_use", { name = "Read", input = {} }) == "reading")
 H.check("P-EVT7 tool_use Bash rm → cleaning",
   pet.emit("tool_use", { name = "Bash", input = { command = "rm x" } }) == "cleaning")
-H.check("P-EVT8 tool_use Edit keeps prior state (nil classify)",
-  pet.emit("tool_use", { name = "Edit", input = {} }) == "cleaning")
+H.check("P-EVT8 tool_use Edit → building (write in progress)",
+  pet.emit("tool_use", { name = "Edit", input = {} }) == "building")
+H.check("P-EVT8b tool_use unknown keeps prior state (nil classify)",
+  pet.emit("tool_use", { name = "SomeNewTool", input = {} }) == "building")
 
 -- Result success → happy, then idle progression owns the clock.
 H.check("P-EVT9 result ok → happy", pet.emit("result", { ok = true, now = 100 }) == "happy")

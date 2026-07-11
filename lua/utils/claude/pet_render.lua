@@ -26,15 +26,15 @@
 -- the render seam — but each image call is pcall'd anyway so a mid-animation throw
 -- can never surface to the user.
 
-local require_prefix = "utils.claude."
-local pet = require(require_prefix .. "pet")
+local require_prefix      = "utils.claude."
+local pet                 = require(require_prefix .. "pet")
 
-local M = {}
+local M                   = {}
 
 -- ── Pet state → GIF asset stem (spec § States → assets) ──────────────────────
 -- The cache dir is named for the source GIF, not the resolved pet state, so this
 -- map is the bridge between pet.lua's state names and the on-disk frame folders.
-local STATE_ASSET = {
+local STATE_ASSET         = {
   sleep             = "sleeping",
   idle              = "idle",
   thinking          = "thinking",
@@ -44,20 +44,20 @@ local STATE_ASSET = {
   cleaning          = "sweeping",
   error             = "error",
   subagent          = "juggling",
-  building          = "building",       -- Edit/Write permission card (rare: usually a diff)
-  notification      = "notification",   -- other permission / question modal
-  diff_wait         = "building",       -- a pending edit/write diff review IS an Edit/Write
-                                        -- → building sprite (the common Edit/Write path)
+  building          = "building",     -- Edit/Write permission card (rare: usually a diff)
+  notification      = "notification", -- other permission / question modal
+  diff_wait         = "building",     -- a pending edit/write diff review IS an Edit/Write
+  -- → building sprite (the common Edit/Write path)
   diff_approved     = "happy",
   happy             = "happy",
   diff_rejected     = "react-annoyed",
   headphones_groove = "headphones-groove",
 }
-M._STATE_ASSET = STATE_ASSET  -- exposed for the headless map-completeness spec
+M._STATE_ASSET            = STATE_ASSET -- exposed for the headless map-completeness spec
 
 -- ── Config (defaults from the L3 spike) ──────────────────────────────────────
-local DEFAULT_SKIN   = "clawd"
-local DEFAULT_FPS    = 10     -- plenty for an idle desk-pet; halves retransmit cost
+local DEFAULT_SKIN        = "clawd"
+local DEFAULT_FPS         = 10 -- plenty for an idle desk-pet; halves retransmit cost
 -- Float footprint (columns × rows). This is a FIXED bounding box: the sprite is fitted
 -- inside it and BOTTOM-RIGHT aligned (see frame_placement), so Clawd stands ON the
 -- float's bottom edge — which is pinned to the statusline / chat bar / modal top — with
@@ -66,10 +66,10 @@ local DEFAULT_FPS    = 10     -- plenty for an idle desk-pet; halves retransmit 
 -- — reconfiguring the float every state change forced a redraw that retransmitted the
 -- kitty image = the transition flicker. Width halved per request (was 24); height is a
 -- generous ceiling the tallest sprite fits within.
-local DEFAULT_WIDTH  = 12     -- pet float footprint, columns
-local DEFAULT_HEIGHT = 8      -- pet float footprint, rows (bounding ceiling)
-local IDLE_PUMP_MS   = 1000   -- how often to tick the idle progression (pet.advance)
-local FRAME_STEP     = 1      -- use every Nth cached frame (cache is already thinned to 16)
+local DEFAULT_WIDTH       = 12   -- pet float footprint, columns
+local DEFAULT_HEIGHT      = 8    -- pet float footprint, rows (bounding ceiling)
+local IDLE_PUMP_MS        = 1000 -- how often to tick the idle progression (pet.advance)
+local FRAME_STEP          = 1    -- use every Nth cached frame (cache is already thinned to 16)
 
 -- Per-asset loop-tail (1-based frame index). Normally an asset loops 1→N→1. For
 -- these, the intro plays ONCE and then it loops from the tail index instead of 1 —
@@ -80,13 +80,13 @@ local FRAME_STEP     = 1      -- use every Nth cached frame (cache is already th
 -- idle-reading: files 000–009 are the intro (glasses on, book pulled out and passed
 -- across the face); the steady both-hands reading pose is files 010–015. Loop from
 -- index 11 (file 010) so the hold is a calm read, not the pass-left-and-back motion.
-local LOOP_FROM = { ["idle-reading"] = 11 }
+local LOOP_FROM           = { ["idle-reading"] = 11 }
 
 -- States that must finish one full animation cycle before a LOW-priority follow-up
 -- (the idle asset) may replace them. happy fires at turn end and the idle reset
 -- lands within a tick — without the hold it reads as a one-frame flash. Urgent
 -- states (typing/thinking/tools/cards) still interrupt immediately.
-local HOLD_FULL_CYCLE = { ["happy"] = true }
+local HOLD_FULL_CYCLE     = { ["happy"] = true }
 -- Every source animation uses the accepted idle size: half-scale inside the fixed
 -- no-flicker carrier. Per-asset overrides remain available for future art variants.
 local DEFAULT_ASSET_SCALE = 0.5
@@ -99,38 +99,38 @@ local DEFAULT_ASSET_SCALE = 0.5
 -- toward the nearest whole-ROW outcome (see the row snap in frame_placement) so the
 -- quantized on-screen size stays closest to idle's 67px/102src ratio. happy (193)
 -- ideally wants 6 rows but that needs >12 cols and would stretch — capped at 5.
-local ASSET_SCALE = {
-  ["idle"]              = 0.50,  -- reference, src bbox 102
-  ["building"]          = 0.75,  -- 153
-  ["debugger"]          = 0.70,  -- 129
-  ["error"]             = 0.70,  -- 139
-  ["happy"]             = 0.95,  -- 193 (capped, see above)
-  ["headphones-groove"] = 0.85,  -- 164
-  ["idle-reading"]      = 0.55,  -- 109
-  ["juggling"]          = 0.70,  -- 121
-  ["notification"]      = 0.73,  -- 149
-  ["react-annoyed"]     = 0.73,  -- 146
-  ["sleeping"]          = 0.70,  -- 134
-  ["sweeping"]          = 0.70,  -- 122
-  ["thinking"]          = 0.70,  -- 134
-  ["typing"]            = 0.73,  -- 149
+local ASSET_SCALE         = {
+  ["idle"]              = 0.50, -- reference, src bbox 102
+  ["building"]          = 0.75, -- 153
+  ["debugger"]          = 0.70, -- 129
+  ["error"]             = 0.70, -- 139
+  ["happy"]             = 0.95, -- 193 (capped, see above)
+  ["headphones-groove"] = 0.85, -- 164
+  ["idle-reading"]      = 0.55, -- 109
+  ["juggling"]          = 0.70, -- 121
+  ["notification"]      = 0.73, -- 149
+  ["react-annoyed"]     = 0.73, -- 146
+  ["sleeping"]          = 0.70, -- 134
+  ["sweeping"]          = 0.70, -- 122
+  ["thinking"]          = 0.70, -- 134
+  ["typing"]            = 0.73, -- 149
 }
-M._ASSET_SCALE = ASSET_SCALE
+M._ASSET_SCALE            = ASSET_SCALE
 
 -- ── Renderer state ───────────────────────────────────────────────────────────
-local cfg = {
+local cfg                 = {
   skin    = DEFAULT_SKIN,
   fps     = DEFAULT_FPS,
   width   = DEFAULT_WIDTH,
   height  = DEFAULT_HEIGHT,
   enabled = true,
 }
-local image        -- the image.nvim module, once loaded
-local ready        = false  -- setup succeeded (image.nvim + a UI present)
-local gated_fn     -- injected: returns true while a decision surface is up
-local cache_root   -- stdpath("cache")/kodex_clawd/<skin>
+local image                       -- the image.nvim module, once loaded
+local ready               = false -- setup succeeded (image.nvim + a UI present)
+local cache_root                  -- stdpath("cache")/kodex_clawd/<skin>
 
 local pet_win, pet_buf
+local patch_win, patch_buf -- 1-row border-repair float (see ensure_border_patch)
 local last_geom            -- last geometry applied to pet_win (skip redundant set_config)
 local active_place         -- {cols, rows} of the CURRENT asset's sprite (float footprint)
 
@@ -145,18 +145,18 @@ local function trace(fmt, ...)
   if not trace_path then return end
   local f = io.open(trace_path, "a")
   if not f then return end
-  f:write(os.date("%H:%M:%S "), fmt:format(...), "\n")
+  f:write(os.date("%H:%M:%S ") --[[@as string]], fmt:format(...), "\n")
   f:close()
 end
-local anchor       = { mode = "panel", win = nil }  -- where the float pins
-local frames_cache = {}   -- asset stem → { Image, … } (bound to the current pet_win)
-local place_cache  = {}   -- asset stem → { cols, rows } sprite cell box (survives win recreate)
-local current_asset       -- asset whose frames the swap timer is cycling
-local shown_img           -- the Image currently on screen (cleared on the next swap)
-local frame_i  = 1
-local hidden   = false    -- true while gated() → image cleared, animation paused
-local hold_cycle = false  -- HOLD_FULL_CYCLE asset playing: defer idle until wrap
-local pending_state       -- state name deferred by hold_cycle (latest wins)
+local anchor       = { mode = "panel", win = nil } -- where the float pins
+local frames_cache = {}                            -- asset stem → { Image, … } (bound to the current pet_win)
+local place_cache  = {}                            -- asset stem → { cols, rows } sprite cell box (survives win recreate)
+local current_asset                                -- asset whose frames the swap timer is cycling
+local current_key                                  -- frames_cache key for it (asset, or asset@pad on surfaces)
+local shown_img                                    -- the Image currently on screen (cleared on the next swap)
+local frame_i      = 1
+local hold_cycle   = false                         -- HOLD_FULL_CYCLE asset playing: defer idle until wrap
+local pending_state                                -- state name deferred by hold_cycle (latest wins)
 local swap_timer, idle_timer
 
 -- ── image.nvim loading (lazy, graceful) ──────────────────────────────────────
@@ -167,9 +167,9 @@ local function load_image()
   local ok, mod = pcall(require, "image")
   if not ok then return nil end
   local setup_ok = pcall(mod.setup, {
-    backend   = "kitty",
-    processor = "magick_cli",  -- uses `convert`; no magick luarock needed
-    integrations = {},          -- bare — the pet needs no markdown/treesitter hooks
+    backend                      = "kitty",
+    processor                    = "magick_cli", -- uses `convert`; no magick luarock needed
+    integrations                 = {},           -- bare — the pet needs no markdown/treesitter hooks
     -- MUST be 100, not nil: a nil value is an ABSENT key in Lua, so image.nvim's
     -- default max_height_window_percentage=50 survives and silently clamps any
     -- sprite taller than half the pet float (5 rows → 4), which also strands it
@@ -210,16 +210,20 @@ local X_PAD = {
   ["typing"]            = 3,
 }
 
-local function placed_geom(mode, wrow, wcol, ww, wh, pw, ph, pad)
+local function placed_geom(mode, wrow, wcol, ww, wh, pw, ph, pad, overlap)
   local col = wcol + ww - pw - (pad or 0)
   local row
   if mode == "surface" then
     -- A bordered float's win_get_position() row IS its border row (screenpos-proven:
-    -- config row=10 → border at 10, content at 11), so the float bottom lands on
-    -- wrow-1, immediately above the border. FINAL after two live A/Bs (2026-07-11):
-    -- overlapping the border row makes the feet visibly cover the outline; sitting
-    -- one row above it is the flush look the user wants. Do not re-try the overlap.
-    row = wrow - ph
+    -- config row=10 → border at 10, content at 11).
+    -- Raw frames (overlap=false): float bottom on wrow-1, one row above the border —
+    -- feet flush at the row edge, half a cell above the mid-cell border glyph.
+    -- Padded frames (overlap=true): the frame carries a half-cell transparent pad
+    -- below the feet and the float extends ONE row onto the border row, so the feet
+    -- land exactly at that row's mid-cell — ON the outline. This is NOT the rejected
+    -- whole-row overlap: the transparent carrier + kitty z=-1 draw the border glyph
+    -- OVER the sprite, so the outline can never be covered.
+    row = wrow - ph + (overlap and 1 or 0)
   else
     -- The statusline begins immediately after the normal panel content.
     row = wrow + wh - ph
@@ -239,20 +243,120 @@ local function anchor_geom()
   local pos = vim.api.nvim_win_get_position(win)
   return placed_geom(anchor.mode, pos[1], pos[2],
     vim.api.nvim_win_get_width(win), vim.api.nvim_win_get_height(win), pw, ph,
-    current_asset and X_PAD[current_asset] or 0)
+    current_asset and X_PAD[current_asset] or 0,
+    active_place and active_place.pad or false)
 end
 
--- Opaque carrier: the float paints the shared bar_bg (ClaudeNormal) so it reads as
--- an invisible box on panel/chat/modal surfaces AND masks the per-swap kitty
--- retransmit gap (image.nvim clear() wipes the transmit cache; the flash shows
--- through a transparent carrier). True transparency is a future goal, but only
--- once a non-ghosting cache-preserving swap is proven live.
+-- Transparent carrier (winblend=100): panel text shows through the float, and the
+-- kitty image already rides display_zindex=-1 (hardcoded in image.nvim's kitty
+-- backend), which Ghostty composites UNDER text glyphs but ABOVE cell backgrounds —
+-- so the transcript renders over Clawd, like he's watching his own mirrored screen.
+-- Tradeoff (accepted 2026-07-11): transparency re-exposes the per-swap retransmit
+-- gap the old opaque ClaudeNormal carrier masked. The round-6 opaque-vs-transparent
+-- A/B predates the set_config skip-guard + sprite-sized float, so the residual
+-- flicker is expected to be far milder now — revert to opaque if live says otherwise.
 local function apply_appearance(win)
   pcall(function()
     if vim.wo[win].winhighlight ~= "NormalFloat:ClaudeNormal" then
       vim.wo[win].winhighlight = "NormalFloat:ClaudeNormal"
     end
-    if vim.wo[win].winblend ~= 0 then vim.wo[win].winblend = 0 end
+    if vim.wo[win].winblend ~= 100 then vim.wo[win].winblend = 100 end
+  end)
+end
+
+-- ── Border patch (surface anchors only) ──────────────────────────────────────
+-- nvim's compositor ERASES the surface float's border glyphs under any
+-- overlapping winblend float: it blends the pet carrier against the BASE window,
+-- not the float beneath, so the pet float's bottom row (the border row) wipes the
+-- outline even though both the carrier and the sprite pixels there are fully
+-- transparent (probe-proven 2026-07-11: the covered band stayed glued to the
+-- border row while the lifted sprite moved up). Repair: a 1-row OPAQUE float over
+-- exactly that strip, redrawing the surface's own top-border char + highlight.
+-- The kitty sprite composites above it with real alpha, so the redrawn line shows
+-- through under the feet.
+local patch_ns = vim.api.nvim_create_namespace("kodex_clawd_border_patch")
+
+-- Top-border char + hl group + body bg group of the anchor surface. The char can
+-- carry an hl in the border spec itself ({"c","Hl"}), but every panel surface
+-- colors its border via winhighlight instead ("FloatBorder:ClaudePermBorder,…"),
+-- so parse that map too — the stock FloatBorder fallback rendered the patch in
+-- the wrong color (live 2026-07-11). Same map yields the surface's NormalFloat
+-- group so the patch bg matches the bar/modal body exactly.
+local function surface_border_spec()
+  local chr, hl, bg = "─", "FloatBorder", "ClaudeNormal"
+  local ok, wcfg = pcall(vim.api.nvim_win_get_config, anchor.win)
+  if ok and type(wcfg.border) == "table" then
+    local top = wcfg.border[2] -- spec order: topleft, top, topright, …
+    if type(top) == "string" and top ~= "" then
+      chr = top
+    elseif type(top) == "table" and type(top[1]) == "string" and top[1] ~= "" then
+      chr = top[1]
+      if type(top[2]) == "string" then return chr, top[2], bg end -- spec hl wins
+    end
+  end
+  local wh_ok, wh = pcall(function() return vim.wo[anchor.win].winhighlight end)
+  if wh_ok and type(wh) == "string" then
+    local border_map = wh:match("FloatBorder:([%w_.]+)")
+    if border_map then hl = border_map end
+    local bg_map = wh:match("NormalFloat:([%w_.]+)")
+    if bg_map then bg = bg_map end
+  end
+  return chr, hl, bg
+end
+
+local function close_border_patch()
+  if patch_win and vim.api.nvim_win_is_valid(patch_win) then
+    pcall(vim.api.nvim_win_close, patch_win, true)
+  end
+  patch_win = nil
+end
+
+-- Keep the patch glued to the pet float's bottom row; close it whenever the pet
+-- isn't standing on a border row (panel anchor, or raw-frame fallback).
+local function ensure_border_patch(geom)
+  if not (anchor.mode == "surface" and active_place and active_place.pad) then
+    close_border_patch()
+    return
+  end
+  local row = geom.row + geom.height - 1
+  local chr, hl, bg = surface_border_spec()
+  if not (patch_buf and vim.api.nvim_buf_is_valid(patch_buf)) then
+    patch_buf = vim.api.nvim_create_buf(false, true)
+  end
+  local line = string.rep(chr, geom.width)
+  pcall(vim.api.nvim_buf_set_lines, patch_buf, 0, -1, false, { line })
+  vim.api.nvim_buf_clear_namespace(patch_buf, patch_ns, 0, -1)
+  pcall(vim.api.nvim_buf_set_extmark, patch_buf, patch_ns, 0, 0,
+    { end_col = #line, hl_group = hl })
+  local cfg_tbl = {
+    relative = "editor",
+    row = row,
+    col = geom.col,
+    width = geom.width,
+    height = 1,
+  }
+  if patch_win and vim.api.nvim_win_is_valid(patch_win) then
+    pcall(vim.api.nvim_win_set_config, patch_win, cfg_tbl)
+  else
+    cfg_tbl.anchor = "NW"
+    cfg_tbl.style = "minimal"
+    cfg_tbl.border = "none"
+    cfg_tbl.focusable = false
+    -- One above the pet carrier so the patch wins its cells in the nvim grid; the
+    -- kitty image is terminal-composited above ALL text anyway, so this cannot
+    -- push the patch over the sprite. window_overlap_clear is off (image.nvim
+    -- default), so the higher float does not make image.nvim hide the sprite.
+    cfg_tbl.zindex = 251
+    local ok, win = pcall(vim.api.nvim_open_win, patch_buf, false, cfg_tbl)
+    if not ok then return end
+    patch_win = win
+  end
+  -- OPAQUE on purpose — this float's whole job is to repaint glyphs the blend
+  -- erased; bg mirrors the surface's own NormalFloat group so it reads as the
+  -- border line, not a box.
+  pcall(function()
+    vim.wo[patch_win].winhighlight = "NormalFloat:" .. bg
+    vim.wo[patch_win].winblend = 0
   end)
 end
 
@@ -260,17 +364,20 @@ end
 -- Returns true if a usable window exists, false when there is no valid anchor.
 local function ensure_win()
   local geom = anchor_geom()
-  if not geom then return false end   -- no panel/chat to pin to → no pet
+  if not geom then return false end -- no panel/chat to pin to → no pet
   if pet_win and vim.api.nvim_win_is_valid(pet_win) then
     -- Only reconfigure when the geometry ACTUALLY changed (anchor switch / panel resize).
     -- ensure_win runs on every state change; a no-op set_config still forces a redraw
     -- that retransmits the kitty image = the per-transition flicker. Skip it when the
     -- float already sits where it should.
     if not (last_geom and last_geom.row == geom.row and last_geom.col == geom.col
-        and last_geom.width == geom.width and last_geom.height == geom.height) then
+          and last_geom.width == geom.width and last_geom.height == geom.height) then
       pcall(vim.api.nvim_win_set_config, pet_win, {
-        relative = "editor", row = geom.row, col = geom.col,
-        width = geom.width, height = geom.height,
+        relative = "editor",
+        row = geom.row,
+        col = geom.col,
+        width = geom.width,
+        height = geom.height,
       })
       last_geom = geom
       local ap = vim.api.nvim_win_get_position(anchor.win)
@@ -279,6 +386,7 @@ local function ensure_win()
         vim.api.nvim_win_get_height(anchor.win))
     end
     apply_appearance(pet_win)
+    ensure_border_patch(geom)
     return true
   end
   -- Recreating the window: the cached frame Images are bound to the OLD (now dead)
@@ -289,18 +397,26 @@ local function ensure_win()
     pet_buf = vim.api.nvim_create_buf(false, true)
   end
   local ok, win = pcall(vim.api.nvim_open_win, pet_buf, false, {
-    relative = "editor", anchor = "NW",
-    row = geom.row, col = geom.col, width = geom.width, height = geom.height,
+    relative = "editor",
+    anchor = "NW",
+    row = geom.row,
+    col = geom.col,
+    width = geom.width,
+    height = geom.height,
     -- High zindex so the pet floats ABOVE permission/question modals (user wants Clawd
     -- on top of them). image.nvim can hide an image whose window is covered by a
     -- higher-zindex float, so the pet must out-rank the cards (dressing/telescope modals
     -- sit ~50–200). The opaque bar_bg float still blends with the modal (same bar_bg).
-    style = "minimal", border = "none", focusable = false, zindex = 250,
+    style = "minimal",
+    border = "none",
+    focusable = false,
+    zindex = 250,
   })
   if not ok then return false end
   pet_win = win
-  last_geom = geom            -- baseline for the set_config skip-guard above
-  apply_appearance(pet_win)   -- opaque bar_bg (invisible box, masks the retransmit flicker)
+  last_geom = geom          -- baseline for the set_config skip-guard above
+  apply_appearance(pet_win) -- transparent carrier (see apply_appearance)
+  ensure_border_patch(geom)
   return true
 end
 
@@ -314,7 +430,7 @@ local function cell_size()
       return s.cell_width, s.cell_height
     end
   end
-  return 8, 17  -- sane Ghostty-ish fallback
+  return 8, 17 -- sane Ghostty-ish fallback
 end
 
 -- PNG pixel dimensions straight from the IHDR header (no subprocess): 8-byte signature,
@@ -325,8 +441,10 @@ local function png_dims(path)
   local hdr = f:read(24)
   f:close()
   if not hdr or #hdr < 24 then return nil end
-  local function be(a) return hdr:byte(a) * 0x1000000 + hdr:byte(a + 1) * 0x10000
-    + hdr:byte(a + 2) * 0x100 + hdr:byte(a + 3) end
+  local function be(a)
+    return hdr:byte(a) * 0x1000000 + hdr:byte(a + 1) * 0x10000
+        + hdr:byte(a + 2) * 0x100 + hdr:byte(a + 3)
+  end
   return be(17), be(21)
 end
 
@@ -341,7 +459,7 @@ local function frame_placement(asset, fw, fh, cell_w, cell_h)
   local cw, ch = cell_w, cell_h
   if not (cw and ch) then cw, ch = cell_size() end
   local scale = math.min((cfg.width * cw) / fw, (cfg.height * ch) / fh)
-    * (ASSET_SCALE[asset] or DEFAULT_ASSET_SCALE)
+      * (ASSET_SCALE[asset] or DEFAULT_ASSET_SCALE)
   -- Snap the target height to a whole row count, then derive the EXACT scale from
   -- it. image.nvim top-aligns the fitted image inside its cell box, so a ceil'd row
   -- count leaves up to a cell of dead slack UNDER the feet (the "not flush" gap on
@@ -356,37 +474,100 @@ end
 M._frame_placement = frame_placement
 
 -- ── Frames ───────────────────────────────────────────────────────────────────
+-- Surface-mode feet-on-line variant: a sibling frame set with `p = fh/(2*rows)` px
+-- of transparent padding added ABOVE and BELOW the sprite (gravity-center extent).
+-- With the row-snap scale, that padding fits to exactly half a cell each side, so
+-- rendering the padded set one row TALLER (rows+1, float overlapping the border
+-- row) puts the feet at the border row's mid-cell — precisely on the outline glyph.
+-- The math is terminal-independent: pad_screen = (fh/2rows) * (rows*ch/fh) = ch/2.
+-- Width is untouched, so the prime-127 resize guarantee holds. Built lazily with
+-- `convert` (already a hard dep of the frame cache), cached on disk, and rebuilt
+-- whenever the raw frames are newer (a --force refetch invalidates it).
+-- Feet lift above the outline glyph, in SCREEN pixels. Ghostty does not composite
+-- kitty z=-1 images under text glyphs (live-proven 2026-07-11: feet exactly at
+-- mid-cell COVER the border stroke), so the feet stop this far above the glyph's
+-- mid-cell line instead — the stroke stays visible right under them, which reads
+-- as standing ON the line. Tune by eye; bump if the stroke still clips.
+-- 3 → 6 → 5 (2026-07-11): the 6px probe proved the covered outline band does NOT
+-- move with the sprite — nvim's compositor erases the surface float's border glyphs
+-- under any overlapping winblend float (it blends against the base window, not the
+-- float beneath), so the border patch float below redraws them. 5 → 4: one more
+-- px down per user's eye, flush to the redrawn line.
+local FEET_LIFT_PX = 2
+
+local function ensure_padded(asset, prows, fw, fh)
+  local raw_dir = cache_root .. "/" .. asset
+  local p = math.floor(fh / (2 * prows) + 0.5)
+  local _, ch = cell_size()
+  -- Source-px lift that lands as FEET_LIFT_PX on screen, via the padded fit scale
+  -- exact = (prows+1)*ch / (fh+2p).
+  local lift = math.floor(FEET_LIFT_PX * (fh + 2 * p) / ((prows + 1) * ch) + 0.5)
+  local out = ("%s@pad%d-%d"):format(raw_dir, prows, lift)
+  local raw0, out0 = raw_dir .. "/000.png", out .. "/000.png"
+  if vim.fn.filereadable(out0) == 1
+      and vim.fn.getftime(out0) >= vim.fn.getftime(raw0) then
+    return out
+  end
+  -- Equal pad top+bottom centers the sprite (feet at the fitted mid-cell); the roll
+  -- then shifts it UP by the lift. lift < p, so nothing wraps around the canvas.
+  -- Build into a staging dir and swap it in back-to-back (fetch-script pattern):
+  -- another live nvim instance may hold Image objects into the old dir, and an
+  -- up-front rm would feed its render ticks "No such file" for the whole convert.
+  local staging = out .. ".staging"
+  local cmd = ("rm -rf %q && mkdir -p %q && for f in %q/*.png; do "
+        .. "convert \"$f\" -background none -gravity center -extent %dx%d "
+        .. "-roll +0-%d %q/\"$(basename \"$f\")\" || exit 1; done "
+        .. "&& rm -rf %q && mv %q %q")
+      :format(staging, staging, raw_dir, fw, fh + 2 * p, lift, staging, out, staging, out)
+  vim.fn.system({ "bash", "-c", cmd })
+  if vim.fn.filereadable(out0) == 1 then return out end
+  trace("padded %s FAILED (convert missing?) — falling back to raw frames", asset)
+  return nil
+end
+
 -- Lazy-load + cache the Image objects for an asset, bound to the current pet_win.
 -- Bound-to-window is why the cache is invalidated on teardown (a stale window
--- reference would render nothing). Returns the frame array (possibly empty).
+-- reference would render nothing). Surface anchors get the padded feet-on-line
+-- variant (cache key `asset@pad`), panel anchors the raw set — the two coexist in
+-- frames_cache/place_cache so chat open/close never rebuilds either.
+-- Returns the frame array (possibly empty) plus its cache key.
 local function ensure_frames(asset)
-  local existing = frames_cache[asset]
-  if existing then return existing end
+  local padded = anchor.mode == "surface"
+  local key = padded and (asset .. "@pad") or asset
+  local existing = frames_cache[key]
+  if existing then return existing, key end
   local frames = {}
-  local dir = cache_root .. "/" .. asset
-  if vim.fn.isdirectory(dir) == 1 then
-    local files = vim.fn.readdir(dir)
+  local raw_dir = cache_root .. "/" .. asset
+  if vim.fn.isdirectory(raw_dir) == 1 then
+    local files = vim.fn.readdir(raw_dir)
     table.sort(files)
     -- All frames of an asset share one crop box, so compute placement once from the
-    -- first frame and reuse it — every frame lands in the same spot (no jitter).
-    local fw, fh = png_dims(dir .. "/" .. (files[1] or ""))
+    -- first RAW frame and reuse it — every frame lands in the same spot (no jitter).
+    -- The padded variant derives from the same numbers: same scale (the pad grows
+    -- source and target height by the same factor), one extra row.
+    local fw, fh = png_dims(raw_dir .. "/" .. (files[1] or ""))
     local _, _, pcols, prows = frame_placement(asset, fw, fh)
+    local dir, rows_used, pad = raw_dir, prows, false
+    if padded and fw and fh then
+      local pdir = ensure_padded(asset, prows, fw, fh)
+      if pdir then dir, rows_used, pad = pdir, prows + 1, true end
+    end
     local tcw, tch = cell_size()
-    trace("frames %s: png=%sx%s cols=%d rows=%d cell=%.1fx%.2f scale=%.2f",
-      asset, tostring(fw), tostring(fh), pcols, prows, tcw, tch,
+    trace("frames %s: png=%sx%s cols=%d rows=%d pad=%s cell=%.1fx%.2f scale=%.2f",
+      key, tostring(fw), tostring(fh), pcols, rows_used, tostring(pad), tcw, tch,
       ASSET_SCALE[asset] or DEFAULT_ASSET_SCALE)
-    -- The float is resized to exactly pcols x prows for this asset (see
+    -- The float is resized to exactly pcols x rows_used for this asset (see
     -- place_cache/anchor_geom), so the sprite fills the window from its top-left.
     for i = 1, #files, FRAME_STEP do
       local ok, img = pcall(image.from_file, dir .. "/" .. files[i], {
-        window = pet_win, x = 0, y = 0, width = pcols, height = prows,
+        window = pet_win, x = 0, y = 0, width = pcols, height = rows_used,
       })
       if ok and img then frames[#frames + 1] = img end
     end
-    place_cache[asset] = { cols = pcols, rows = prows }
+    place_cache[key] = { cols = pcols, rows = rows_used, pad = pad }
   end
-  frames_cache[asset] = frames
-  return frames
+  frames_cache[key] = frames
+  return frames, key
 end
 
 -- Render the next frame BEFORE clearing the previous one (anti-flicker order).
@@ -414,7 +595,7 @@ local function clear_shown()
 end
 
 -- ── Timers ───────────────────────────────────────────────────────────────────
--- One animation tick: hide/restore off gated(), then advance one frame.
+-- One animation tick: validate the anchor, then advance one frame.
 local function on_swap_tick()
   if not (ready and pet_win and vim.api.nvim_win_is_valid(pet_win)) then return end
 
@@ -429,17 +610,11 @@ local function on_swap_tick()
   end
 
   -- Follow live chat/modal height changes; unchanged geometry is a no-op.
-  if not ensure_win() then M.teardown(); return end
-
-  local now_gated = gated_fn and gated_fn() or false
-  if now_gated then
-    if not hidden then clear_shown(); hidden = true end
-    return
-  elseif hidden then
-    hidden = false  -- decision surface dismissed → repaint below
+  if not ensure_win() then
+    M.teardown(); return
   end
 
-  local frames = current_asset and frames_cache[current_asset]
+  local frames = current_key and frames_cache[current_key]
   if not frames or #frames == 0 then return end
   -- Advance one frame, wrapping to the asset's loop-tail (default 1) at the end so
   -- intro-then-hold assets (idle-reading) don't replay their intro every cycle.
@@ -450,13 +625,15 @@ local function on_swap_tick()
       hold_cycle = false
       local deferred = pending_state
       pending_state = nil
-      if deferred then M.render_state(deferred); return end
+      if deferred then
+        M.render_state(deferred); return
+      end
     end
     nxt = math.min(LOOP_FROM[current_asset] or 1, #frames)
   else
     nxt = frame_i + 1
   end
-  if nxt == frame_i then                 -- single-frame state: just ensure it's up
+  if nxt == frame_i then -- single-frame state: just ensure it's up
     swap_to(frames[frame_i]); return
   end
   frame_i = nxt
@@ -494,7 +671,7 @@ end
 
 -- The injected renderer seam. pet.lua calls this on every real state change.
 -- Maps the pet state to its asset, paints frame 1 render-before-clear, and keeps
--- the swap timer cycling. A no-op while disabled, gated, or asset-less.
+-- the swap timer cycling. A no-op while disabled or asset-less.
 function M.render_state(name, _prev)
   if not (ready and cfg.enabled) then return end
   local asset = STATE_ASSET[name]
@@ -523,39 +700,38 @@ function M.render_state(name, _prev)
     return
   end
 
-  local frames = ensure_frames(asset)
+  local frames, key = ensure_frames(asset)
   current_asset = asset
+  current_key = key
   frame_i = 1
-  if #frames == 0 then clear_shown(); return end  -- assets missing: show nothing
+  if #frames == 0 then
+    clear_shown(); return
+  end -- assets missing: show nothing
 
   -- Resize the float to THIS asset's sprite box (ensure_win above ran with the
   -- previous asset's footprint — it had to exist before ensure_frames could bind
   -- Images to it). Cheap: ensure_win no-ops when the geometry didn't change.
-  active_place = place_cache[asset]
+  active_place = place_cache[key]
   ensure_win()
 
-  if not (gated_fn and gated_fn()) then
-    hidden = false
-    swap_to(frames[1])
-  else
-    -- Entered while a card is up: clear any sprite still on screen BEFORE latching
-    -- hidden. Without the clear, the next swap tick skips it (its guard is
-    -- `if not hidden`), leaving the old frame kitty-composited ON TOP of the card
-    -- for its whole lifetime — the spike-Q2 bleed the hide rule exists to prevent.
-    clear_shown()
-    hidden = true
-  end
+  swap_to(frames[1])
   start_timers()
 end
 
 -- Pin the pet bottom-right of the Claude panel (idle/working anchor). Called when
 -- the panel opens and when the chat bar closes.
 function M.attach_to_panel(win)
+  local mode_changed = anchor.mode ~= "panel"
   anchor = { mode = "panel", win = win }
   if not (ready and cfg.enabled) then return end
   if not ensure_win() then return end
-  if shown_img then
-    pcall(function() shown_img:render() end)  -- repaint current frame at the new pos
+  if mode_changed and current_asset then
+    -- The two anchor modes use DIFFERENT frame variants (raw vs padded feet-on-line),
+    -- so a repaint of shown_img would show the wrong one. Re-drive render_state: it
+    -- picks the mode's variant from cache (or builds it) and resizes the float.
+    M.render_state(pet.state)
+  elseif shown_img then
+    pcall(function() shown_img:render() end) -- repaint current frame at the new pos
   elseif current_asset then
     -- ensure_win recreated the float (old one externally killed) → cache + shown_img
     -- were wiped, so there's nothing to repaint. Re-drive render_state to rebuild the
@@ -567,14 +743,18 @@ end
 
 -- Pin the pet top-right of a bordered bottom surface: chat bar or modal.
 function M.attach_to_surface(win)
+  local mode_changed = anchor.mode ~= "surface"
   anchor = { mode = "surface", win = win }
   if not (ready and cfg.enabled) then return end
   if not ensure_win() then return end
-  if shown_img then
+  if mode_changed and current_asset then
+    -- See attach_to_panel: mode switch = frame-variant switch, so re-drive.
+    M.render_state(pet.state)
+  elseif shown_img then
     pcall(function() shown_img:render() end)
   elseif current_asset then
-    -- See attach_to_panel: rebuild frames against a recreated float instead of
-    -- leaving the pet blank until the next state change.
+    -- Rebuild frames against a recreated float instead of leaving the pet blank
+    -- until the next state change.
     M.render_state(pet.state)
   end
 end
@@ -586,8 +766,11 @@ M.attach_to_chat = M.attach_to_surface
 function M.debug_geometry()
   local cw, ch = cell_size()
   return {
-    asset = current_asset, anchor_mode = anchor.mode, anchor_geom = anchor_geom(),
-    cell = { width = cw, height = ch }, cfg = vim.deepcopy(cfg),
+    asset = current_asset,
+    anchor_mode = anchor.mode,
+    anchor_geom = anchor_geom(),
+    cell = { width = cw, height = ch },
+    cfg = vim.deepcopy(cfg),
     image_geometry = shown_img and vim.deepcopy(shown_img.geometry) or nil,
     rendered_geometry = shown_img and vim.deepcopy(shown_img.rendered_geometry) or nil,
     -- Raw anchor-window metrics: enough to hand-check placed_geom against what is
@@ -597,12 +780,20 @@ function M.debug_geometry()
       if not (w and vim.api.nvim_win_is_valid(w)) then return nil end
       local p = vim.api.nvim_win_get_position(w)
       local c = vim.api.nvim_win_get_config(w)
-      return { win = w, pos_row = p[1], pos_col = p[2],
-        width = vim.api.nvim_win_get_width(w), height = vim.api.nvim_win_get_height(w),
-        cfg_anchor = c.anchor, cfg_row = c.row, cfg_col = c.col, border = c.border and true or false }
+      return {
+        win = w,
+        pos_row = p[1],
+        pos_col = p[2],
+        width = vim.api.nvim_win_get_width(w),
+        height = vim.api.nvim_win_get_height(w),
+        cfg_anchor = c.anchor,
+        cfg_row = c.row,
+        cfg_col = c.col,
+        border = c.border and true or false
+      }
     end)(),
     pet_win_cfg = (pet_win and vim.api.nvim_win_is_valid(pet_win))
-      and vim.api.nvim_win_get_config(pet_win) or nil,
+        and vim.api.nvim_win_get_config(pet_win) or nil,
   }
 end
 
@@ -618,29 +809,31 @@ function M.teardown()
   end
   frames_cache = {}
   current_asset = nil
+  current_key = nil
   frame_i = 1
-  hidden = false
   hold_cycle = false
   pending_state = nil
   if pet_win and vim.api.nvim_win_is_valid(pet_win) then
     pcall(vim.api.nvim_win_close, pet_win, true)
   end
   pet_win = nil
-  last_geom = nil   -- window gone → next ensure_win recreates + rebaselines
+  close_border_patch()
+  last_geom = nil -- window gone → next ensure_win recreates + rebaselines
 end
 
 -- Wire the renderer into the pure state machine and prime image.nvim. `opts`:
---   { skin, fps, width, height, enabled, gated = <fn> }.
+--   { skin, fps, width, height, enabled }.
+-- (A `gated` hide predicate existed until 2026-07-11 — removed as dead code once
+-- the slash menu went above the carrier by zindex instead of hiding the pet.)
 -- Idempotent-ish: safe to call once at plugin setup. When image.nvim or a UI is
 -- absent, leaves pet.render as the pure no-op stub so the pet stays headless-safe.
 function M.setup(opts)
-  opts = opts or {}
-  cfg.skin    = opts.skin    or cfg.skin
-  cfg.fps     = opts.fps     or cfg.fps
-  cfg.width   = opts.width   or cfg.width
-  cfg.height  = opts.height  or cfg.height
+  opts       = opts or {}
+  cfg.skin   = opts.skin or cfg.skin
+  cfg.fps    = opts.fps or cfg.fps
+  cfg.width  = opts.width or cfg.width
+  cfg.height = opts.height or cfg.height
   if opts.enabled ~= nil then cfg.enabled = opts.enabled end
-  gated_fn = opts.gated
   cache_root = vim.fn.stdpath("cache") .. "/kodex_clawd/" .. cfg.skin
 
   -- Never render in a headless/embedded session (no graphics terminal).

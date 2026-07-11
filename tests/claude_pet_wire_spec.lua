@@ -49,10 +49,15 @@ end
 vim.cmd("cd /tmp")
 claude.toggle()
 vim.wait(30)
+-- Baseline: no turn in flight → pet asleep.
+H.check("W0 pet starts asleep", pet.state == "sleep", "state=" .. tostring(pet.state))
 claude._send("hello")
 vim.wait(30)
 H.check("W0 stdout callback captured", captured_stdout_cb ~= nil)
-H.check("W0 pet starts asleep", pet.state == "sleep", "state=" .. tostring(pet.state))
+-- Sending starts the spinner, which enters the transcript's initial "Typing" compute
+-- band (pre-thinking TTFT) → the tick drives the pet to typing right away, matching
+-- what the transcript shows. (See tick_typing_ph.)
+H.check("W0b send → initial typing band", pet.state == "typing", "state=" .. tostring(pet.state))
 
 -- ── Turn lifecycle seams (render.lua dispatch) ────────────────────────────────
 
@@ -61,6 +66,15 @@ feed({ type = "stream_event",
   event = { type = "content_block_start", index = 0,
             content_block = { type = "thinking" } } })
 H.check("W1 thinking seam → thinking", pet.state == "thinking", "state=" .. tostring(pet.state))
+
+-- W1b stream typing — a text content_block_start (incremental SSE) flips to typing
+-- the moment prose STARTS streaming, not only when the aggregated block lands (W2).
+-- This is the seam the pet needs so it animates typing during the live compose band
+-- the transcript shows `●∙∙ Typing` for, not just for one frame at the end.
+feed({ type = "stream_event",
+  event = { type = "content_block_start", index = 1,
+            content_block = { type = "text" } } })
+H.check("W1b text stream-start → typing", pet.state == "typing", "state=" .. tostring(pet.state))
 
 -- W2 typing — an aggregated assistant text block flips to generating output.
 assistant({ type = "text", text = "hi there" })

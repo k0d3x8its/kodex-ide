@@ -50,16 +50,23 @@ H.check("PR-SAFE5 teardown no-op", pcall(pr.teardown))
 
 
 -- Pure placement contract for surfaces, statusline, and idle normalization.
+-- win_get_position row = the BORDER row of a bordered float; the pet float's bottom
+-- row (row+ph-1) is wrow-1, just above the border (live A/B final: overlap covers
+-- the outline; one row above reads flush).
 local sg = pr._placed_geom("surface", 50, 80, 40, 3, 12, 8)
-H.check("PR-GEOM0 surface sits above top border", sg.row == 41)
-H.check("PR-GEOM1 surface right edge is flush", sg.col == 108)
+H.check("PR-GEOM0 surface sits above top border", sg.row == 42)
+H.check("PR-GEOM1 surface right edge is flush when unpadded", sg.col == 108)
+local sgp = pr._placed_geom("surface", 50, 80, 40, 3, 12, 8, 1)
+H.check("PR-GEOM1b per-asset x-pad shifts left", sgp.col == 107)
 local pg = pr._placed_geom("panel", 2, 80, 40, 50, 12, 8)
 H.check("PR-GEOM2 panel sits above statusline", pg.row == 44)
 local ix, iy, iw, ih = pr._frame_placement("idle", 96, 64, 8, 16)
 H.check("PR-SCALE0 idle is half-width", iw == 6)
 H.check("PR-SCALE1 idle is half-height", ih == 2)
 H.check("PR-SCALE2 idle remains bottom-right", ix == 6 and iy == 6)
+-- sleeping carries a per-asset scale (0.70): source-bbox normalization to idle.
+-- rows snap to floor(64*0.70/16+0.5)=3, exact 3*16/64=0.75 → cols ceil(96*0.75/8)=9.
 local _, _, sw, sh = pr._frame_placement("sleeping", 96, 64, 8, 16)
-H.check("PR-SCALE3 sleep uses uniform half scale", sw == 6 and sh == 2)
+H.check("PR-SCALE3 sleep uses its per-asset scale", sw == 9 and sh == 3)
 
 H.summary("claude_pet_render_spec")

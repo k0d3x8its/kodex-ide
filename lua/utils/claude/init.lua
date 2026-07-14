@@ -624,6 +624,22 @@ local function gated()
 end
 mod._gated = gated
 
+-- The window of the currently-open modal float, or nil. Feeds the focus-trap
+-- (open_panel_window's WinEnter) so a click on the panel bounces focus back to the
+-- modal instead of stranding it without key control. Decision cards (permission,
+-- question, diff) keep their win in state; the effort/advisor pickers expose it via
+-- a win() accessor. Priority order is topmost-first, but only one is ever open at a
+-- time (the perm queue serializes), so the first valid hit is correct.
+local function active_modal_win()
+  for _, m in ipairs({ state.perm, state.qask, state.diff_card }) do
+    if m and m.win and vim.api.nvim_win_is_valid(m.win) then return m.win end
+  end
+  local w = effort.win() or advisor.win()
+  if w and vim.api.nvim_win_is_valid(w) then return w end
+  return nil
+end
+mod._active_modal_win = active_modal_win
+
 -- Clawd pet renderer: lazily prime image.nvim on the FIRST panel open (never at
 -- startup) and pin the pet bottom-right of the panel. Deferred through
 -- vim.schedule so a cold image.nvim/`convert` load can't add latency to opening
@@ -2162,6 +2178,29 @@ local function open_panel_window(buf)
     callback = function()
       if not state.claude_active then return end
       refit_separators()
+    end,
+  })
+
+  -- Modal focus-trap. When a modal float is open, a mouse click on the panel (or an
+  -- Alt+w cycle that lands on it) fires WinEnter for the panel window — which would
+  -- strand the modal without key focus, the reported "I clicked the panel and lost
+  -- control of the modal" bug. Bounce focus straight back to the modal. Only the
+  -- PANEL is trapped: entering the editor is allowed, so Alt+w still switches between
+  -- the editor and the modal-over-panel. Scheduled so the window change lands after
+  -- the autocmd (setting the current window mid-WinEnter is rejected on some paths).
+  vim.api.nvim_create_autocmd("WinEnter", {
+    group = grp,
+    callback = function()
+      if not state.claude_active then return end
+      if vim.api.nvim_get_current_win() ~= state.panel_win then return end
+      local mwin = active_modal_win()
+      if not mwin then return end
+      vim.schedule(function()
+        if vim.api.nvim_win_is_valid(mwin)
+            and vim.api.nvim_get_current_win() == state.panel_win then
+          pcall(vim.api.nvim_set_current_win, mwin)
+        end
+      end)
     end,
   })
 

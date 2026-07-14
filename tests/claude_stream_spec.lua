@@ -1217,4 +1217,31 @@ H.check("S33 compact line replaced with an interrupted receipt",
   panel_text():find("Compacting interrupted", 1, true) ~= nil, panel_text())
 H.check("S33 turn clock unpaused after the sweep", claude.state.pause_t0 == nil)
 
+-- ── S34: chansend into a closed channel recovers instead of hanging (F6) ───────
+-- A send can land in the window after the CLI died but before its async on_exit
+-- fires: the channel is closing, chansend writes 0 bytes, and no result event
+-- will ever come. The old code dropped that 0 → state.working stayed true and the
+-- spinner climbed forever. dispatch_send now reads the return and tears the
+-- working state down (working=false, spinner stopped, WARN) so the panel recovers.
+local dead_warns = 0
+local prior_notify_s34 = vim.notify
+vim.notify = function(message, level)
+  if level == vim.log.levels.WARN
+      and tostring(message):find("session closed", 1, true) then
+    dead_warns = dead_warns + 1
+  end
+end
+local prior_chansend_s34 = vim.fn.chansend
+vim.fn.chansend = function() return 0 end   -- closed/closing channel: 0 bytes written
+
+claude._send("into a dead channel")
+vim.wait(30)
+
+H.check("S34 working state torn down after a 0-byte send", claude.state.working == false,
+  "working=" .. tostring(claude.state.working))
+H.check("S34 the dead-channel send warns once", dead_warns == 1, "warns=" .. dead_warns)
+
+vim.fn.chansend = prior_chansend_s34
+vim.notify = prior_notify_s34
+
 H.summary("claude_stream")

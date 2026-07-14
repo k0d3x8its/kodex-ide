@@ -152,10 +152,23 @@ local function render_question_card()
   end
 
   lines[#lines + 1] = ""                                   -- spacer
+  -- Per-question note field ("n to add notes"): the note for THIS question (q.qi).
+  -- Each question carries its own note (q.notes[i]); navigating between questions
+  -- swaps which note shows. Empty = dim placeholder; set = prose-orange (real content).
+  local note = q.notes[q.qi]
+  if note and note ~= "" then
+    lines[#lines + 1] = "  Notes: " .. note
+    hl[#hl + 1] = { #lines - 1, "ClaudeProse" }
+  else
+    lines[#lines + 1] = "  Notes: Add notes…"
+    hl[#hl + 1] = { #lines - 1, "ClaudeDim" }
+  end
+  lines[#lines + 1] = ""                                   -- spacer
+
   local nav = (#q.questions > 1) and " · ⇥ question" or ""
   lines[#lines + 1] = question.multiSelect
-    and ("  ↑/↓ move · space toggle" .. nav .. " · ⏎ select · esc cancel")
-    or  ("  ↑/↓ move" .. nav .. " · ⏎ select · esc cancel")
+    and ("  ↑/↓ move · space toggle" .. nav .. " · ⏎ select · n note · esc cancel")
+    or  ("  ↑/↓ move" .. nav .. " · ⏎ select · n note · esc cancel")
   hl[#hl + 1] = { #lines - 1, "ClaudeDim" }
 
   -- Geometry: full panel-column width (shared helper — same anchoring the
@@ -306,8 +319,22 @@ local function submit_question_answers()
       answers[question.question] = ans
     end
   end
+  -- "n to add notes": deliver each question's note via the AskUserQuestion tool's
+  -- `annotations` field — the schema-backed channel, keyed by question text with a
+  -- `notes` sub-field (per question, matching the UI). This is why an earlier attempt
+  -- that shoved the note into `answers`/a bare `notes` key was never seen by Claude:
+  -- the tool key-matches `answers` against real questions and drops unknown keys, and
+  -- reads notes ONLY from `annotations[question].notes`.
+  local annotations = {}
+  for i, question in ipairs(q.questions) do
+    local note = q.notes[i]
+    if note and note ~= "" then
+      annotations[question.question] = { notes = note }
+    end
+  end
   local merged = vim.deepcopy(q.input or {})
   merged.answers = answers
+  if next(annotations) then merged.annotations = annotations end
   send_permission_response(q.request_id, "allow", { input = merged })
   local n = #q.questions
   close_question_card(
@@ -360,6 +387,12 @@ local function question_summary(q)
       ans = #ans > 0 and table.concat(ans, ", ") or nil
     end
     parts[#parts + 1] = ans and ("  Answer: " .. ans) or "  (No answer provided)"
+    -- Carry this question's note ("n to add notes") into the clarify message too, so
+    -- it isn't lost when the user chooses "Chat about this" instead of submitting.
+    local note = q.notes[i]
+    if note and note ~= "" then
+      parts[#parts + 1] = "  Note: " .. note
+    end
   end
   return table.concat(parts, "\n")
 end
@@ -395,14 +428,18 @@ local function set_question_custom(text)
 end
 Question.set_question_custom = set_question_custom
 
--- Open a small input for the "Type something" affordance. A dedicated, FOCUSED
--- float in the panel column (NOT vim.ui.input): dressing routes vim.ui.input to a
--- cursor-relative float that opened behind the question card (the card holds focus
--- + a higher draw position), so the user's typing landed in an invisible window.
--- This float anchors SW at the panel column with a zindex ABOVE the card (70 > 60),
--- focused + in insert mode, so what's typed is always visible. <CR> commits the
--- answer, <Esc> cancels back to the card. Empty/cancelled input just repaints.
-local function prompt_question_custom()
+-- Shared focused text-prompt float, used by BOTH the "Type something" custom-answer
+-- affordance and the "n to add notes" field. A dedicated FOCUSED float in the panel
+-- column (NOT vim.ui.input): dressing routes vim.ui.input to a cursor-relative float
+-- that opens BEHIND the question card (the card holds focus + a higher draw position),
+-- so the user's typing lands in an invisible window. This float anchors SW at the
+-- panel column with a zindex ABOVE the card (70 > 60), focused + in insert mode, so
+-- what's typed is always visible. <CR> commits (fires on_commit with the typed text,
+-- "" when blank), <Esc> cancels (fires on_commit(nil) — distinct from a blank commit
+-- so callers can keep an existing value on cancel). `initial` pre-fills the input so
+-- an existing value is edited/repopulated rather than retyped. on_commit always
+-- refocuses the card; it owns the repaint (callers control empty/cancel behaviour).
+local function open_prompt_float(title, initial, on_commit)
   if not state.qask then return end
   -- Shared geometry: anchors to the panel's real screen column (same fix
   -- open_question_float already got — this path was still using columns-panel_w,
@@ -426,7 +463,7 @@ local function prompt_question_custom()
     height    = 1,
     border    = "rounded",
     style     = "minimal",
-    title     = " ✎ Type your answer ",
+    title     = title,
     title_pos = "left",
     zindex    = 70,
   })
@@ -441,8 +478,7 @@ local function prompt_question_custom()
   -- Show the cursor while typing (the panel hides it globally via guicursor).
   vim.o.guicursor = state.real_guicursor or "a:block,a:blinkon0"
 
-  -- Close the input, then either record the typed text (commit + advance/submit)
-  -- or fall back to the card untouched. Refocus the card so navigation continues.
+  -- Close the input, refocus the card, then hand the typed text to on_commit.
   -- Guarded so the prompt callback + an <Esc>/WinLeave can't both fire it.
   local done = false
   local function finish(text)
@@ -458,8 +494,7 @@ local function prompt_question_custom()
     -- keymaps are normal-mode, so without this the arrows are dead until the user
     -- drops out of insert manually.
     vim.cmd("stopinsert")
-    if text and text ~= "" then set_question_custom(text)
-    else render_question_card() end
+    on_commit(text)
   end
 
   vim.fn.prompt_setcallback(buf, function(text) finish(text) end)
@@ -467,7 +502,38 @@ local function prompt_question_custom()
   vim.keymap.set("i", "<Esc>", function() finish(nil) end, opts)
   vim.keymap.set("n", "<Esc>", function() finish(nil) end, opts)
   vim.cmd("startinsert!")
+  -- Pre-fill with the existing value so it can be edited/repopulated. Typed AFTER
+  -- startinsert! (in insert mode) so it lands in the prompt line past the "❯ " arrow;
+  -- "n" = no remap, plain literal text (the note never contains termcodes).
+  if initial and initial ~= "" then
+    vim.api.nvim_feedkeys(initial, "n", false)
+  end
 end
+
+-- "Type something" affordance: record the typed text as the custom answer (commit +
+-- advance/submit), or repaint the card untouched on empty/cancel.
+local function prompt_question_custom()
+  open_prompt_float(" ✎ Type your answer ", nil, function(text)
+    if text and text ~= "" then set_question_custom(text)
+    else render_question_card() end
+  end)
+end
+
+-- "n to add notes": edit THIS question's note (pre-filled with the current value so a
+-- dismiss-then-repopulate keeps it). <CR> sets it (blank <CR> clears it); <Esc> — a
+-- dismiss — leaves the existing note untouched, so an accidental Esc never wipes it.
+local function prompt_question_note()
+  local q = state.qask
+  if not q then return end
+  local qi = q.qi                                   -- capture: qi is stable while typing
+  open_prompt_float(" ✎ Add a note ", q.notes[qi], function(text)
+    if state.qask and text ~= nil then             -- nil = Esc → keep existing note
+      state.qask.notes[qi] = (text ~= "") and text or nil
+    end
+    render_question_card()
+  end)
+end
+Question.prompt_question_note = prompt_question_note
 
 -- Act on the highlighted option: "Chat about this" denies with feedback (clarify
 -- dialogue), "Type something" opens the input, a model option records the pick
@@ -548,6 +614,7 @@ local function open_question_float(q)
   map("<Left>",    prev_question)
   map("<Space>",   toggle_question_choice)
   map("<CR>",      select_question_choice)
+  map("n",         prompt_question_note)   -- "n to add notes" (card-level note field)
   map("<Esc>",     cancel_question)
   map("q",         cancel_question)
 
@@ -576,6 +643,7 @@ local function show_question_card(event)
     choice     = {},     -- choice[i] = highlighted display-option index per question
     sel        = {},     -- sel[i]    = { [modelOptIndex] = true } per multiSelect question
     picks      = {},     -- picks[i]  = recorded answer per question (see question_answered)
+    notes      = {},     -- notes[i]  = free-text note per question ("n to add notes")
   }
   if #q.questions == 0 then
     -- Nothing to ask — allow with no answers so the turn isn't left blocked.

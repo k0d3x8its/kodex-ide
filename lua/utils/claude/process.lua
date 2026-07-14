@@ -355,7 +355,11 @@ end
 
 -- Send a brand-new turn: echo the message into the transcript (normal colour),
 -- a blank line so the spinner gets its own line, then dispatch it.
-local function send(text)
+-- `dispatch_override` (optional): echo `text` in the transcript as usual but send a
+-- DIFFERENT string to the CLI. Used for a mid-sentence slash command — the user sees
+-- their full prose, while only the extracted "/command" is dispatched so the CLI
+-- actually runs it (it won't parse a command buried in a sentence). nil = normal turn.
+local function send(text, dispatch_override)
   -- Clear any lingering placeholder BEFORE the user echo. render_user runs before
   -- dispatch_send's start_spinner, so a placeholder still on the last line (a turn
   -- that ended without a result event, or a rapid re-send) would otherwise get the
@@ -368,7 +372,7 @@ local function send(text)
   local wire, note = attach_host_context(text)
   render_user(text, note)
   buf_append({ "" })
-  dispatch_send(wire)
+  dispatch_send(dispatch_override or wire)
 end
 Process.send = send
 

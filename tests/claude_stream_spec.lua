@@ -1285,6 +1285,117 @@ H.check("S35 queue empty after drain",
 require("utils.claude.question").cancel_question()   -- clean up second card
 vim.wait(30)
 
+-- ── S35b: F7 — zero-questions event drains queue (drain-chain fix) ───────────────
+-- If an AskUserQuestion event arrives with 0 questions (auto-allowed silently), any
+-- events queued behind it must still drain. Before the fix the early return at L697
+-- skipped the drain, stranding queue entries and blocking the turn indefinitely.
+do
+  -- Reset state cleanly.
+  claude.state.qask       = nil
+  claude.state.qask_queue = nil
+
+  -- 1. Send zero-questions event — no card opens, auto-allowed silently.
+  feed({ type = "control_request", request_id = "q-s35b-zero",
+    request = { subtype = "can_use_tool", tool_name = "AskUserQuestion",
+      input = { questions = {} } } })
+  vim.wait(10)
+
+  H.check("S35b no card opened for zero-questions event",
+    claude.state.qask == nil, "qask=" .. vim.inspect(claude.state.qask))
+
+  -- 2. Simulate a second real question arriving while qask is still nil (state after
+  --    drain): just verify the queue is empty — the drain fired correctly.
+  H.check("S35b queue empty after zero-questions auto-allow (drain ran)",
+    claude.state.qask_queue == nil or #claude.state.qask_queue == 0,
+    "queue_len=" .. tostring(claude.state.qask_queue and #claude.state.qask_queue))
+
+  -- 3. Queue a real question behind a second zero-questions event.
+  -- First, fake that a card IS open so the second event queues.
+  claude.state.qask = { request_id = "fake-open", questions = { { question = "X?",
+    header = "X", options = { { label = "A" } } } }, qi = 1,
+    choice = {}, sel = {}, picks = {}, notes = {}, input = {} }
+  feed({ type = "control_request", request_id = "q-s35b-queued-zero",
+    request = { subtype = "can_use_tool", tool_name = "AskUserQuestion",
+      input = { questions = {} } } })
+  feed({ type = "control_request", request_id = "q-s35b-queued-real",
+    request = { subtype = "can_use_tool", tool_name = "AskUserQuestion",
+      input = { questions = { { question = "After zero?", header = "Q",
+        options = { { label = "Yes" }, { label = "No" } } } } } } })
+  vim.wait(10)
+
+  H.check("S35b two events queued behind fake-open card",
+    claude.state.qask_queue ~= nil and #claude.state.qask_queue == 2,
+    "queue_len=" .. tostring(claude.state.qask_queue and #claude.state.qask_queue))
+
+  -- Close the fake card: drain should fire zero-questions first (auto-allow), then
+  -- open the real question card.
+  claude.state.qask = nil   -- simulate card close without going through full teardown
+  -- Invoke drain directly via cancel_question on the zero-questions queued event.
+  -- Instead: replicate what close_question_card does — call show_question_card(nxt).
+  local Question = require("utils.claude.question")
+  -- Directly trigger the drain by calling cancel_question which closes the card.
+  -- Reset to the queued state first.
+  claude.state.qask = { request_id = "fake-open2", questions = { { question = "X?",
+    header = "X", options = { { label = "A" } } } }, qi = 1,
+    choice = {}, sel = {}, picks = {}, notes = {}, input = {} }
+  claude.state.qask_queue = {
+    { request_id = "q-drain-zero",
+      request = { subtype = "can_use_tool", tool_name = "AskUserQuestion",
+        input = { questions = {} } } },
+    { request_id = "q-drain-real",
+      request = { subtype = "can_use_tool", tool_name = "AskUserQuestion",
+        input = { questions = { { question = "Survived?", header = "Q2",
+          options = { { label = "Yes" }, { label = "No" } } } } } } },
+  }
+  Question.cancel_question()
+  vim.wait(30)
+
+  -- After cancel: drain fires → zero-questions event auto-allowed → drain again →
+  -- real question card opened → state.qask set.
+  H.check("S35b real card opens after zero-questions drained in chain",
+    claude.state.qask ~= nil and claude.state.qask.request_id == "q-drain-real",
+    "qask_rid=" .. tostring(claude.state.qask and claude.state.qask.request_id))
+  H.check("S35b queue empty after full chain drain",
+    claude.state.qask_queue == nil or #claude.state.qask_queue == 0,
+    "queue_len=" .. tostring(claude.state.qask_queue and #claude.state.qask_queue))
+
+  -- Clean up.
+  Question.cancel_question()
+  vim.wait(30)
+  claude.state.qask       = nil
+  claude.state.qask_queue = nil
+end
+
+-- ── S35c: ADV-001 — close_question_card tail runs after all-zero queue drain ──────
+-- When the last queued event is zero-questions (no card opened), the `return` after
+-- show_question_card in close_question_card skips resume_turn / qask_reopen_bar.
+-- Fix: guard the return on `if state.qask` — fall through to tail when no card opened.
+do
+  claude.state.qask = { request_id = "s35c-fake", questions = { { question = "Q",
+    header = "H", options = { { label = "A" } } } }, qi = 1,
+    choice = {}, sel = {}, picks = {}, notes = {}, input = {} }
+  claude.state.qask_queue = {
+    { request_id = "q-s35c-zero",
+      request = { subtype = "can_use_tool", tool_name = "AskUserQuestion",
+        input = { questions = {} } } },
+  }
+  claude.state.qask_reopen_bar = true   -- simulate dismissed chat bar
+  require("utils.claude.question").cancel_question()
+  vim.wait(30)
+
+  H.check("S35c no card open after all-zero drain from close_question_card",
+    claude.state.qask == nil,
+    "qask=" .. vim.inspect(claude.state.qask))
+  H.check("S35c queue empty after all-zero drain",
+    claude.state.qask_queue == nil or #claude.state.qask_queue == 0,
+    "queue_len=" .. tostring(claude.state.qask_queue and #claude.state.qask_queue))
+  H.check("S35c tail ran: qask_reopen_bar consumed (set to false by tail block)",
+    claude.state.qask_reopen_bar == false,
+    "qask_reopen_bar=" .. tostring(claude.state.qask_reopen_bar))
+
+  claude.state.qask_reopen_bar = false
+end
+
 -- ── S36: F8 — dispatch guard drops events silently when panel_buf is invalid ─────
 -- renderers call nvim_buf_line_count(state.panel_buf) without a validity guard;
 -- after a manual :bd or a reset race the buffer is gone → crash in the scheduled

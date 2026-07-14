@@ -5,7 +5,7 @@
 -- control_request the CLI can't auto-resolve: the interactive permission card
 -- (Bash/WebFetch/out-of-cwd), the Issue-B pre-write diff gate for Edit/Write, and
 -- the Accept/Reject diff-review card. Extracted from the former monolithic
--- claude.lua (Goal 15.5) to relieve init's main-chunk 200-local ceiling.
+-- claude.lua to relieve init's main-chunk 200-local ceiling.
 --
 -- Dependencies: core.state + core buffer helpers (state/buf_append/hl_lines/
 -- panel_width) come from a direct require; five init-owned helpers
@@ -78,7 +78,7 @@ local function send_permission_response(request_id, decision, o)
     -- AskUserQuestion's "Chat about this". The TUI bundle's question component sets an
     -- internal `feedback` prop, but the wire serializer maps it straight to `message`
     -- (`{behavior:"deny",message:$.feedback??"User denied permission"}`) — there is NO
-    -- `feedback` field on the wire; sending one is silently dropped. § Q-ASK addendum.
+    -- `feedback` field on the wire; sending one is silently dropped.
     response = { behavior = "deny", message = o.message or "User rejected" }
   else
     local input = o.input
@@ -90,11 +90,25 @@ local function send_permission_response(request_id, decision, o)
     type     = "control_response",
     response = { subtype = "success", request_id = request_id, response = response },
   })
-  pcall(vim.fn.chansend, state.job_id, msg .. "\n")
+  -- chansend returns bytes written — 0 = the channel
+  -- closed (the CLI died while the card was up). The decision never reached the CLI,
+  -- so no result event will ever come and the turn would hang. Tear the working state
+  -- down so the panel recovers; on_exit's own sweep still fires when the async exit
+  -- lands.
+  local ok, written = pcall(vim.fn.chansend, state.job_id, msg .. "\n")
+  if not ok or written == 0 then
+    state.working = false
+    stop_spinner()
+    clear_hint()
+    vim.notify(
+      "Claude: decision not delivered (session closed) — next message starts a fresh session",
+      vim.log.levels.WARN
+    )
+  end
 end
 Gate.send_permission_response = send_permission_response
 
--- F3 (FINDINGS § Q-ERROR-AUDIT): every control_request expects a control_response.
+-- Every control_request expects a control_response.
 -- A subtype the dispatcher doesn't implement, silently dropped, blocks the CLI's
 -- turn forever behind the spinner — answer with the protocol's error variant so the
 -- CLI fails the request and moves on. WARN once per subtype per session: the same
@@ -223,7 +237,7 @@ end
 -- drops a one-line receipt into the transcript so the scrollback records the
 -- decision. One card at a time (the CLI blocks the turn awaiting our
 -- control_response). Edits never reach here (auto-allowed → vimdiff). Mirrors
--- OpenCode's card; full protocol in .work/FINDINGS.md § Q-PERM.
+-- OpenCode's card.
 
 -- Repaint the float's button row (p.row, 0-indexed last content line) in place:
 -- the active option pops (ClaudeQuestion), the rest dim (ClaudeDim). Called on
@@ -344,7 +358,7 @@ local function resolve_permission(kind)
 end
 Gate.resolve_permission = resolve_permission
 
--- F5 (FINDINGS § Q-ERROR-AUDIT): abandon every pending permission decision —
+-- Abandon every pending permission decision —
 -- live card, queued requests, held pre-write gate — because the session is gone
 -- (CLI death or reset). Unlike resolve_permission this must NOT drain the queue
 -- into a fresh card: there is no session left to answer. The deny responses are

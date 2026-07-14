@@ -1092,7 +1092,13 @@ local function start_compact_modal()
   local first = vim.api.nvim_buf_line_count(buf)
   buf_append({ COMPACT_SPIN[1] .. " Compacting conversation…", "" })
   hl_lines(first, first, "ClaudeThink")
-  state.compact_mark = vim.api.nvim_buf_set_extmark(buf, compact_ns(), first, 0, {})
+  -- right_gravity=false: paint_compact_line rewrites this exact row every 110ms via
+  -- set_lines(ln, ln+1) — a delete+reinsert. Default right-gravity drags the mark to
+  -- the RIGHT edge of the reinserted text (next row) each tick, so the spinner walks
+  -- downward painting a fresh "Compacting…" line every frame (the flood). Left-gravity
+  -- pins it to the row's start so the rewrite stays in place.
+  state.compact_mark = vim.api.nvim_buf_set_extmark(buf, compact_ns(), first, 0,
+    { right_gravity = false })
   compact_spin_i = 1
   state.compact_timer = vim.fn.timer_start(110, function()
     compact_spin_i = compact_spin_i % #COMPACT_SPIN + 1
@@ -1144,10 +1150,30 @@ local function fmt_reset(ts)
   return os.date("%H:%M", ts)              -- local wall-clock, matches the TUI
 end
 
+-- True only for a status that means the request was actually BLOCKED. The CLI emits
+-- rate_limit_event every turn as telemetry, and near a window edge it reports a
+-- non-"allowed" but still-permitted status (e.g. an approaching-limit warning). The
+-- old "anything ≠ allowed = reached" test rendered that as a false "Rate limit
+-- reached (five hour)" while the user was well under the cap (live 2026-07-14). Treat
+-- any allowed/warning/approaching-family status as non-blocking; only a hard rejection
+-- surfaces the block. NOTE: the exact blocking enum is still an open [VERIFY] (see
+-- FINDINGS § Q-RATE-LIMIT) — this blacklists the known-safe statuses rather than
+-- whitelisting the blocking one, so a real limit is never silently swallowed.
+local function is_rate_limit_blocking(status)
+  if type(status) ~= "string" then return false end
+  local s = status:lower()
+  if s == "allowed" or s:find("allow", 1, true) or s:find("warn", 1, true)
+      or s:find("approach", 1, true) or s == "ok" then
+    return false
+  end
+  return true
+end
+
 local function render_rate_limit(info)
   local status = info.status
-  -- vim.json maps JSON null → vim.NIL (userdata), so guard both nil and "allowed".
-  if status == nil or status == vim.NIL or status == "allowed" then
+  -- vim.json maps JSON null → vim.NIL (userdata). Guard nil/NIL and any non-blocking
+  -- status (allowed / approaching-limit warning) — only a real block renders the card.
+  if not is_rate_limit_blocking(status) then
     state.rate_limit_shown = nil           -- back under the limit → allow a future re-show
     return
   end

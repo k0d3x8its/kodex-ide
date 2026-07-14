@@ -466,10 +466,19 @@ end
 -- The activity line shows during the two block-less compute phases (Typing +
 -- Thinking) — NOT while a tool runs (its cornered ●/└ block IS the activity),
 -- and not while a permission card or a pending diff owns the panel.
+--
+-- Also suppressed while a /compact modal is up (state.compact_mark set): that
+-- modal runs its OWN 110ms braille spinner over the "Compacting conversation…"
+-- line, so a concurrent "Typing" activity line is both wrong (the model isn't
+-- composing a reply, it's compacting) AND fatal — two timers appending to the
+-- buffer tail break the "typing block is the last two lines" invariant, so every
+-- tick orphans a fresh Typing line (the flood) and the desynced tail shifts the
+-- compact extmark into a doubled modal line. Let the compact modal own the tail.
 local function in_typing_phase()
   return state.working
     and not state.tool_run
     and not state.perm and not state.diff_pending
+    and not state.compact_mark
 end
 
 -- Delete the activity block. Safe to call anytime: no-op unless active. It is
@@ -489,6 +498,7 @@ local function remove_typing_ph()
 end
 mod._remove_typing_ph = remove_typing_ph
 mod._activity_word    = activity_word
+mod._in_typing_phase  = in_typing_phase
 
 -- Append the activity block: the word line + a trailing BLANK line. The blank is
 -- what set_hint anchors the eol randomizer to, so the randomizer renders on its
@@ -557,6 +567,7 @@ local function tick_typing_ph()
     remove_typing_ph()
   end
 end
+mod._tick_typing_ph = tick_typing_ph
 
 -- The eol randomizer hint: the per-turn flavour word + a climbing turn timer +
 -- token count. It rides at EOL on the row BELOW the in-body activity line (the

@@ -2,7 +2,7 @@
 --
 -- The persistent-subprocess lifecycle: spawn, stdin send, stdout line-buffer,
 -- exit handling, and the type-ahead queue. Extracted from the former monolithic
--- claude.lua (Goal 15.6) to relieve init's main-chunk 200-local ceiling.
+-- claude.lua to relieve init's main-chunk 200-local ceiling.
 --
 -- Architecture: ONE long-lived `claude` process per panel session, driven over
 -- stdin/stdout as newline-delimited stream-json — the same mode KOS Capture uses
@@ -26,8 +26,8 @@
 -- Dependencies: core.state + core.opts + core.buf_append come from a direct
 -- require; widgets (close_todo_widget/reflow_bottom_floats) is required directly.
 -- Eleven init-owned helpers couple to init's render/spinner/hint/host-ctx
--- machinery (dispatch is 15.7's; render_* + spinner + hint stay in init because
--- they hold timers / touch the render foundation) and are injected via
+-- machinery (dispatch, render_*, spinner + hint stay in init because they hold
+-- timers / touch the render foundation) and are injected via
 -- Process.wire{} at load time. stdout_buf is module-owned here; init's
 -- ensure_panel_buf / reset call Process.clear_stdout() to reset it on a fresh
 -- panel/session.
@@ -49,7 +49,7 @@ local buf_append = core.buf_append
 
 -- Init-owned helpers, injected by Process.wire{} at load time (see init.lua).
 -- Declared as forward locals so the process functions below close over them.
-local dispatch              -- 15.7's event dispatcher (on_stdout routes events to it)
+local dispatch              -- event dispatcher (on_stdout routes events to it)
 local render_user           -- transcript echo of a new user turn
 local render_queue          -- shaded virtual-line render of the type-ahead queue
 local remove_typing_ph      -- clear a lingering typing placeholder before the echo
@@ -60,7 +60,7 @@ local set_hint
 local attach_host_context   -- first-turn @<file> mention (host-ctx cluster stays in init)
 local FLAVOR                -- flavour-word table (its DONE twin stays in init)
 local claude_bin            -- mod.CLAUDE_BIN (the resolved `claude` binary path)
-local abort_decision_state  -- render's F5+F9 teardown sweep (on_exit strands otherwise)
+local abort_decision_state  -- render's decision/compact teardown sweep (on_exit strands otherwise)
 
 --- Inject init's render/spinner/hint/host-ctx helpers + the FLAVOR table + the
 --- claude binary path. Called once from init after those are defined (dispatch,
@@ -85,7 +85,7 @@ end
 -- resets it via Process.clear_stdout() on a fresh panel buffer / session reset.
 local stdout_buf = ""
 
--- One render-error notice per turn (F2, FINDINGS § Q-ERROR-AUDIT). A renderer
+-- One render-error notice per turn. A renderer
 -- throw repeats for every further event in the turn (same broken shape streams
 -- again); notifying each one buries the editor in error toasts. Re-armed at
 -- dispatch_send so the NEXT broken turn is not silent.
@@ -177,8 +177,7 @@ local function build_args()
     -- already allowlisted, which we answer over stdin (dispatch + can_use_tool
     -- branch). Without it the CLI silently auto-denies un-allowlisted tools.
     -- Must persist across model/plan respawns (plan-mode only varies
-    -- --permission-mode, never drops this flag) — full protocol in
-    -- .work/FINDINGS.md § Q-PERM.
+    -- --permission-mode, never drops this flag).
     "--permission-prompt-tool", "stdio",
     -- Steer search toward ast-grep/rg so the Search-block renderer fires (headless
     -- claude has no Grep tool). Persists across model/plan respawns.
@@ -207,7 +206,7 @@ local function build_args()
   return args
 end
 
--- Deep-strip vim.NIL from a decoded event (F1, FINDINGS § Q-ERROR-AUDIT).
+-- Deep-strip vim.NIL from a decoded event.
 -- vim.json.decode maps JSON null → vim.NIL, a TRUTHY userdata, so every
 -- `field or fallback` idiom downstream keeps the userdata and crashes in
 -- concat/split/ipairs — one null field from the CLI killed the render (worst
@@ -215,8 +214,7 @@ end
 -- blocked forever on the unanswered gate). Normalizing ONCE here, at the only
 -- decode boundary, lets every renderer's `or` fallback work as written instead
 -- of guarding ~30 call sites. Lists are rebuilt without their null slots — a
--- nil punched into the array part would be an ipairs-stopping hole (the exact
--- gotcha behind the S29 focus-trap bug).
+-- nil punched into the array part would be an ipairs-stopping hole.
 local function strip_nulls(node)
   if vim.islist(node) then
     local compacted = {}
@@ -267,7 +265,7 @@ local function on_stdout(_, data, _)
         -- not inside the Neovim API safe zone. vim.schedule defers to the next
         -- safe iteration of the event loop.
         vim.schedule(function()
-          -- pcall: one malformed event must not kill the stream (F2). Unhandled,
+          -- pcall: one malformed event must not kill the stream. Unhandled,
           -- a renderer throw here spams one scheduled-callback error per further
           -- event, and a throw landing between a modifiable=true…false seam
           -- (render_tool_result, render_edit_hunk, expand_result) leaves the
@@ -303,11 +301,16 @@ local function on_exit(_, code, _)
   state.working      = false
   state.system_ready = false
   stdout_buf         = ""
-  stop_spinner()
 
   vim.schedule(function()
-    -- F5: a dead CLI can never answer the decision a card is blocked on — sweep
-    -- stranded cards/queues/pre-write holds + the compact zombie timer (F9)
+    -- stop_spinner reaches the buffer (remove_typing_ph → nvim_buf_set_lines)
+    -- and must run inside the schedule, not in the raw libuv job callback — a
+    -- buffer op there can hit textlock/fast-context errors exactly when the
+    -- process dies (the worst moment to throw). The plain state resets above are
+    -- safe outside; only this teardown touches the API.
+    stop_spinner()
+    -- A dead CLI can never answer the decision a card is blocked on — sweep
+    -- stranded cards/queues/pre-write holds + the compact zombie timer
     -- before the notify, so the user sees the receipts and the exit reason
     -- together. Scheduled: the sweep closes windows and appends buffer lines.
     if abort_decision_state then abort_decision_state("session ended") end
@@ -337,7 +340,7 @@ local function ensure_process()
   if state.job_id then return state.job_id end
   stdout_buf = ""
   -- Fresh session: the CLI restarts its "Task #N" counter at 1, so drop any prior
-  -- task list + our id counter to realign (Task* widget, § Q-TODO-TRIGGER). This is
+  -- task list + our id counter to realign (Task* widget). This is
   -- the genuine once-per-session hook — system/init fires per TURN, not per spawn.
   if state.todos then
     state.todos, state.todo_seq = nil, nil
@@ -411,7 +414,23 @@ local function dispatch_send(text)
     type    = "user",
     message = { role = "user", content = { { type = "text", text = text } } },
   })
-  pcall(vim.fn.chansend, state.job_id, msg .. "\n")
+  -- chansend returns bytes written — 0 means the channel is closed/closing
+  -- (the process died between ensure_process and here, before on_exit fired). The
+  -- dropped result used to leave state.working=true + the spinner climbing forever
+  -- with no result event ever coming. Treat 0 (or a pcall error) as process death:
+  -- tear down the working state so the panel doesn't hang. on_exit still runs its
+  -- own sweep when the async exit lands.
+  local ok, written = pcall(vim.fn.chansend, state.job_id, msg .. "\n")
+  if not ok or written == 0 then
+    state.working = false
+    stop_spinner()
+    clear_hint()
+    vim.notify(
+      "Claude: message not delivered (session closed) — next message starts a fresh session",
+      vim.log.levels.WARN
+    )
+    return false
+  end
   return true
 end
 

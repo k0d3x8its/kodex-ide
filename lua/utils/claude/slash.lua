@@ -65,7 +65,12 @@ function Slash.ensure_commands()
   if not ok or not lines or not lines[1] then return end
   local ok2, names = pcall(vim.json.decode, lines[1])
   if ok2 and type(names) == "table" and #names > 0 then
-    state.slash_commands = names
+    -- F10: filter non-string elements (corrupted cache → name:match crash).
+    local filtered = {}
+    for _, name in ipairs(names) do
+      if type(name) == "string" then filtered[#filtered + 1] = name end
+    end
+    state.slash_commands = filtered
   end
 end
 

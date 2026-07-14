@@ -12,8 +12,10 @@ H.stub_project_root("/tmp")
 -- ── Subprocess + module stubs (mirror claude_spec.lua) ────────────────────────
 
 local captured_stdout_cb = nil
+local captured_exit_cb = nil
 vim.fn.jobstart = function(_, opts)
   captured_stdout_cb = opts.on_stdout
+  captured_exit_cb = opts.on_exit
   return 99
 end
 vim.fn.jobstop  = function() end
@@ -1164,5 +1166,55 @@ if claude.state.perm then
 end
 vim.fn.chansend = prior_chansend
 vim.notify = prior_notify
+
+-- ── S33: CLI death sweeps stranded decision/compact state (F5+F9) ──────────────
+-- FINDINGS § Q-ERROR-AUDIT F5: on_exit cleared job/working/system_ready but NOT
+-- the decision modals — a crash with a card up left it stranded ("Waiting…"
+-- forever), answers silently no-op'd (nil job_id), and the compact spinner's
+-- timer animated a zombie line forever (F9). on_exit now runs a teardown sweep:
+-- close cards with a receipt, drop the queue + held pre-write request, stop the
+-- compact timer, resume the paused turn clock.
+claude._send("doomed turn")
+vim.wait(30)
+feed({ type = "system", subtype = "status", status = "compacting" })
+feed({ type = "control_request", request_id = "die-1", request = {
+  subtype = "can_use_tool", tool_name = "Bash", input = { command = "ls" } } })
+feed({ type = "control_request", request_id = "die-2", request = {
+  subtype = "can_use_tool", tool_name = "WebFetch", input = { url = "https://x" } } })
+feed({ type = "control_request", request_id = "die-3", request = {
+  subtype = "can_use_tool", tool_name = "AskUserQuestion",
+  input = { questions = { { question = "Pick one?", header = "Pick",
+    options = { { label = "A" }, { label = "B" } } } } } } })
+local prewrite_rejected = false
+package.loaded["utils.claude_diff"].state = { prewrite = true }
+package.loaded["utils.claude_diff"].reject_all = function()
+  prewrite_rejected = true
+end
+claude.state.prewrite = { request_id = "die-4", input = {} }
+
+H.check("S33 precondition: perm card + queue + question card + compact modal all up",
+  claude.state.perm ~= nil and #(claude.state.perm_queue or {}) == 1
+    and claude.state.qask ~= nil and claude.state.compact_timer ~= nil
+    and claude.state.compact_mark ~= nil,
+  ("perm=%s q=%d qask=%s timer=%s"):format(tostring(claude.state.perm),
+    #(claude.state.perm_queue or {}), tostring(claude.state.qask),
+    tostring(claude.state.compact_timer)))
+
+captured_exit_cb(99, 1, "exit")     -- CLI crash (non-clean code) mid-everything
+vim.wait(100)
+
+H.check("S33 permission card closed on session death", claude.state.perm == nil)
+H.check("S33 queued permission requests dropped",
+  claude.state.perm_queue == nil or #claude.state.perm_queue == 0)
+H.check("S33 question card closed on session death", claude.state.qask == nil)
+H.check("S33 held pre-write request rejected and cleared",
+  prewrite_rejected and claude.state.prewrite == nil,
+  "rejected=" .. tostring(prewrite_rejected) .. " prewrite=" .. tostring(claude.state.prewrite))
+H.check("S33 compact timer stopped and mark cleared (F9)",
+  claude.state.compact_timer == nil and claude.state.compact_mark == nil,
+  "timer=" .. tostring(claude.state.compact_timer) .. " mark=" .. tostring(claude.state.compact_mark))
+H.check("S33 compact line replaced with an interrupted receipt",
+  panel_text():find("Compacting interrupted", 1, true) ~= nil, panel_text())
+H.check("S33 turn clock unpaused after the sweep", claude.state.pause_t0 == nil)
 
 H.summary("claude_stream")

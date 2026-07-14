@@ -40,6 +40,10 @@ local pet_emit
 local pet_attach_surface
 local pet_attach_panel
 
+-- Forward declaration so close_question_card (defined first) can drain the queue
+-- by calling show_question_card — mirrors gate.lua's show_permission_card pattern.
+local show_question_card
+
 --- Inject init's float/pad/spinner/permission helpers. Called once from init after
 --- they are defined.
 function Question.wire(hooks)
@@ -264,6 +268,15 @@ local function close_question_card(receipt, receipt_hl)
     buf_append({ receipt })
     hl_lines(recl, recl, receipt_hl or "ClaudeQuestion")
   end
+  -- F7: drain the queue — same pattern as gate.lua's resolve_permission drain.
+  -- The next card owns resume_turn + spinner + bar lifecycle, so return early.
+  -- Turn stays paused (pause_turn is idempotent); the incoming show_question_card
+  -- will call stop_spinner + pause_turn itself.
+  if state.qask_queue and #state.qask_queue > 0 then
+    local nxt = table.remove(state.qask_queue, 1)
+    show_question_card(nxt)
+    return
+  end
   core.resume_turn()   -- fold the answer wait out of the turn timer (mirrors the tick)
   -- Blank line so the resumed spinner gets its own row, not the receipt's EOL
   -- (same reason as resolve_permission — set_hint anchors to the last line).
@@ -286,13 +299,18 @@ local function close_question_card(receipt, receipt_hl)
   end
 end
 
--- F5 (FINDINGS § Q-ERROR-AUDIT): the session ended (CLI death or reset) with the
--- question card still up — close it with a receipt saying why, WITHOUT a wire
--- response (unlike cancel_question: there is no live request left to answer).
--- close_question_card resumes the paused turn clock and clears the frozen
--- "Waiting…" hint on its way out.
+-- F5: the session ended (CLI death or reset) with the question card still up.
+-- Clear the queue first (like abort_permission_cards clears perm_queue) so the
+-- close_question_card drain doesn't open new cards on a dead session, then close
+-- the live card with a receipt. No wire response: the CLI is gone.
 function Question.abort_question_card(receipt)
   if not state.qask then return end
+  local queued = state.qask_queue
+  state.qask_queue = nil
+  for _, queued_event in ipairs(queued or {}) do
+    send_permission_response(queued_event.request_id, "allow",
+      { input = (queued_event.request or {}).input or {} })
+  end
   close_question_card("✗ Questions dismissed — " .. receipt, "ClaudeDim")
 end
 
@@ -651,7 +669,16 @@ end
 -- Arm a question card from an inbound AskUserQuestion can_use_tool control_request.
 -- Pauses the spinner (Claude is blocked on us) and dismisses any open chat bar
 -- (same SW-column collision as the permission card), reopened on close.
-local function show_question_card(event)
+show_question_card = function(event)
+  -- F7: one card at a time. A second AskUserQuestion while one is up orphans the
+  -- first float (same frozen-ghost class as gate.lua's perm bug, T17b). Queue it;
+  -- close_question_card drains the queue when the current card closes.
+  if state.qask then
+    state.qask_queue = state.qask_queue or {}
+    state.qask_queue[#state.qask_queue + 1] = event
+    return
+  end
+
   local req = event.request or {}
   local input = req.input or {}
   local q = {

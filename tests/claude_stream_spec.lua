@@ -988,8 +988,29 @@ if panel and vim.api.nvim_win_is_valid(panel) then
   vim.wait(100, function() return vim.api.nvim_get_current_win() == mwin end)
   H.check("S29 focusing the panel bounces back to the modal",
     vim.api.nvim_get_current_win() == mwin, tostring(vim.api.nvim_get_current_win()))
-  -- Once the modal is gone the panel is no longer trapped.
+  -- REGRESSION (live 2026-07-14): active_modal_win built its card list as a bare
+  -- { state.perm, state.qask, state.diff_card } — with NO perm card open, the nil
+  -- at index 1 is a table HOLE and ipairs stops there, so a question/diff card was
+  -- never seen: perm bounced, question/diff escaped. Each slot must be found with
+  -- the earlier slots nil.
   claude.state.perm = nil
+  claude.state.qask = { win = mwin }   -- stand-in for an open question card
+  H.check("S29 active_modal_win sees a question card with NO perm card open",
+    claude._active_modal_win() == mwin, tostring(claude._active_modal_win()))
+  vim.api.nvim_set_current_win(panel)
+  vim.wait(100, function() return vim.api.nvim_get_current_win() == mwin end)
+  H.check("S29 panel focus bounces back to the question card",
+    vim.api.nvim_get_current_win() == mwin, tostring(vim.api.nvim_get_current_win()))
+  claude.state.qask = nil
+  claude.state.diff_card = { win = mwin }   -- stand-in for an open diff-review card
+  H.check("S29 active_modal_win sees a diff card with NO perm/question card open",
+    claude._active_modal_win() == mwin, tostring(claude._active_modal_win()))
+  vim.api.nvim_set_current_win(panel)
+  vim.wait(100, function() return vim.api.nvim_get_current_win() == mwin end)
+  H.check("S29 panel focus bounces back to the diff card",
+    vim.api.nvim_get_current_win() == mwin, tostring(vim.api.nvim_get_current_win()))
+  claude.state.diff_card = nil
+  -- Once the modal is gone the panel is no longer trapped.
   vim.api.nvim_set_current_win(panel)
   vim.wait(50)
   H.check("S29 no bounce once no modal is open",

@@ -344,6 +344,55 @@ local function resolve_permission(kind)
 end
 Gate.resolve_permission = resolve_permission
 
+-- F5 (FINDINGS § Q-ERROR-AUDIT): abandon every pending permission decision —
+-- live card, queued requests, held pre-write gate — because the session is gone
+-- (CLI death or reset). Unlike resolve_permission this must NOT drain the queue
+-- into a fresh card: there is no session left to answer. The deny responses are
+-- best-effort — send_permission_response no-ops on a nil job_id (CLI death) and
+-- actually answers on a reset-while-alive, where the CLI is still blocked.
+local function abort_permission_cards(receipt)
+  -- Queue first, so closing the live card below can't race a drain.
+  local queued = state.perm_queue
+  state.perm_queue = nil
+  for _, queued_event in ipairs(queued or {}) do
+    send_permission_response(queued_event.request_id, "deny", { message = receipt })
+  end
+
+  local p = state.perm
+  if p then
+    state.perm = nil   -- before close → the float's WinClosed fallback-deny no-ops
+    send_permission_response(p.request_id, "deny", { message = receipt })
+    if p.resize_close then pcall(p.resize_close) end
+    if p.win and vim.api.nvim_win_is_valid(p.win) then
+      pcall(vim.api.nvim_win_close, p.win, true)   -- WinClosed autocmd drops the pad
+    end
+    state.perm_reopen_bar = false   -- no chat bar to hand back to a dead session
+    if pet_emit then pet_emit("permission", { active = false }) end
+    if pet_attach_panel then pet_attach_panel() end
+    if state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf) then
+      local receipt_row = vim.api.nvim_buf_line_count(state.panel_buf)
+      buf_append({ "✗ " .. p.display .. " — " .. receipt })
+      hl_lines(receipt_row, receipt_row, "ClaudeDim")
+    end
+  end
+
+  -- Held pre-write request: reject through claude_diff so the diff windows close
+  -- with it. Guarded on claude_diff's OWN prewrite flag — reject_all in any other
+  -- mode acts on a post-write review instead (its "new file" branch deletes the
+  -- file from disk). The nil below is a belt over a reject_all that failed
+  -- part-way: the held request must never stay armed on a dead session.
+  if state.prewrite then
+    local claude_diff = require("utils.claude_diff")
+    if claude_diff.state and claude_diff.state.prewrite then
+      pcall(claude_diff.reject_all)
+    end
+    state.prewrite = nil
+  end
+
+  core.resume_turn()   -- the decision wait is over, whatever ended it
+end
+Gate.abort_permission_cards = abort_permission_cards
+
 -- Find path-like tokens in a PLAIN card line (the desc / Patterns rows are not
 -- markdown, so parse_inline never touches them). Any run containing a "/" is a
 -- path: trailing-slash → directory (ClaudeDir blue + folder feel), else a file

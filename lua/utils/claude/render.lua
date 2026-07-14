@@ -1120,7 +1120,7 @@ local function finish_compact_modal(meta)
   local pos = vim.api.nvim_buf_get_extmark_by_id(buf, compact_ns(), mark, {})
   if not (pos and pos[1]) then return end
   local ln = pos[1]
-  local line
+  local line, receipt_hl = nil, "ClaudeAdvisor"
   if type(meta) == "table" then
     local trig    = (meta.trigger == "auto") and "auto" or "manual"
     local dropped = meta.cumulative_dropped_tokens
@@ -1129,14 +1129,36 @@ local function finish_compact_modal(meta)
     line = string.format("✓ Compacted %s → %s tokens%s · %s",
       fmt_ktok(meta.pre_tokens), fmt_ktok(meta.post_tokens),
       dropped and (" (−" .. fmt_ktok(dropped) .. ")") or "", trig)
+  elseif meta == "interrupted" then
+    -- The session died mid-compaction (F5 sweep): a "✓ compacted" receipt would
+    -- lie — the CLI never confirmed the boundary.
+    line, receipt_hl = "✗ Compacting interrupted — session ended", "ClaudeDim"
   else
     line = "✓ Conversation compacted"
   end
   vim.bo[buf].modifiable = true
   pcall(vim.api.nvim_buf_set_lines, buf, ln, ln + 1, false, { line })
   vim.bo[buf].modifiable = false
-  hl_lines(ln, ln, "ClaudeAdvisor")
+  hl_lines(ln, ln, receipt_hl)
 end
+
+-- ── F5+F9 teardown sweep (FINDINGS § Q-ERROR-AUDIT) ───────────────────────────
+-- CLI death (process.on_exit) or a session reset with decision state up used to
+-- strand it: cards froze on "Waiting…" forever (answers no-op on a nil job_id),
+-- queued permission requests leaked, a held pre-write request pinned its diff
+-- windows, and the compact spinner's timer animated a zombie line until quit
+-- (F9 — nothing outside the boundary/status events ever stopped it). One sweep,
+-- called from both paths; every branch guards on its own state so the reset →
+-- async-on_exit double-fire is harmless. `receipt` says why (shown in the cards'
+-- transcript receipts).
+local function abort_decision_state(receipt)
+  gate.abort_permission_cards(receipt)
+  question.abort_question_card(receipt)
+  -- Safe when no compaction is in flight: with no extmark armed the receipt
+  -- rewrite is skipped and only the (already-nil) timer handle is cleared.
+  finish_compact_modal("interrupted")
+end
+Render.abort_decision_state = abort_decision_state
 
 -- ── Rate-limit block (F5) ─────────────────────────────────────────────────────
 -- rate_limit_event fires as telemetry EVERY turn — usually status="allowed" (fine).

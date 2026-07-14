@@ -269,13 +269,14 @@ local function close_question_card(receipt, receipt_hl)
     hl_lines(recl, recl, receipt_hl or "ClaudeQuestion")
   end
   -- F7: drain the queue — same pattern as gate.lua's resolve_permission drain.
-  -- The next card owns resume_turn + spinner + bar lifecycle, so return early.
-  -- Turn stays paused (pause_turn is idempotent); the incoming show_question_card
-  -- will call stop_spinner + pause_turn itself.
+  -- Only return early if a real card opened (state.qask set by show_question_card).
+  -- A zero-questions event auto-allows without opening a card, so state.qask stays nil
+  -- after the call; in that case fall through to the tail (resume_turn, bar reopen).
   if state.qask_queue and #state.qask_queue > 0 then
     local nxt = table.remove(state.qask_queue, 1)
     show_question_card(nxt)
-    return
+    if state.qask then return end   -- real card opened; it owns the tail
+    -- Zero-questions event consumed with no card opened — fall through to run the tail
   end
   core.resume_turn()   -- fold the answer wait out of the turn timer (mirrors the tick)
   -- Blank line so the resumed spinner gets its own row, not the receipt's EOL
@@ -694,6 +695,19 @@ show_question_card = function(event)
   if #q.questions == 0 then
     -- Nothing to ask — allow with no answers so the turn isn't left blocked.
     send_permission_response(event.request_id, "allow", { input = input })
+    -- No card opened, so close_question_card won't run; drain the queue here.
+    -- Iterative (not recursive) to handle consecutive zero-questions events without
+    -- unbounded call depth: each zero-questions event auto-allows and loops.
+    while state.qask_queue and #state.qask_queue > 0 do
+      local nxt       = table.remove(state.qask_queue, 1)
+      local nxt_input = (nxt.request or {}).input or {}
+      local nxt_qs    = nxt_input.questions or {}
+      if #nxt_qs > 0 then
+        show_question_card(nxt)
+        return
+      end
+      send_permission_response(nxt.request_id, "allow", { input = nxt_input })
+    end
     return
   end
 

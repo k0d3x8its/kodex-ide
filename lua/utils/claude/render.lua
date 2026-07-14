@@ -2035,6 +2035,12 @@ local function dispatch(event)
       -- sends the control_response). The CLI blocks the turn until we answer.
       gate.show_permission_card(event)
     end
+
+  elseif ev_type == "control_request" then
+    -- Unknown subtype (F3): the CLI blocks its turn until EVERY control_request
+    -- is answered — dropping one hangs the session behind the spinner. Answer
+    -- the error variant instead of guessing at success semantics we don't know.
+    gate.send_control_error(event.request_id, tostring((event.request or {}).subtype))
   end
 end
 Render.dispatch = dispatch

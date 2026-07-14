@@ -47,6 +47,13 @@ function Effort.active()
   return modal.win ~= nil and vim.api.nvim_win_is_valid(modal.win)
 end
 
+--- The modal's window (valid handle) while open, else nil. Consumed by init's
+--- focus-trap so a panel click bounces focus back here instead of stranding it.
+function Effort.win()
+  if Effort.active() then return modal.win end
+  return nil
+end
+
 -- Even column centres for the 5 slots across an interior [lm, W-rm]. Used by both
 -- the marker row and the label row so the ▲ sits over its level.
 local function slot_centers(width)
@@ -190,10 +197,9 @@ function Effort.open(current, on_confirm)
   map("<CR>",    confirm)
   map("<Esc>",   Effort.close)
   map("q",       Effort.close)
-  -- Closing on focus loss keeps it modal-ish: clicking away dismisses it.
-  vim.api.nvim_create_autocmd({ "WinLeave", "BufLeave" }, {
-    buffer = modal.buf, once = true, callback = function() Effort.close() end,
-  })
+  -- No close-on-focus-loss: init's WinEnter focus-trap keeps the panel from
+  -- stealing focus (a click on the panel bounces back here), and <Esc>/q are the
+  -- explicit dismiss. Alt+w still reaches the editor — only the panel is trapped.
 
   render()
 end

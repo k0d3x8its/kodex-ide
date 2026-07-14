@@ -918,6 +918,31 @@ feed({ type = "system", subtype = "compact_boundary", compact_metadata = {
 H.check("S27 autocompact renders the receipt with derived drop + auto trigger",
   panel_text():find("Compacted 50.0K → 8.0K tokens (−42.0K) · auto", 1, true) ~= nil, panel_text())
 
+-- ── S27b: compact modal suppresses the in-body "Typing" activity line ───────────
+-- Regression: during compaction state.working stays true and tool_run is nil, so the
+-- spinner's typing-placeholder used to paint a "●∙∙ Typing" line ON TOP of the
+-- compact modal. Two 110ms timers appending to the buffer tail broke the "typing
+-- block is the last two lines" invariant, orphaning a fresh Typing line every tick
+-- (the flood) and desyncing the compact extmark into a doubled modal line. The
+-- compact modal now owns the tail: in_typing_phase() is false while it is up.
+claude.state.tool_run = nil
+claude.state.working  = true
+feed({ type = "system", subtype = "status", status = "compacting" })
+H.check("S27b in_typing_phase is false while the compact modal is up",
+  claude._in_typing_phase() == false, tostring(claude._in_typing_phase()))
+-- Drive the spinner tick many times (as the 110ms timer would over a ~15s compact).
+for _ = 1, 60 do claude._tick_typing_ph() end
+H.check("S27b no in-body 'Typing' line is painted during compaction",
+  panel_text():find("Typing", 1, true) == nil, panel_text())
+H.check("S27b exactly one 'Compacting conversation…' modal line (no flood/dupe)",
+  count_occurrences(panel_text(), "Compacting conversation…") == 1, panel_text())
+-- Once the boundary lands, the modal clears and the typing phase is available again.
+feed({ type = "system", subtype = "compact_boundary", compact_metadata = {
+  trigger = "manual", pre_tokens = 30000, post_tokens = 6000 } })
+H.check("S27b typing phase resumes after the compact modal finalizes",
+  claude._in_typing_phase() == true, tostring(claude._in_typing_phase()))
+claude.state.working = false
+
 -- ── S28: rate-limit block (F5) ─────────────────────────────────────────────────
 -- rate_limit_event is per-turn telemetry: status="allowed" renders NOTHING; a real
 -- limit (any other status) renders an informational block, de-duped across turns.

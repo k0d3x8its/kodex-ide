@@ -1670,6 +1670,10 @@ end
 local function dispatch(event)
   local ev_type = event.type or ""
 
+  -- F8: panel_buf dead (manual :bd or reset race) → drop rather than crash in a
+  -- renderer. All downstream paths — including subagent inline render — use panel_buf.
+  if not (state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf)) then return end
+
   -- Subagent inner-event routing. A spawned Agent/Task subagent's inner activity
   -- (thinking/tool_use/tool_result) streams tagged with parent_tool_use_id = the
   -- spawning Agent tool_use id; main-session events carry null. Accumulate the raw
@@ -1725,11 +1729,17 @@ local function dispatch(event)
     -- once (first non-empty wins; a later empty init must not wipe it).
     if type(event.slash_commands) == "table" and #event.slash_commands > 0
         and not state.slash_commands then
-      state.slash_commands = event.slash_commands
+      -- F10: keep only plain strings — a corrupted cache or future CLI change
+      -- emitting non-string elements causes name:match crashes in all_commands().
+      local slash_names = {}
+      for _, cmd in ipairs(event.slash_commands) do
+        if type(cmd) == "string" then slash_names[#slash_names + 1] = cmd end
+      end
+      state.slash_commands = slash_names
       -- Persist for next session so the "/" menu works before the first message
       -- (the CLI only advertises the list here, AFTER the first turn). Deferred so
       -- the require doesn't run on every non-init event.
-      require(require_prefix .. "slash").save_cache(event.slash_commands)
+      require(require_prefix .. "slash").save_cache(slash_names)
     end
     state.system_ready = true
     -- working hint already set by send(); don't clobber it

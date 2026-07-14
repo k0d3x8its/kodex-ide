@@ -802,4 +802,146 @@ feed({ type = "assistant", message = { content = { {
 H.check("S23 error/empty advisor result shows 'Advisor unavailable'",
   panel_text():find("Advisor unavailable", 1, true) ~= nil, panel_text())
 
+-- ── S24: live thinking-token count collapses to K past 1,100 ───────────────────
+-- Below the 1,100 threshold the raw integer shows; at/above it collapses to a
+-- one-decimal "K" form (uppercase K, by request). Boundary + representative cases.
+H.check("S24 sub-threshold token count stays a raw integer",
+  claude._fmt_think_tokens(632) == "632", claude._fmt_think_tokens(632))
+H.check("S24 just below 1,100 stays raw",
+  claude._fmt_think_tokens(1099) == "1099", claude._fmt_think_tokens(1099))
+H.check("S24 exactly 1,100 collapses to 1.1K",
+  claude._fmt_think_tokens(1100) == "1.1K", claude._fmt_think_tokens(1100))
+H.check("S24 2504 → 2.5K",
+  claude._fmt_think_tokens(2504) == "2.5K", claude._fmt_think_tokens(2504))
+-- And the spinner bracket actually uses it (not the raw %d anymore).
+claude.state.think_start  = vim.loop.now()
+claude.state.think_tokens = 2504
+local klbl = claude._spinner_label() or ""
+H.check("S24 spinner bracket shows the K-form token count",
+  klbl:find("2.5K tokens", 1, true) ~= nil, klbl)
+claude.state.think_start  = nil
+claude.state.think_tokens = 0
+
+-- ── S25: Artifact tool_use header + published-URL result ───────────────────────
+-- A publish renders "● Artifact(<target>)" then a "└ published · <url>" line from
+-- the RESULT (URL pattern-matched out of the result text, not a fixed field).
+claude.state.tool_run = nil
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "toolu_art1", name = "Artifact",
+  input = { file_path = "/tmp/foo/report.md", description = "A report" },
+} } } })
+H.check("S25 Artifact tool_use renders the '● Artifact(<target>)' header",
+  panel_text():find("● Artifact(", 1, true) ~= nil, panel_text())
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "toolu_art1",
+  content = "Artifact published: https://claude.ai/code/artifact/abc-123",
+} } } })
+H.check("S25 Artifact result renders the 'published · <url>' line",
+  panel_text():find("published · https://claude.ai/code/artifact/abc%-123") ~= nil, panel_text())
+
+-- A `list` result carries MANY URLs → every one renders (not just the first).
+claude.state.tool_run = nil
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "toolu_art2", name = "Artifact",
+  input = { action = "list" },
+} } } })
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "toolu_art2",
+  content = "1. Alpha https://claude.ai/code/artifact/aaa\n2. Beta https://claude.ai/code/artifact/bbb",
+} } } })
+H.check("S25 Artifact list renders all URLs (first)",
+  panel_text():find("https://claude.ai/code/artifact/aaa", 1, true) ~= nil, panel_text())
+H.check("S25 Artifact list renders all URLs (second)",
+  panel_text():find("https://claude.ai/code/artifact/bbb", 1, true) ~= nil, panel_text())
+
+-- An ERROR result (no URL) falls back to the generic body — nothing swallowed.
+claude.state.tool_run = nil
+feed({ type = "assistant", message = { content = { {
+  type = "tool_use", id = "toolu_art3", name = "Artifact",
+  input = { file_path = "/tmp/foo/bad.md" },
+} } } })
+feed({ type = "user", message = { content = { {
+  type = "tool_result", tool_use_id = "toolu_art3", is_error = true,
+  content = "Publish failed: CSP violation",
+} } } })
+H.check("S25 Artifact error result falls back to the generic body",
+  panel_text():find("Publish failed", 1, true) ~= nil, panel_text())
+
+-- ── S26: compact-summary string content does not crash dispatch ────────────────
+-- /compact (and autocompact) inject a message whose `content` is a plain STRING, not
+-- a block array. Every dispatch content-loop assumed an array → "bad argument #1 to
+-- 'ipairs' (table expected, got string)" crashed the whole turn (2026-07-13). Feeding
+-- both a user- and assistant-shaped string-content message must now be a clean no-op.
+claude.state.tool_run = nil
+local ok_u = pcall(function()
+  feed({ type = "user", message = { content = "Compact summary: prior turns condensed." } })
+end)
+H.check("S26 string-content user event does not crash dispatch", ok_u, tostring(ok_u))
+local ok_a = pcall(function()
+  feed({ type = "assistant", message = { content = "A plain string body." } })
+end)
+H.check("S26 string-content assistant event does not crash dispatch", ok_a, tostring(ok_a))
+-- The full captured compact lifecycle (status compacting → done → init → boundary)
+-- also dispatches cleanly.
+local ok_c = pcall(function()
+  feed({ type = "system", subtype = "status", status = "compacting" })
+  feed({ type = "system", subtype = "status", status = vim.NIL, compact_result = "success" })
+  feed({ type = "system", subtype = "init", model = "claude-opus-4-8" })
+  feed({ type = "system", subtype = "compact_boundary", compact_metadata = {
+    trigger = "manual", pre_tokens = 30762, post_tokens = 6127,
+    cumulative_dropped_tokens = 24635, duration_ms = 17494 } })
+end)
+H.check("S26 full compact lifecycle dispatches cleanly", ok_c, tostring(ok_c))
+
+-- ── S27: /compact modal → token receipt (F4) ───────────────────────────────────
+-- status="compacting" opens the animated modal; compact_boundary replaces it in place
+-- with a pre→post/dropped token receipt. No incremental %% exists in the stream.
+claude.state.tool_run = nil
+feed({ type = "system", subtype = "status", status = "compacting" })
+H.check("S27 compacting shows the modal line",
+  panel_text():find("Compacting conversation", 1, true) ~= nil, panel_text())
+feed({ type = "system", subtype = "compact_boundary", compact_metadata = {
+  trigger = "manual", pre_tokens = 40000, post_tokens = 5000,
+  cumulative_dropped_tokens = 35000 } })
+H.check("S27 boundary replaces the modal with a token receipt",
+  panel_text():find("Compacted 40.0K → 5.0K tokens", 1, true) ~= nil, panel_text())
+H.check("S27 receipt shows dropped total + trigger",
+  panel_text():find("(−35.0K) · manual", 1, true) ~= nil, panel_text())
+H.check("S27 animated modal line is gone once the receipt lands",
+  count_occurrences(panel_text(), "Compacting conversation…") == 0, panel_text())
+
+-- Autocompact populates the SAME modal (trigger="auto"); dropped is derived when the
+-- boundary omits cumulative_dropped_tokens (pre-post).
+feed({ type = "system", subtype = "status", status = "compacting" })
+feed({ type = "system", subtype = "compact_boundary", compact_metadata = {
+  trigger = "auto", pre_tokens = 50000, post_tokens = 8000 } })
+H.check("S27 autocompact renders the receipt with derived drop + auto trigger",
+  panel_text():find("Compacted 50.0K → 8.0K tokens (−42.0K) · auto", 1, true) ~= nil, panel_text())
+
+-- ── S28: rate-limit block (F5) ─────────────────────────────────────────────────
+-- rate_limit_event is per-turn telemetry: status="allowed" renders NOTHING; a real
+-- limit (any other status) renders an informational block, de-duped across turns.
+claude.state.tool_run = nil
+feed({ type = "rate_limit_event", rate_limit_info = {
+  status = "allowed", resetsAt = 1783997400, rateLimitType = "five_hour" } })
+H.check("S28 allowed status renders no block",
+  panel_text():find("Rate limit reached", 1, true) == nil, panel_text())
+feed({ type = "rate_limit_event", rate_limit_info = {
+  status = "rejected", resetsAt = 1783997400, rateLimitType = "five_hour" } })
+H.check("S28 an actual limit renders the block (type shown)",
+  panel_text():find("Rate limit reached (five hour)", 1, true) ~= nil, panel_text())
+H.check("S28 block lists the reset time + wait option",
+  panel_text():find("Resets at", 1, true) ~= nil
+    and panel_text():find("Stop and wait for the limit to reset", 1, true) ~= nil, panel_text())
+feed({ type = "rate_limit_event", rate_limit_info = {
+  status = "rejected", resetsAt = 1783997400, rateLimitType = "five_hour" } })
+H.check("S28 the same limit reported again is NOT duplicated",
+  count_occurrences(panel_text(), "Rate limit reached") == 1, panel_text())
+-- Back under the limit clears the de-dupe latch so a future limit re-shows.
+feed({ type = "rate_limit_event", rate_limit_info = { status = "allowed" } })
+feed({ type = "rate_limit_event", rate_limit_info = {
+  status = "rejected", resetsAt = 1783999999, rateLimitType = "five_hour" } })
+H.check("S28 a new limit after recovery re-shows the block",
+  count_occurrences(panel_text(), "Rate limit reached") == 2, panel_text())
+
 H.summary("claude_stream")

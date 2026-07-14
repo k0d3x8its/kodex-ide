@@ -1392,24 +1392,48 @@ mod._stop_process     = process.stop_process
 -- Public submit used by the input float: send immediately when idle, otherwise
 -- queue (type-ahead while Claude is working, like the Claude Code TUI).
 local function submit(text)
+  -- A slash command may sit ANYWHERE in the prompt — mid-sentence, after args, or on
+  -- any line of a multi-line bar — not just line-leading. Scan the whole prompt for
+  -- the first EXACT known command token; the invocation is that "/…" run to the end
+  -- of ITS line (so "/model sonnet" keeps its arg while a following line isn't
+  -- swallowed). A command owns the submission: surrounding prose is dropped, matching
+  -- how these turn-level actions behave when typed alone. No command found → the
+  -- prose is sent verbatim. Mirrors the anywhere-in-prompt highlight in the chat bar.
+  local command
+  for _, ln in ipairs(vim.split(text, "\n", { plain = true })) do
+    local s, _, name = ln:find("/([%w:_%-]+)")
+    while s do
+      if slash.is_command(name) then command = ln:sub(s); break end
+      s, _, name = ln:find("/([%w:_%-]+)", s + 1)
+    end
+    if command then break end
+  end
+  local target = command or text
+
   -- Intercept the panel-local /effort command: "/effort <level>" applies directly,
   -- a bare "/effort" opens the slider. Never sent to the CLI as a message.
-  local level = text:match("^/effort%s*(%S*)$")
+  local level = target:match("^/effort%s*(%S*)$")
   if level ~= nil then
     mod.pick_effort(level ~= "" and level or nil)
     return
   end
   -- Intercept the panel-local /advisor command: "/advisor <model>" applies directly,
   -- a bare "/advisor" opens the picker. Never sent to the CLI as a message.
-  local adv = text:match("^/advisor%s*(%S*)$")
+  local adv = target:match("^/advisor%s*(%S*)$")
   if adv ~= nil then
     mod.pick_advisor(adv ~= "" and adv or nil)
     return
   end
-  if state.working then
-    enqueue(text)
+
+  -- A CLI slash command (e.g. /compact) found somewhere in the prompt: echo the user's
+  -- FULL text in the transcript, but dispatch only the extracted "/command" so the CLI
+  -- actually runs it (it won't parse a command buried mid-message). No command → the
+  -- whole prose is both echoed and sent. (In-flight turns queue the command; the rare
+  -- mid-sentence-during-work case dispatches the command without the prose echo.)
+  if command then
+    if state.working then enqueue(command) else send(text, command) end
   else
-    send(text)
+    if state.working then enqueue(text) else send(text) end
   end
 end
 
@@ -1605,6 +1629,10 @@ local function open_chat_float(title, callback, opts)
   end
   local function update_slash_menu()
     if not vim.api.nvim_buf_is_valid(ibuf) then return end
+    -- Seed the command universe from the disk cache before any matching, so slash
+    -- commands highlight + populate the menu on the FIRST keystroke — before a prompt
+    -- has been sent and the CLI has advertised its list. Idempotent + cheap.
+    slash.ensure_commands()
     vim.api.nvim_buf_clear_namespace(ibuf, slash_ns, 0, -1)
     local lnum = vim.api.nvim_buf_line_count(ibuf) - 1
     local line = vim.api.nvim_buf_get_lines(ibuf, lnum, lnum + 1, false)[1] or ""
@@ -1621,7 +1649,11 @@ local function open_chat_float(title, callback, opts)
     -- Only a leading "/" with no whitespace => still composing a command: drive the
     -- picker menu above the bar and colour the partial prefix while it still matches.
     local query = typed:match("^/([^%s]*)$")
-    if query ~= nil then
+    -- Open the picker only while the leading "/query" still matches ≥1 command: a bare
+    -- "/" lists everything, and the menu DISAPPEARS the moment the typed letters match
+    -- nothing (has_prefix false) instead of lingering on an empty diagnostic — the
+    -- requested "populate on /, vanish when it stops matching" behaviour.
+    if query ~= nil and slash.has_prefix(query) then
       -- Menu floats just above the bar. Use the bar window's LIVE height (interior +
       -- 2 border) so the small gap stays constant regardless of the meter row / wrap
       -- growth — a stale tracked height put the menu a row too high.
@@ -1630,34 +1662,34 @@ local function open_chat_float(title, callback, opts)
         bar_rows = vim.api.nvim_win_get_config(win).height + 2
       end
       slash.open(ibuf, query, bar_rows, on_slash_accept)
-      -- Colour the "/query" span clay ONLY while it's still a live command prefix;
-      -- once the typed letters match nothing, leave it PLAIN (not red) — the
-      -- highlight signals "this is a potential command", then drops off when it
-      -- obviously isn't one anymore.
-      if slash.has_prefix(query) then
-        vim.api.nvim_buf_set_extmark(ibuf, slash_ns, lnum, prefix_len, {
-          end_col = #line, hl_group = "ClaudeSlashMatch",
-        })
-      end
+      -- Colour the "/query" span clay while it's a live command prefix.
+      vim.api.nvim_buf_set_extmark(ibuf, slash_ns, lnum, prefix_len, {
+        end_col = #line, hl_group = "ClaudeSlashMatch",
+      })
     else
       if slash.active() then slash.close() end
     end
 
-    -- Anywhere-in-line highlight: colour every "/token" that is still a live command
-    -- PREFIX, so a command typed mid-sentence or after args lights up as you type and
-    -- turns plain again the moment the letters stop matching any command (same
-    -- signal as the leading composer). Scans the whole line, so "run /brainstorm now"
-    -- and a half-typed "/brai" both colour, while "/braix" drops back to plain.
-    local from = 1
-    while true do
-      local s, e, tok = line:find("/([%w:_%-]+)", from)
-      if not s then break end
-      if slash.has_prefix(tok) then
-        vim.api.nvim_buf_set_extmark(ibuf, slash_ns, lnum, s - 1, {
-          end_col = e, hl_group = "ClaudeSlashMatch",
-        })
+    -- Anywhere-in-prompt highlight: colour every "/token" that is still a live command
+    -- PREFIX, on EVERY line of the bar (not just the active last line) — so a command
+    -- typed mid-sentence, after args, or on an earlier line all light up as you type
+    -- and turn plain again the moment the letters stop matching any command. Scans
+    -- each line, so "run /brainstorm now" and a half-typed "/brai" both colour, while
+    -- "/braix" drops back to plain. submit() mirrors this: a recognised command
+    -- ANYWHERE in the whole prompt is executed, so the colour is a truthful affordance.
+    local all_lines = vim.api.nvim_buf_get_lines(ibuf, 0, -1, false)
+    for i, l in ipairs(all_lines) do
+      local from = 1
+      while true do
+        local s, e, tok = l:find("/([%w:_%-]+)", from)
+        if not s then break end
+        if slash.has_prefix(tok) then
+          vim.api.nvim_buf_set_extmark(ibuf, slash_ns, i - 1, s - 1, {
+            end_col = e, hl_group = "ClaudeSlashMatch",
+          })
+        end
+        from = e + 1
       end
-      from = e + 1
     end
   end
 
@@ -2192,14 +2224,19 @@ local function open_panel_window(buf)
     group = grp,
     callback = function()
       if not state.claude_active then return end
-      if vim.api.nvim_get_current_win() ~= state.panel_win then return end
       local mwin = active_modal_win()
       if not mwin then return end
+      -- Trap ONLY the panel. With a decision card open, a click on the Claude panel
+      -- BEHIND the card would strand it without key focus — bounce straight back so
+      -- the card keeps control until it is dealt with (Esc/q or a decision), which
+      -- then returns focus to the panel. Clicking the EDITOR is deliberately allowed:
+      -- the user may want to read/scroll code while a card waits. Scheduled because
+      -- set_current_win is rejected mid-WinEnter on some paths, and the defer lets a
+      -- modal's own late win-assignment settle before we re-check the current window.
       vim.schedule(function()
-        if vim.api.nvim_win_is_valid(mwin)
-            and vim.api.nvim_get_current_win() == state.panel_win then
-          pcall(vim.api.nvim_set_current_win, mwin)
-        end
+        if not vim.api.nvim_win_is_valid(mwin) then return end
+        if vim.api.nvim_get_current_win() ~= state.panel_win then return end
+        pcall(vim.api.nvim_set_current_win, mwin)
       end)
     end,
   })
@@ -2274,8 +2311,22 @@ local function open_panel_window(buf)
   vim.api.nvim_create_autocmd("WinEnter", {
     group = vim.api.nvim_create_augroup("ClaudeCursorBackstop", { clear = true }),
     callback = function()
-      if vim.o.guicursor == "a:ver1-ClaudeCursorHidden"
-          and vim.api.nvim_get_current_buf() ~= state.panel_buf then
+      -- Authoritative per-focus cursor state, applied SYNCHRONOUSLY on every WinEnter
+      -- (no defer — a deferred re-apply raced the focus-trap's own scheduled bounce and
+      -- regressed it). Hide the cursor over the panel AND every claude select-modal
+      -- (permission / question card / diff / effort / advisor) — arrow-driven read-only
+      -- surfaces where a block cursor is noise — and restore it everywhere else. This
+      -- both re-hides after the pairwise panel WinLeave restored a visible cursor on a
+      -- panel→modal bounce, and un-hides when focus lands on the editor (the leak the
+      -- original backstop guarded). The chat bar / question typing-prompt set their own
+      -- visible cursor and aren't in active_modal_win, so they fall to the restore arm.
+      local cur = vim.api.nvim_get_current_win()
+      if cur == state.panel_win or cur == active_modal_win() then
+        if vim.o.guicursor ~= "a:ver1-ClaudeCursorHidden" then
+          remember_real_gc()
+          vim.o.guicursor = "a:ver1-ClaudeCursorHidden"
+        end
+      elseif vim.o.guicursor == "a:ver1-ClaudeCursorHidden" then
         vim.o.guicursor = state.real_guicursor or "a:block,a:blinkon0"
       end
     end,

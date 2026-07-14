@@ -286,6 +286,16 @@ local function close_question_card(receipt, receipt_hl)
   end
 end
 
+-- F5 (FINDINGS § Q-ERROR-AUDIT): the session ended (CLI death or reset) with the
+-- question card still up — close it with a receipt saying why, WITHOUT a wire
+-- response (unlike cancel_question: there is no live request left to answer).
+-- close_question_card resumes the paused turn clock and clears the frozen
+-- "Waiting…" hint on its way out.
+function Question.abort_question_card(receipt)
+  if not state.qask then return end
+  close_question_card("✗ Questions dismissed — " .. receipt, "ClaudeDim")
+end
+
 -- A question counts as answered once it has a recorded pick (single-select option
 -- or custom text), or — for multiSelect — once the user has confirmed it with <CR>
 -- (picks[i] = { kind = "multi" }; the actual labels live in sel[i]).

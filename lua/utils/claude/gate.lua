@@ -302,6 +302,15 @@ local function resolve_permission(kind)
   if state.perm_reopen_bar then
     state.perm_reopen_bar = false
     vim.schedule(function() prompt_input() end)
+  elseif state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+    -- No chat bar to reopen: closing the float otherwise drops focus to whatever
+    -- window preceded it (usually the editor). Land back in the Claude panel so a
+    -- decision keeps the user inside the panel, not kicked out to the code buffer.
+    vim.schedule(function()
+      if vim.api.nvim_win_is_valid(state.panel_win) then
+        pcall(vim.api.nvim_set_current_win, state.panel_win)
+      end
+    end)
   end
 end
 Gate.resolve_permission = resolve_permission
@@ -482,6 +491,7 @@ local function open_permission_float(p)
     zindex    = 60,
   })
   p.win = win
+  core.hide_modal_cursor()   -- hide the cursor over the card at open (see core doc)
   if pet_attach_surface then pet_attach_surface(win) end
   -- Amber outline so the card is clearly NOT the clay chat bar; interior shares
   -- ClaudeBarBg so the box reads flush, only the outline pops.
@@ -732,6 +742,7 @@ local function open_diff_card_float(d)
     zindex    = 60,
   })
   d.win = win
+  core.hide_modal_cursor()   -- hide the cursor over the card at open (see core doc)
   if pet_attach_surface then pet_attach_surface(win) end
   -- Same amber outline as the permission card — both are "your decision needed"
   -- cards; a distinct colour per card type would read as two different systems.

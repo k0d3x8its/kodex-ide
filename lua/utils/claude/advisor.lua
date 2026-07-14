@@ -208,6 +208,7 @@ function Advisor.open(on_confirm)
   })
   vim.wo[modal.win].winhighlight = "NormalFloat:ClaudeSlashBg,FloatBorder:ClaudeSlashBorder"
   harden_float_scroll(modal.win)
+  core.hide_modal_cursor()   -- hide the cursor over the picker at open (see core doc)
   if pet_attach_surface then pet_attach_surface(modal.win) end
 
   local function map(lhs, fn)

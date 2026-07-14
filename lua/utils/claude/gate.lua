@@ -94,6 +94,35 @@ local function send_permission_response(request_id, decision, o)
 end
 Gate.send_permission_response = send_permission_response
 
+-- F3 (FINDINGS § Q-ERROR-AUDIT): every control_request expects a control_response.
+-- A subtype the dispatcher doesn't implement, silently dropped, blocks the CLI's
+-- turn forever behind the spinner — answer with the protocol's error variant so the
+-- CLI fails the request and moves on. WARN once per subtype per session: the same
+-- unimplemented subtype tends to repeat every turn (one toast, not a storm).
+local unknown_control_warned = {}
+local function send_control_error(request_id, subtype)
+  if state.job_id then
+    local msg = vim.json.encode({
+      type     = "control_response",
+      response = {
+        subtype    = "error",
+        request_id = request_id,
+        error      = "control_request subtype not supported by the panel: " .. subtype,
+      },
+    })
+    pcall(vim.fn.chansend, state.job_id, msg .. "\n")
+  end
+  if not unknown_control_warned[subtype] then
+    unknown_control_warned[subtype] = true
+    vim.notify(
+      "Claude panel: unhandled control_request subtype '" .. subtype
+        .. "' — answered with an error so the CLI is not blocked",
+      vim.log.levels.WARN
+    )
+  end
+end
+Gate.send_control_error = send_control_error
+
 -- Edit-family tools at the can_use_tool gate. GATED ones (Issue-B prototype:
 -- Write/Edit) hold the request open and show a PRE-write diff reconstructed from
 -- the tool input — accept releases "allow" (the CLI then writes + narrates,

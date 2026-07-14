@@ -1018,4 +1018,92 @@ if panel and vim.api.nvim_win_is_valid(panel) then
   pcall(vim.api.nvim_win_close, mwin, true)
 end
 
+-- ── S30: null-riddled event corpus — vim.NIL must never reach a renderer ───────
+-- vim.json.decode maps JSON null → vim.NIL, a TRUTHY userdata, so the pervasive
+-- `field or fallback` idiom passes userdata into concat/split/ipairs and throws
+-- mid-dispatch (FINDINGS § Q-ERROR-AUDIT F1). on_stdout deep-strips vim.NIL right
+-- after decode, so this corpus — every audit crash site fed a null field — must
+-- dispatch without a single scheduled error. The schedule hook records errors
+-- directly (not via notify) so the check stays meaningful without the F2 wrapper.
+local scheduled_errors = {}
+local real_schedule = vim.schedule
+vim.schedule = function(callback)
+  real_schedule(function()
+    local ok, err = pcall(callback)
+    if not ok then table.insert(scheduled_errors, tostring(err)) end
+  end)
+end
+
+-- system/init with null model/version (friendly_model + patch_banner sites)
+feed({ type = "system", subtype = "init", model = vim.NIL,
+  claude_code_version = vim.NIL, version = vim.NIL })
+-- assistant: null prose text + Edit/Write tool_use with null paths/strings
+-- (render_prose, tool_target, edit_counts, render_write_body sites)
+feed({ type = "assistant", message = { content = {
+  { type = "text", text = vim.NIL },
+  { type = "tool_use", id = "t-null-1", name = "Edit",
+    input = { file_path = vim.NIL, old_string = vim.NIL, new_string = vim.NIL } },
+  { type = "tool_use", id = "t-null-2", name = "Write",
+    input = { file_path = vim.NIL, content = vim.NIL } },
+} } })
+-- task widget with a null subject (render_todo_lines concat site)
+feed({ type = "assistant", message = { content = {
+  { type = "tool_use", id = "t-null-3", name = "TaskCreate",
+    input = { subject = vim.NIL, description = vim.NIL } },
+} } })
+-- AskUserQuestion with null questions → must take the empty auto-allow path,
+-- not crash on #vim.NIL
+feed({ type = "control_request", request_id = "q-null-1", request = {
+  subtype = "can_use_tool", tool_name = "AskUserQuestion",
+  input = { questions = vim.NIL } } })
+H.check("S30 null corpus dispatches without a scheduled error",
+  #scheduled_errors == 0, table.concat(scheduled_errors, " | "))
+
+-- Permission card: null display_name/suggestions must fall back to tool_name —
+-- pre-fix the card crashed before opening and the CLI hung on the unanswered gate.
+feed({ type = "control_request", request_id = "p-null-1", request = {
+  subtype = "can_use_tool", tool_name = "Bash",
+  input = { command = "ls" },
+  display_name = vim.NIL, permission_suggestions = vim.NIL } })
+H.check("S30 permission card with null display_name opens on the tool_name fallback",
+  claude.state.perm ~= nil and #scheduled_errors == 0,
+  "perm=" .. tostring(claude.state.perm) .. " errs=" .. table.concat(scheduled_errors, " | "))
+if claude.state.perm then
+  require("utils.claude.gate").resolve_permission("deny")
+  vim.wait(30)
+end
+vim.schedule = real_schedule
+
+-- ── S31: dispatch error isolation — a renderer throw must not kill the stream ──
+-- FINDINGS § Q-ERROR-AUDIT F2: process.on_stdout scheduled a BARE dispatch(event),
+-- so any renderer throw became an unhandled scheduled-callback error, spamming one
+-- error per further event and leaving the panel `modifiable` when the throw landed
+-- between a modifiable=true…false seam. The wrapper pcalls dispatch, re-locks the
+-- buffer, and notifies ONCE per turn. text=42 throws in vim.split (a type error the
+-- vim.NIL normalizer deliberately does not paper over).
+local error_notices = 0
+local real_notify = vim.notify
+vim.notify = function(message, level)
+  if level == vim.log.levels.ERROR and tostring(message):find("render error", 1, true) then
+    error_notices = error_notices + 1
+  end
+end
+
+feed({ type = "assistant", message = { content = { { type = "text", text = 42 } } } })
+H.check("S31 renderer throw is caught and notified once", error_notices == 1,
+  "notices=" .. error_notices)
+H.check("S31 panel buffer is re-locked after the throw",
+  vim.bo[claude.state.panel_buf].modifiable == false)
+feed({ type = "assistant", message = { content = { { type = "text", text = 42 } } } })
+H.check("S31 further throws in the same turn do not re-notify", error_notices == 1,
+  "notices=" .. error_notices)
+-- A new turn re-arms the notice so the NEXT broken turn is not silent.
+claude._send("next turn")
+vim.wait(30)
+feed({ type = "assistant", message = { content = { { type = "text", text = 42 } } } })
+H.check("S31 a new turn re-arms the error notice", error_notices == 2,
+  "notices=" .. error_notices)
+feed({ type = "result", result = "ok", total_cost_usd = 0.01 })
+vim.notify = real_notify
+
 H.summary("claude_stream")

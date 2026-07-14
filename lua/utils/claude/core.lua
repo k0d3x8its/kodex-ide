@@ -414,4 +414,17 @@ Core.free_below  = free_below
 --- Wire init.lua's set_bottom_pad into buf_append's auto-follow pad path.
 function Core.wire_set_bottom_pad(bottom_pad_setter) set_bottom_pad = bottom_pad_setter end
 
+--- Hide the cursor over a just-opened modal float. The panel's WinEnter backstop
+--- keeps the cursor hidden while a select-modal holds focus, but it fires DURING the
+--- modal's nvim_open_win — before the modal has assigned its state.<x>.win — so it
+--- can't recognise the modal yet and leaves the cursor visible for the open frame.
+--- Each modal calls this right after it assigns its win to close that gap. Stashes
+--- the real (visible) guicursor first so the backstop can restore it on the way out.
+function Core.hide_modal_cursor()
+  if vim.o.guicursor ~= "a:ver1-ClaudeCursorHidden" then
+    state.real_guicursor = vim.o.guicursor
+  end
+  vim.o.guicursor = "a:ver1-ClaudeCursorHidden"
+end
+
 return Core

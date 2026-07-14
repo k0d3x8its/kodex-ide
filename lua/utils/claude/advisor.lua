@@ -63,6 +63,13 @@ function Advisor.active()
   return modal.win ~= nil and vim.api.nvim_win_is_valid(modal.win)
 end
 
+--- The modal's window (valid handle) while open, else nil. Consumed by init's
+--- focus-trap so a panel click bounces focus back here instead of stranding it.
+function Advisor.win()
+  if Advisor.active() then return modal.win end
+  return nil
+end
+
 -- Greedy word-wrap `text` to `width` columns; returns a list of lines. Used for
 -- the blurb/recommended notes so they never overflow the panel-width float.
 local function wrap(text, width)
@@ -213,9 +220,8 @@ function Advisor.open(on_confirm)
   map("<CR>",    confirm)
   map("<Esc>",   Advisor.close)
   map("q",       Advisor.close)
-  vim.api.nvim_create_autocmd({ "WinLeave", "BufLeave" }, {
-    buffer = modal.buf, once = true, callback = function() Advisor.close() end,
-  })
+  -- No close-on-focus-loss: init's WinEnter focus-trap keeps the panel from
+  -- stealing focus (a click on the panel bounces back here); <Esc>/q dismiss.
 
   local n = render()
   if modal.win and vim.api.nvim_win_is_valid(modal.win) then

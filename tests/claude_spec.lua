@@ -733,6 +733,45 @@ H.check("T18 multiSelect answer is an array of chosen labels",
   type(arr) == "table" and arr[1] == "Red" and arr[2] == "Blue" and #arr == 2,
   vim.inspect(arr))
 
+-- No note set → updatedInput carries NO annotations key (only added when a note
+-- exists). Re-check the multiSelect submit above (rq3) which set no note.
+H.check("T18 no note → no annotations key in updatedInput",
+  rq3 and rq3.response.response.updatedInput.annotations == nil,
+  vim.inspect(rq3 and rq3.response.response.updatedInput))
+
+-- Note ("n to add notes"): rides updatedInput.annotations, keyed by question TEXT
+-- with a `notes` sub-field, PER QUESTION. This is the schema-backed channel — a note
+-- stuffed into `answers` is dropped by the tool's answer key-matching (the reported
+-- "Claude never saw my note" bug), so it MUST travel here.
+feed({
+  type       = "control_request",
+  request_id = "req-ask-note",
+  request    = {
+    subtype   = "can_use_tool",
+    tool_name = "AskUserQuestion",
+    input     = { questions = {
+      { question = "Depth?", header = "Depth", multiSelect = false,
+        options = { { label = "Low" }, { label = "High" } } },
+      { question = "Scope?", header = "Scope", multiSelect = false,
+        options = { { label = "Repo" }, { label = "File" } } },
+    } },
+  },
+})
+claude.state.qask.notes[1] = "trace T4 sinks only"   -- note on Q1 (via `n` in real UI)
+claude._select_question_choice()                     -- answer Q1 = Low, advance to Q2
+claude._select_question_choice()                     -- answer Q2 = Repo, submit
+local rqn = last_control_response()
+local ann = rqn and rqn.response.response.updatedInput.annotations
+H.check("T18 note delivered via annotations[question].notes (per question)",
+  ann and ann["Depth?"] and ann["Depth?"].notes == "trace T4 sinks only",
+  vim.inspect(rqn and rqn.response.response.updatedInput))
+H.check("T18 un-noted question gets no annotation entry",
+  ann and ann["Scope?"] == nil, vim.inspect(ann))
+H.check("T18 answers still ride alongside the note",
+  rqn and rqn.response.response.updatedInput.answers["Depth?"] == "Low"
+    and rqn.response.response.updatedInput.answers["Scope?"] == "Repo",
+  vim.inspect(rqn and rqn.response.response.updatedInput.answers))
+
 -- Cancel → allow with NO answers key (the clean dismiss).
 feed({
   type       = "control_request",

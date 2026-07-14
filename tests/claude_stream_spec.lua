@@ -969,4 +969,32 @@ feed({ type = "rate_limit_event", rate_limit_info = {
 H.check("S28 a new limit after recovery re-shows the block",
   count_occurrences(panel_text(), "Rate limit reached") == 2, panel_text())
 
+-- ── S29: modal focus-trap — a panel click bounces focus back to the modal ───────
+-- Regression: with a decision card open, clicking the panel (or an Alt+w cycle
+-- landing on it) fired WinEnter for the panel and stranded the modal without key
+-- control. open_panel_window's WinEnter trap bounces focus back to the active modal
+-- (only the panel is trapped — the editor stays reachable, so Alt+w still switches).
+local panel = claude.state.panel_win
+if panel and vim.api.nvim_win_is_valid(panel) then
+  local mbuf = vim.api.nvim_create_buf(false, true)
+  local mwin = vim.api.nvim_open_win(mbuf, true, {
+    relative = "editor", row = 1, col = 1, width = 12, height = 3, style = "minimal",
+  })
+  claude.state.perm = { win = mwin }   -- stand-in for an open permission card
+  H.check("S29 active_modal_win routes to the open card win",
+    claude._active_modal_win() == mwin, tostring(claude._active_modal_win()))
+  -- Simulate the panel click: focus the panel, then let the scheduled bounce run.
+  vim.api.nvim_set_current_win(panel)
+  vim.wait(100, function() return vim.api.nvim_get_current_win() == mwin end)
+  H.check("S29 focusing the panel bounces back to the modal",
+    vim.api.nvim_get_current_win() == mwin, tostring(vim.api.nvim_get_current_win()))
+  -- Once the modal is gone the panel is no longer trapped.
+  claude.state.perm = nil
+  vim.api.nvim_set_current_win(panel)
+  vim.wait(50)
+  H.check("S29 no bounce once no modal is open",
+    vim.api.nvim_get_current_win() == panel, tostring(vim.api.nvim_get_current_win()))
+  pcall(vim.api.nvim_win_close, mwin, true)
+end
+
 H.summary("claude_stream")

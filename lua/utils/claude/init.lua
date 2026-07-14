@@ -1410,6 +1410,7 @@ process.wire({
   attach_host_context = attach_host_context,
   FLAVOR              = FLAVOR,
   claude_bin          = mod.CLAUDE_BIN,
+  abort_decision_state = render.abort_decision_state,  -- F5+F9 sweep on CLI death
 })
 
 -- Re-source the process functions init still calls directly (submit path,
@@ -2506,7 +2507,6 @@ function mod.reset()
   state.working       = false
   state.system_ready  = false
   state.diff_pending  = false
-  state.prewrite      = nil
   state.host_file     = nil
   state.host_ctx_last_path = nil
   state.tool_results  = {}
@@ -2530,17 +2530,14 @@ function mod.reset()
   -- Clawd: tear down the renderer too (kitty delete + timers + float) so no image
   -- artifact survives the reset; the fresh panel re-attaches its own pet.
   pcall(pet_render.teardown)
-  if state.perm and state.perm.win and vim.api.nvim_win_is_valid(state.perm.win) then
-    pcall(vim.api.nvim_win_close, state.perm.win, true)
-  end
-  state.perm          = nil
-  -- Deny any permission requests still queued behind the card (parallel tool_use):
-  -- they hold an open control_request the CLI is blocked on, so leaving them unanswered
-  -- across a reset hangs the turn. Reset tears the session down anyway, so deny is safe.
-  for _, ev in ipairs(state.perm_queue or {}) do
-    gate.send_permission_response(ev.request_id, "deny", { message = "Session reset" })
-  end
-  state.perm_queue    = nil
+  -- F5+F9 sweep: close the permission/question cards, deny the queued requests
+  -- (they hold open control_requests the CLI is blocked on), reject a held
+  -- pre-write gate, and stop the compact zombie timer — the same teardown
+  -- on_exit runs on CLI death. stop_process() above already nulled job_id, so
+  -- when its async on_exit fires the sweep re-runs as a no-op (every branch
+  -- guards on its own, now-cleared state). state.prewrite is cleared by the
+  -- sweep, not the bulk block above, so the diff windows close with it.
+  render.abort_decision_state("session reset")
   if state.diff_card and state.diff_card.win and vim.api.nvim_win_is_valid(state.diff_card.win) then
     pcall(vim.api.nvim_win_close, state.diff_card.win, true)
   end

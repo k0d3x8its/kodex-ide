@@ -376,6 +376,17 @@ local function all_commands()
     suffix_seen[name:match("([^:]+)$") or name] = true   -- "plugin:skill" ⇒ "skill"
   end
   for _, name in ipairs(LOCAL_COMMANDS) do push(name) end
+  -- CLI built-ins ship INSIDE the claude binary and are advertised in slash_commands[]
+  -- only once system/init fires — which happens after the FIRST message is sent. Until
+  -- then, seed them from BUILTIN_DESC so /compact, /clear, /config, … are a known
+  -- command universe from the very first keystroke, before any prompt (the reported
+  -- "slash commands don't highlight before an initial prompt" bug). Gate on the live
+  -- list being empty: once init arrives it is authoritative and already includes these,
+  -- so we don't want the static fallback second-guessing it (keeps the menu identical
+  -- before and after the first message).
+  if not (state.slash_commands and #state.slash_commands > 0) then
+    for name in pairs(BUILTIN_DESC) do push(name) end
+  end
   -- Disk-discovered skills/commands (see disk_command_names): the source that makes
   -- newly-created skills appear without a CLI re-advertise. Skip any name already
   -- advertised exactly OR present as the suffix of a namespaced advertised name

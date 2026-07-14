@@ -60,6 +60,7 @@ local set_hint
 local attach_host_context   -- first-turn @<file> mention (host-ctx cluster stays in init)
 local FLAVOR                -- flavour-word table (its DONE twin stays in init)
 local claude_bin            -- mod.CLAUDE_BIN (the resolved `claude` binary path)
+local abort_decision_state  -- render's F5+F9 teardown sweep (on_exit strands otherwise)
 
 --- Inject init's render/spinner/hint/host-ctx helpers + the FLAVOR table + the
 --- claude binary path. Called once from init after those are defined (dispatch,
@@ -77,6 +78,7 @@ function Process.wire(hooks)
   attach_host_context = hooks.attach_host_context
   FLAVOR              = hooks.FLAVOR
   claude_bin          = hooks.claude_bin
+  abort_decision_state = hooks.abort_decision_state
 end
 
 -- Partial-line carry between on_stdout calls (see on_stdout). Module-owned; init
@@ -304,6 +306,11 @@ local function on_exit(_, code, _)
   stop_spinner()
 
   vim.schedule(function()
+    -- F5: a dead CLI can never answer the decision a card is blocked on — sweep
+    -- stranded cards/queues/pre-write holds + the compact zombie timer (F9)
+    -- before the notify, so the user sees the receipts and the exit reason
+    -- together. Scheduled: the sweep closes windows and appends buffer lines.
+    if abort_decision_state then abort_decision_state("session ended") end
     local clean = (code == 0 or code == 143 or code == -1)
     if not clean then
       vim.notify(

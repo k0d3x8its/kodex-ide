@@ -1244,4 +1244,92 @@ H.check("S34 the dead-channel send warns once", dead_warns == 1, "warns=" .. dea
 vim.fn.chansend = prior_chansend_s34
 vim.notify = prior_notify_s34
 
+-- ── S35: F7 — concurrent AskUserQuestion queues rather than overwriting ─────────
+-- show_question_card had no queue guard: a second AskUserQuestion while one was up
+-- orphaned the first float (same frozen-ghost class as the perm bug, gate.lua T17b).
+-- Fix: queue in show_question_card / drain in close_question_card (mirrors perm_queue).
+claude.state.qask       = nil
+claude.state.qask_queue = nil
+
+feed({ type = "control_request", request_id = "q-f7-1", request = {
+  subtype = "can_use_tool", tool_name = "AskUserQuestion",
+  input = { questions = { { question = "First question?", header = "Q1",
+    options = { { label = "A" }, { label = "B" } } } } } } })
+
+H.check("S35 first AskUserQuestion opens the card",
+  claude.state.qask ~= nil and claude.state.qask.request_id == "q-f7-1",
+  "qask=" .. tostring(claude.state.qask and claude.state.qask.request_id))
+
+feed({ type = "control_request", request_id = "q-f7-2", request = {
+  subtype = "can_use_tool", tool_name = "AskUserQuestion",
+  input = { questions = { { question = "Second question?", header = "Q2",
+    options = { { label = "X" }, { label = "Y" } } } } } } })
+
+H.check("S35 second AskUserQuestion queues (qask_queue has 1)",
+  claude.state.qask_queue ~= nil and #claude.state.qask_queue == 1,
+  "queue_len=" .. tostring(claude.state.qask_queue and #claude.state.qask_queue))
+H.check("S35 first card not overwritten (request_id still q-f7-1)",
+  claude.state.qask ~= nil and claude.state.qask.request_id == "q-f7-1",
+  "rid=" .. tostring(claude.state.qask and claude.state.qask.request_id))
+
+require("utils.claude.question").cancel_question()
+vim.wait(30)
+
+H.check("S35 queue drained: second card now active after first closes",
+  claude.state.qask ~= nil and claude.state.qask.request_id == "q-f7-2",
+  "rid=" .. tostring(claude.state.qask and claude.state.qask.request_id))
+H.check("S35 queue empty after drain",
+  claude.state.qask_queue == nil or #claude.state.qask_queue == 0,
+  "queue_len=" .. tostring(claude.state.qask_queue and #claude.state.qask_queue))
+
+require("utils.claude.question").cancel_question()   -- clean up second card
+vim.wait(30)
+
+-- ── S36: F8 — dispatch guard drops events silently when panel_buf is invalid ─────
+-- renderers call nvim_buf_line_count(state.panel_buf) without a validity guard;
+-- after a manual :bd or a reset race the buffer is gone → crash in the scheduled
+-- dispatch callback. Fix: early return at dispatch top when panel_buf is nil/invalid.
+-- With the guard, the event is silently dropped (no error notification); without it,
+-- the F2 pcall wrapper catches the throw and fires a "render error" notification.
+local saved_panel_buf = claude.state.panel_buf
+claude.state.panel_buf = nil
+
+local s36_render_errors = 0
+local prior_notify_s36 = vim.notify
+vim.notify = function(message, level)
+  if level == vim.log.levels.ERROR and tostring(message):find("render error", 1, true) then
+    s36_render_errors = s36_render_errors + 1
+  end
+end
+
+feed({ type = "assistant", message = { content = { { type = "text", text = "panel gone" } } } })
+
+H.check("S36 dispatch guard drops event silently when panel_buf is nil (no render error)",
+  s36_render_errors == 0, "render_errors=" .. s36_render_errors)
+
+claude.state.panel_buf = saved_panel_buf
+vim.notify = prior_notify_s36
+
+-- ── S37: F10 — slash capture filters non-string elements ──────────────────────────
+-- slash.ensure_commands and the system/init capture both trusted element types; a
+-- corrupted cache or CLI event with numbers/booleans in slash_commands → name:match
+-- crash in all_commands(). Fix: keep only type(v)=="string" at both capture points.
+local prior_slash = claude.state.slash_commands
+claude.state.slash_commands = nil   -- allow the init capture branch to run
+
+feed({ type = "system", subtype = "init",
+  model = "claude-test", claude_code_version = "0.0.0",
+  slash_commands = { "compact", 42, "resume", true, "clear" } })
+
+local s37_all_strings = true
+for _, cmd in ipairs(claude.state.slash_commands or {}) do
+  if type(cmd) ~= "string" then s37_all_strings = false end
+end
+H.check("S37 slash capture stores only string elements (filters 42 and true)",
+  claude.state.slash_commands ~= nil and s37_all_strings
+    and #claude.state.slash_commands == 3,
+  "cmds=" .. vim.inspect(claude.state.slash_commands))
+
+claude.state.slash_commands = prior_slash
+
 H.summary("claude_stream")

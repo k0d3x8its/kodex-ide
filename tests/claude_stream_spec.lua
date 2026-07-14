@@ -1106,4 +1106,63 @@ H.check("S31 a new turn re-arms the error notice", error_notices == 2,
 feed({ type = "result", result = "ok", total_cost_usd = 0.01 })
 vim.notify = real_notify
 
+-- ── S32: unknown control_request subtypes are answered, never dropped ──────────
+-- FINDINGS § Q-ERROR-AUDIT F3: every control_request expects a control_response —
+-- dispatch handled ONLY can_use_tool, so any other subtype (protocol has several;
+-- future CLI versions add more) blocked the turn forever behind the spinner. The
+-- default branch must answer the protocol's error variant (echoing request_id) so
+-- the CLI fails the request and moves on, and WARN once per subtype (the same
+-- unimplemented subtype repeats every turn — one toast, not a storm).
+local control_sends = {}
+local prior_chansend = vim.fn.chansend
+vim.fn.chansend = function(_, data)
+  table.insert(control_sends, data)
+  return #data
+end
+local unknown_warns = 0
+local prior_notify = vim.notify
+vim.notify = function(message, level)
+  if level == vim.log.levels.WARN
+      and tostring(message):find("control_request", 1, true) then
+    unknown_warns = unknown_warns + 1
+  end
+end
+
+local function error_responses_for(request_id)
+  local matches = 0
+  for _, line in ipairs(control_sends) do
+    if line:find(request_id, 1, true) and line:find('"error"', 1, true) then
+      matches = matches + 1
+    end
+  end
+  return matches
+end
+
+feed({ type = "control_request", request_id = "cr-77",
+  request = { subtype = "hook_callback", callback_id = "h1" } })
+H.check("S32 unknown control_request subtype gets a control_response error",
+  error_responses_for("cr-77") == 1, vim.inspect(control_sends))
+H.check("S32 unknown subtype is logged", unknown_warns == 1, "warns=" .. unknown_warns)
+-- The SAME subtype again: must still be answered (each request blocks the CLI),
+-- but must NOT toast again.
+feed({ type = "control_request", request_id = "cr-78",
+  request = { subtype = "hook_callback", callback_id = "h2" } })
+H.check("S32 repeat subtype is still answered", error_responses_for("cr-78") == 1,
+  vim.inspect(control_sends))
+H.check("S32 repeat subtype does not re-toast", unknown_warns == 1,
+  "warns=" .. unknown_warns)
+-- can_use_tool must NOT fall into the default branch: no error response, the
+-- permission card opens as before.
+feed({ type = "control_request", request_id = "cr-79", request = {
+  subtype = "can_use_tool", tool_name = "Bash", input = { command = "ls" } } })
+H.check("S32 can_use_tool still routes to the permission card",
+  claude.state.perm ~= nil and error_responses_for("cr-79") == 0,
+  vim.inspect(control_sends))
+if claude.state.perm then
+  require("utils.claude.gate").resolve_permission("deny")
+  vim.wait(30)
+end
+vim.fn.chansend = prior_chansend
+vim.notify = prior_notify
+
 H.summary("claude_stream")

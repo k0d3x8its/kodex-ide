@@ -132,6 +132,21 @@ local function tool_target(input)
   return (t:gsub("[\r\n\t]+", " "))
 end
 
+-- A stream-json message.content is USUALLY a block array, but some events carry it
+-- as a plain STRING — notably the summary injected after /compact (manual OR auto).
+-- Every dispatch loop below iterates the blocks, so a raw string there crashed the
+-- whole dispatch with "bad argument #1 to 'ipairs' (table expected, got string)"
+-- (2026-07-13, on the compact summary). Normalize once: a string becomes a single
+-- text block; nil/other becomes empty. Callers that only care about tool_result
+-- blocks simply find none in a text block (correct — a compact summary is context,
+-- not a tool result, and must not render inline).
+local function content_blocks(message)
+  local c = (message or {}).content
+  if type(c) == "table" then return c end
+  if type(c) == "string" and c ~= "" then return { { type = "text", text = c } } end
+  return {}
+end
+
 -- ─── Render functions (Goal 6.3) ──────────────────────────────────────────────
 
 -- Render assistant prose text. Strips trailing blank lines so consecutive
@@ -466,6 +481,12 @@ local function tool_lines(name, input)
     -- transcript is in the drill-in view (ctrl+b to cycle).
     local desc = input.description or input.subagent_type or "subagent"
     return "● neoclaude(" .. corner_one_line(desc) .. ")", nil
+  elseif name == "Artifact" then
+    -- Published-artifact tool: the target (file_path, or a URL on an update/list)
+    -- rides the header in CC-TUI "● Artifact(<target>)" shape. The "published · <url>"
+    -- confirmation arrives with the RESULT, rendered by render_artifact_result.
+    local tgt = (path and rel_path(path)) or input.url or ""
+    return "● Artifact" .. (tgt ~= "" and ("(" .. tgt .. ")") or ""), nil
   elseif name == "ExitPlanMode" then
     -- The proposed plan rides the tool INPUT (input.plan), not the result body;
     -- render a clean "● Plan" header + a one-line preview (the full plan text also
@@ -981,6 +1002,177 @@ local function render_tool_result(content, is_error, meta, opts)
   state.tool_results[#state.tool_results + 1] = entry
 end
 
+-- The Claude Code Artifact tool has two actions, BOTH URL-centric — there is no
+-- inline/non-URL artifact at the CLI layer (that's a claude.ai-chat concept, not a
+-- CLI tool_result):
+--   publish (default) → one hosted claude.ai URL ("published · <url>")
+--   list              → many title+URL rows (the user's published artifacts)
+-- So the result render collects EVERY http(s) token from the body (one line each)
+-- rather than only the first — otherwise a `list` would drop all but one entry. The
+-- exact field shape isn't pinned to a captured fixture, so we pattern-match the text
+-- rather than assume a key (robust to wire drift). No URL at all (error / unpublished
+-- / an unexpected shape) falls back to the generic body so nothing is swallowed.
+local function render_artifact_result(content, is_error)
+  local body = tool_result_lines(content)
+  local urls = {}
+  for _, line in ipairs(body) do
+    for u in line:gmatch("(https?://%S+)") do
+      urls[#urls + 1] = u
+    end
+  end
+  if is_error or #urls == 0 then
+    render_tool_result(content, is_error, nil)
+    return
+  end
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  -- Drop the running block's trailing randomizer blank so this attaches directly
+  -- under the "● Artifact(…)" header (same seam as render_tool_result).
+  local last = vim.api.nvim_buf_line_count(buf)
+  if last > 0 and vim.api.nvim_buf_get_lines(buf, last - 1, last, false)[1] == "" then
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, last - 1, last, false, {})
+    vim.bo[buf].modifiable = false
+  end
+  local first = vim.api.nvim_buf_line_count(buf)
+  local lines = {}
+  -- Single publish → "published · <url>"; a list → one bare "└ <url>" per entry.
+  for i, u in ipairs(urls) do
+    lines[i] = (#urls == 1) and ("  └ published · " .. u) or ("  └ " .. u)
+  end
+  buf_append(lines)
+  hl_lines(first, first + #lines - 1, "ClaudeAdvisor")   -- bright green: success verb
+  buf_append({ "" })                                       -- randomizer's own row below
+end
+
+-- ── /compact modal (F4) ──────────────────────────────────────────────────────
+-- The compaction lifecycle over stream-json (captured 2026-07-13):
+--   system/status  status="compacting"                    → START (manual OR auto)
+--   system/status  status=null, compact_result="success"  → done signal (no stats)
+--   system/init                                            → fresh context
+--   system/compact_boundary compact_metadata{trigger,pre_tokens,post_tokens,…} → stats
+-- There is NO incremental %% in the stream, so the "modal" is an animated one-line
+-- status block that persists from the compacting signal until the boundary replaces
+-- it with a token receipt. Both manual and autocompact emit the same compacting
+-- status, so autocompact populates it too (the user's explicit ask).
+local COMPACT_SPIN = { "⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷" }
+local compact_spin_i = 1
+
+-- Compact/dropped token counts in a one-decimal K form (30762 → "30.8K"; <1000 raw).
+local function fmt_ktok(n)
+  if type(n) ~= "number" then return "?" end
+  if n >= 1000 then return string.format("%.1fK", n / 1000) end
+  return tostring(math.floor(n))
+end
+
+local function compact_ns()
+  state.compact_ns = state.compact_ns or vim.api.nvim_create_namespace("claude_compact")
+  return state.compact_ns
+end
+
+-- Rewrite the tracked compacting line with the current spinner frame (in place).
+local function paint_compact_line()
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf) and state.compact_mark) then return end
+  local pos = vim.api.nvim_buf_get_extmark_by_id(buf, compact_ns(), state.compact_mark, {})
+  if not (pos and pos[1]) then return end
+  local ln = pos[1]
+  vim.bo[buf].modifiable = true
+  pcall(vim.api.nvim_buf_set_lines, buf, ln, ln + 1, false,
+    { COMPACT_SPIN[compact_spin_i] .. " Compacting conversation…" })
+  vim.bo[buf].modifiable = false
+  hl_lines(ln, ln, "ClaudeThink")
+end
+
+local function start_compact_modal()
+  if state.compact_mark then return end            -- already compacting (idempotent)
+  remove_typing_ph()
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  local first = vim.api.nvim_buf_line_count(buf)
+  buf_append({ COMPACT_SPIN[1] .. " Compacting conversation…", "" })
+  hl_lines(first, first, "ClaudeThink")
+  state.compact_mark = vim.api.nvim_buf_set_extmark(buf, compact_ns(), first, 0, {})
+  compact_spin_i = 1
+  state.compact_timer = vim.fn.timer_start(110, function()
+    compact_spin_i = compact_spin_i % #COMPACT_SPIN + 1
+    paint_compact_line()
+  end, { ["repeat"] = -1 })
+end
+
+-- Replace the animated line with a token receipt (from compact_boundary stats) or a
+-- bare "compacted" line (done signal with no stats). Idempotent + safe if never armed.
+local function finish_compact_modal(meta)
+  if state.compact_timer then
+    vim.fn.timer_stop(state.compact_timer)
+    state.compact_timer = nil
+  end
+  local buf = state.panel_buf
+  local mark = state.compact_mark
+  state.compact_mark = nil
+  if not (buf and vim.api.nvim_buf_is_valid(buf) and mark) then return end
+  local pos = vim.api.nvim_buf_get_extmark_by_id(buf, compact_ns(), mark, {})
+  if not (pos and pos[1]) then return end
+  local ln = pos[1]
+  local line
+  if type(meta) == "table" then
+    local trig    = (meta.trigger == "auto") and "auto" or "manual"
+    local dropped = meta.cumulative_dropped_tokens
+      or (type(meta.pre_tokens) == "number" and type(meta.post_tokens) == "number"
+          and (meta.pre_tokens - meta.post_tokens)) or nil
+    line = string.format("✓ Compacted %s → %s tokens%s · %s",
+      fmt_ktok(meta.pre_tokens), fmt_ktok(meta.post_tokens),
+      dropped and (" (−" .. fmt_ktok(dropped) .. ")") or "", trig)
+  else
+    line = "✓ Conversation compacted"
+  end
+  vim.bo[buf].modifiable = true
+  pcall(vim.api.nvim_buf_set_lines, buf, ln, ln + 1, false, { line })
+  vim.bo[buf].modifiable = false
+  hl_lines(ln, ln, "ClaudeAdvisor")
+end
+
+-- ── Rate-limit block (F5) ─────────────────────────────────────────────────────
+-- rate_limit_event fires as telemetry EVERY turn — usually status="allowed" (fine).
+-- The panel only surfaces a block when the status is NOT allowed (an actual limit),
+-- matching the TUI's rate-limit screen. Headless stream-json cannot drive the TUI's
+-- interactive upgrade selector, so this is an INFORMATIONAL block: the reset time +
+-- the same options as read-only guidance (upgrades happen on the web). De-duped so a
+-- limit re-reported each turn doesn't stack; cleared when status returns to allowed.
+local function fmt_reset(ts)
+  if type(ts) ~= "number" then return "soon" end
+  return os.date("%H:%M", ts)              -- local wall-clock, matches the TUI
+end
+
+local function render_rate_limit(info)
+  local status = info.status
+  -- vim.json maps JSON null → vim.NIL (userdata), so guard both nil and "allowed".
+  if status == nil or status == vim.NIL or status == "allowed" then
+    state.rate_limit_shown = nil           -- back under the limit → allow a future re-show
+    return
+  end
+  local key = tostring(status) .. ":" .. tostring(info.resetsAt)
+  if state.rate_limit_shown == key then return end   -- same limit already shown
+  state.rate_limit_shown = key
+  remove_typing_ph()
+  local buf = state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  local ltype = (type(info.rateLimitType) == "string")
+    and (" (" .. info.rateLimitType:gsub("_", " ") .. ")") or ""
+  local first = vim.api.nvim_buf_line_count(buf)
+  buf_append({
+    "⚠ Rate limit reached" .. ltype,
+    "  Resets at " .. fmt_reset(info.resetsAt),
+    "  1. Stop and wait for the limit to reset",
+    "  2. Upgrade your plan · claude.ai/settings/billing",
+    "  3. Upgrade to Team plan · claude.ai",
+    "",
+  })
+  hl_lines(first, first, "ClaudeError")                       -- red header
+  hl_lines(first + 1, first + 1, "ClaudeDim")                 -- reset time
+  hl_lines(first + 2, first + 4, "ClaudeLabel")               -- the three options
+end
+
 -- The advisor tool (the "advisor strategy") is a SERVER-side tool: the executor
 -- model escalates a hard call to a stronger advisor model, which streams back as an
 -- `advisor_tool_result` content block, then the executor resumes. Two quirks drive
@@ -1331,7 +1523,7 @@ end
 
 local function render_subagent_inline(event, sub)
   if (event.type or "") ~= "assistant" then return end
-  for _, b in ipairs((event.message or {}).content or {}) do
+  for _, b in ipairs(content_blocks(event.message)) do
     if (b.type or "") == "tool_use" then
       if (sub.main_lines or 0) >= SUBAGENT_MAIN_CAP then subagent_cap_pointer(sub); return end
       local a    = b.input or {}
@@ -1380,7 +1572,7 @@ local function subagent_lines(ev)
     hls[#lines]       = group and { { 0, -1, group } } or {}
   end
   if (ev.type or "") == "assistant" then
-    for _, b in ipairs((ev.message or {}).content or {}) do
+    for _, b in ipairs(content_blocks(ev.message)) do
       local bt = b.type or ""
       if bt == "text" and type(b.text) == "string" and b.text ~= "" then
         for _, ln in ipairs(vim.split(b.text, "\n", { plain = true })) do
@@ -1405,7 +1597,7 @@ local function subagent_lines(ev)
       end
     end
   elseif (ev.type or "") == "user" then
-    for _, b in ipairs((ev.message or {}).content or {}) do
+    for _, b in ipairs(content_blocks(ev.message)) do
       if (b.type or "") == "tool_result" then
         local body = tool_result_lines(b.content)
         local grp  = (b.is_error == true) and "ClaudeError" or "ClaudeDim"
@@ -1494,6 +1686,28 @@ local function dispatch(event)
     state.system_ready = true
     -- working hint already set by send(); don't clobber it
 
+  elseif ev_type == "system" and event.subtype == "status" then
+    -- Compaction lifecycle (F4). status="compacting" opens the animated modal (manual
+    -- OR auto); the done signal (status=null, compact_result set) is a safety-net close
+    -- in case no compact_boundary follows — normally the boundary finalizes with stats.
+    if event.status == "compacting" then
+      start_compact_modal()
+    elseif event.compact_result ~= nil and event.compact_result ~= vim.NIL then
+      -- Boundary (with stats) usually lands in the same batch; defer the bare close so
+      -- it wins. The guard skips if the boundary already finalized.
+      vim.defer_fn(function()
+        if state.compact_mark then finish_compact_modal(nil) end
+      end, 500)
+    end
+
+  elseif ev_type == "system" and event.subtype == "compact_boundary" then
+    -- The token receipt: replaces the animated modal with pre→post/dropped stats.
+    finish_compact_modal(event.compact_metadata)
+
+  elseif ev_type == "rate_limit_event" then
+    -- Per-turn rate-limit telemetry; renders a block only on an actual limit (F5).
+    render_rate_limit(event.rate_limit_info or {})
+
   elseif ev_type == "system" and event.subtype == "thinking_tokens" then
     -- Live estimated-token count while the model thinks; the spinner appends it to
     -- the "Thinking… Xs" label (e.g. "· 111 tok"). Type-guarded like session_cost.
@@ -1580,7 +1794,7 @@ local function dispatch(event)
     -- Render the tool_result BODY under its tool block (was dropped as "v2").
     -- Drop the typing placeholder first so the body never lands below it.
     remove_typing_ph()
-    for _, block in ipairs((event.message or {}).content or {}) do
+    for _, block in ipairs(content_blocks(event.message)) do
       if (block.type or "") == "tool_result" then
         local meta = state.tool_meta and state.tool_meta[block.tool_use_id]
         local sb   = state.search_blocks and state.search_blocks[block.tool_use_id]
@@ -1597,6 +1811,10 @@ local function dispatch(event)
           -- "The file … has been updated successfully" ack — redundant with the
           -- diff window AND the post-approval red/green hunk block, so drop it.
           -- Errors still render (the user needs to see why an edit failed).
+        elseif meta and meta.name == "Artifact" then
+          -- Artifact publish/list → the "published · <url>" (or per-entry URL) line,
+          -- not the generic body (see render_artifact_result).
+          render_artifact_result(block.content, block.is_error == true)
         elseif sb then
           -- A registered search (Grep/Glob tool, or search-shaped Bash) rewrites
           -- its own header + renders the file list.
@@ -1627,7 +1845,7 @@ local function dispatch(event)
     -- The styled block REPLACES the in-body typing placeholder: drop it before any
     -- render so content never lands below the placeholder line.
     remove_typing_ph()
-    local content = (event.message or {}).content or {}
+    local content = content_blocks(event.message)
     for _, block in ipairs(content) do
       local btype = block.type or ""
       if btype == "text" then

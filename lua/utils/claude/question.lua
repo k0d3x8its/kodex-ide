@@ -275,6 +275,14 @@ local function close_question_card(receipt, receipt_hl)
   if state.qask_reopen_bar then
     state.qask_reopen_bar = false
     vim.schedule(function() prompt_input() end)
+  elseif state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+    -- No chat bar to reopen: keep focus in the Claude panel rather than letting it
+    -- fall back to the editor window the float was opened over (mirrors gate.lua).
+    vim.schedule(function()
+      if vim.api.nvim_win_is_valid(state.panel_win) then
+        pcall(vim.api.nvim_set_current_win, state.panel_win)
+      end
+    end)
   end
 end
 
@@ -588,6 +596,7 @@ local function open_question_float(q)
     zindex    = 60,
   })
   q.win = win
+  core.hide_modal_cursor()   -- hide the cursor over the card at open (see core doc)
   if pet_attach_surface then pet_attach_surface(win) end
   vim.wo[win].winhighlight =
     "FloatBorder:ClaudeBarBorder,FloatTitle:ClaudeBarBorder,NormalFloat:ClaudeBarBg"

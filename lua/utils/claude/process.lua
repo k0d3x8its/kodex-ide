@@ -83,6 +83,12 @@ end
 -- resets it via Process.clear_stdout() on a fresh panel buffer / session reset.
 local stdout_buf = ""
 
+-- One render-error notice per turn (F2, FINDINGS § Q-ERROR-AUDIT). A renderer
+-- throw repeats for every further event in the turn (same broken shape streams
+-- again); notifying each one buries the editor in error toasts. Re-armed at
+-- dispatch_send so the NEXT broken turn is not silent.
+local dispatch_error_notified = false
+
 -- Raw-event capture for wire-format discovery. When $KODEX_CLAUDE_EVENTLOG points
 -- at a path, every complete stream-json line is appended verbatim BEFORE decode —
 -- so even lines that fail JSON parse (ANSI noise, half-known event shapes) land in
@@ -199,6 +205,36 @@ local function build_args()
   return args
 end
 
+-- Deep-strip vim.NIL from a decoded event (F1, FINDINGS § Q-ERROR-AUDIT).
+-- vim.json.decode maps JSON null → vim.NIL, a TRUTHY userdata, so every
+-- `field or fallback` idiom downstream keeps the userdata and crashes in
+-- concat/split/ipairs — one null field from the CLI killed the render (worst
+-- case: a null display_name meant the permission card never opened and the CLI
+-- blocked forever on the unanswered gate). Normalizing ONCE here, at the only
+-- decode boundary, lets every renderer's `or` fallback work as written instead
+-- of guarding ~30 call sites. Lists are rebuilt without their null slots — a
+-- nil punched into the array part would be an ipairs-stopping hole (the exact
+-- gotcha behind the S29 focus-trap bug).
+local function strip_nulls(node)
+  if vim.islist(node) then
+    local compacted = {}
+    for _, item in ipairs(node) do
+      if item ~= vim.NIL then
+        table.insert(compacted, type(item) == "table" and strip_nulls(item) or item)
+      end
+    end
+    return compacted
+  end
+  for key, field in pairs(node) do
+    if field == vim.NIL then
+      node[key] = nil
+    elseif type(field) == "table" then
+      node[key] = strip_nulls(field)
+    end
+  end
+  return node
+end
+
 -- Neovim's on_stdout callback. CRITICAL: jobstart splits stdout on "\n" and
 -- STRIPS the newlines before calling us — `data` is a list of line fragments,
 -- NOT raw bytes. The convention (see :h channel-lines):
@@ -222,13 +258,31 @@ local function on_stdout(_, data, _)
       -- are not valid JSON; silently skip rather than surfacing an error.
       local ok, event = pcall(vim.json.decode, trimmed)
       if ok and type(event) == "table" then
+        event = strip_nulls(event)
         -- vim.schedule: dispatch modifies the buffer (appends lines, sets
         -- highlights, creates folds). These operations are forbidden inside an
         -- on_stdout callback because libuv callbacks run on the event loop,
         -- not inside the Neovim API safe zone. vim.schedule defers to the next
         -- safe iteration of the event loop.
         vim.schedule(function()
-          dispatch(event)
+          -- pcall: one malformed event must not kill the stream (F2). Unhandled,
+          -- a renderer throw here spams one scheduled-callback error per further
+          -- event, and a throw landing between a modifiable=true…false seam
+          -- (render_tool_result, render_edit_hunk, expand_result) leaves the
+          -- panel buffer editable — so re-lock it before moving on.
+          local dispatched, dispatch_err = pcall(dispatch, event)
+          if not dispatched then
+            if state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf) then
+              vim.bo[state.panel_buf].modifiable = false
+            end
+            if not dispatch_error_notified then
+              dispatch_error_notified = true
+              vim.notify(
+                "Claude panel render error — event dropped: " .. tostring(dispatch_err),
+                vim.log.levels.ERROR
+              )
+            end
+          end
         end)
       end
     end
@@ -329,6 +383,7 @@ local function dispatch_send(text)
   end
   state.system_ready = false
   state.working      = true
+  dispatch_error_notified = false   -- fresh turn: next render error notifies again
   state.turn_t0      = vim.loop.now()   -- cumulative turn timer (every spinner phase + churn line)
   state.turn_paused_ms = 0              -- fresh turn: no accumulated modal-wait pause yet
   state.pause_t0     = nil              -- not currently paused on a decision modal

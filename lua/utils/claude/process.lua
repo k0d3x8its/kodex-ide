@@ -83,6 +83,22 @@ end
 -- resets it via Process.clear_stdout() on a fresh panel buffer / session reset.
 local stdout_buf = ""
 
+-- Raw-event capture for wire-format discovery. When $KODEX_CLAUDE_EVENTLOG points
+-- at a path, every complete stream-json line is appended verbatim BEFORE decode —
+-- so even lines that fail JSON parse (ANSI noise, half-known event shapes) land in
+-- the log. Off by default (nil env = zero overhead). Recipe: launch Neovim from a
+-- GNOME terminal with the var set, drive the panel through /compact or up to a rate
+-- limit, then read the JSONL to see the actual event the CLI emits.
+--   KODEX_CLAUDE_EVENTLOG=/tmp/claude-events.jsonl nvim
+local eventlog_path = vim.env.KODEX_CLAUDE_EVENTLOG
+local function eventlog_write(line)
+  if not eventlog_path then return end
+  local fh = io.open(eventlog_path, "a")
+  if not fh then return end
+  fh:write(line, "\n")
+  fh:close()
+end
+
 --- Reset the stdout line-buffer. Called by init's ensure_panel_buf (new buffer)
 --- and reset() (fresh session) so no stale partial line bleeds across sessions.
 function Process.clear_stdout()
@@ -201,6 +217,7 @@ local function on_stdout(_, data, _)
   for _, line in ipairs(data) do
     local trimmed = line:match("^%s*(.-)%s*$")
     if trimmed ~= "" then
+      eventlog_write(trimmed)   -- verbatim capture BEFORE decode (see eventlog_path)
       -- pcall: ANSI noise lines that slip through (e.g. cursor movement codes)
       -- are not valid JSON; silently skip rather than surfacing an error.
       local ok, event = pcall(vim.json.decode, trimmed)

@@ -631,7 +631,12 @@ mod._gated = gated
 -- a win() accessor. Priority order is topmost-first, but only one is ever open at a
 -- time (the perm queue serializes), so the first valid hit is correct.
 local function active_modal_win()
-  for _, m in ipairs({ state.perm, state.qask, state.diff_card }) do
+  -- `or false` placeholders: a bare { state.perm, state.qask, state.diff_card }
+  -- leaves a HOLE at any nil slot and ipairs STOPS there — with no perm card up,
+  -- the question/diff cards were never reached, so the focus-trap and cursor
+  -- backstop ignored them entirely (live 2026-07-14: perm bounced, question/diff
+  -- escaped). false keeps the sequence dense so every slot is visited.
+  for _, m in ipairs({ state.perm or false, state.qask or false, state.diff_card or false }) do
     if m and m.win and vim.api.nvim_win_is_valid(m.win) then return m.win end
   end
   local w = effort.win() or advisor.win()
@@ -639,6 +644,34 @@ local function active_modal_win()
   return nil
 end
 mod._active_modal_win = active_modal_win
+
+-- Live focus-trap instrumentation for the permission-card escape bug (fails in a
+-- real terminal only, every headless repro bounces correctly — TODOS "Panel bug
+-- batch" 2026-07-14). When $KODEX_CLAUDE_FOCUSLOG points at a path, every trap
+-- decision appends one line: which window fired WinEnter, what the trap saw as
+-- panel/modal/perm windows and their validity, and which branch it took. Off by
+-- default (nil env = zero overhead). Recipe:
+--   KODEX_CLAUDE_FOCUSLOG=/tmp/claude-focus.log nvim
+-- then reproduce the failing click and read the log.
+local focuslog_path = vim.env.KODEX_CLAUDE_FOCUSLOG
+local function focuslog(tag, mwin)
+  if not focuslog_path then return end
+  local perm_win = state.perm and state.perm.win
+  local line = string.format(
+    "%d %-18s cur=%s panel=%s(valid=%s) modal=%s perm=%s(valid=%s) qask=%s diff=%s eff=%s adv=%s",
+    vim.loop.now(), tag,
+    tostring(vim.api.nvim_get_current_win()),
+    tostring(state.panel_win),
+    tostring(state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)),
+    tostring(mwin),
+    tostring(perm_win),
+    tostring(perm_win and vim.api.nvim_win_is_valid(perm_win)),
+    tostring(state.qask and state.qask.win),
+    tostring(state.diff_card and state.diff_card.win),
+    tostring(effort.win()), tostring(advisor.win()))
+  local fh = io.open(focuslog_path, "a")
+  if fh then fh:write(line, "\n"); fh:close() end
+end
 
 -- Clawd pet renderer: lazily prime image.nvim on the FIRST panel open (never at
 -- startup) and pin the pet bottom-right of the panel. Deferred through
@@ -2225,7 +2258,8 @@ local function open_panel_window(buf)
     callback = function()
       if not state.claude_active then return end
       local mwin = active_modal_win()
-      if not mwin then return end
+      if not mwin then focuslog("enter:no-modal"); return end
+      focuslog("enter", mwin)
       -- Trap ONLY the panel. With a decision card open, a click on the Claude panel
       -- BEHIND the card would strand it without key focus — bounce straight back so
       -- the card keeps control until it is dealt with (Esc/q or a decision), which
@@ -2234,9 +2268,12 @@ local function open_panel_window(buf)
       -- set_current_win is rejected mid-WinEnter on some paths, and the defer lets a
       -- modal's own late win-assignment settle before we re-check the current window.
       vim.schedule(function()
-        if not vim.api.nvim_win_is_valid(mwin) then return end
-        if vim.api.nvim_get_current_win() ~= state.panel_win then return end
-        pcall(vim.api.nvim_set_current_win, mwin)
+        if not vim.api.nvim_win_is_valid(mwin) then focuslog("sched:modal-gone", mwin); return end
+        if vim.api.nvim_get_current_win() ~= state.panel_win then
+          focuslog("sched:not-panel", mwin); return
+        end
+        local ok, err = pcall(vim.api.nvim_set_current_win, mwin)
+        focuslog(ok and "sched:bounced" or ("sched:FAILED " .. tostring(err)), mwin)
       end)
     end,
   })

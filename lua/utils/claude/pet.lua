@@ -303,6 +303,17 @@ function M.emit(event, data)
       M.idle_from  = nil
     end
 
+  elseif event == "interrupt" then
+    -- User aborted the turn (control_request interrupt). Not a success (no happy
+    -- flash) and not an error — just drop the work sprite and settle into idle so
+    -- the pet resyncs immediately instead of hanging on its last streaming state
+    -- until the CLI's abort result lands. A queued prompt, if any, drives the next
+    -- turn when that result arrives.
+    c.work  = nil
+    c.flash = nil
+    c.subagent = false
+    enter_idle(now)
+
   elseif event == "user_action" then
     -- Any interaction that resets the idle progression (panel focus, keymap,
     -- diff interaction). Only meaningful while idling; ignored mid-turn.

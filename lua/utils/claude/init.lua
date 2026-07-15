@@ -1046,6 +1046,8 @@ widgets.wire({
   set_bottom_pad      = set_bottom_pad,
   panel_float_geom    = panel_float_geom,
   harden_float_scroll = harden_float_scroll,
+  pet_attach_surface  = function(win) pcall(pet_render.attach_to_surface, win) end,
+  pet_attach_panel    = function() pcall(pet_render.attach_to_panel, state.panel_win) end,
 })
 
 -- Test hooks for the widget module (re-exported so the specs' mod._* references

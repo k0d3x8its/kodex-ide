@@ -144,10 +144,11 @@ return {
       -- of the main panel's status modals). Same green as the tag/switcher accent.
       vim.api.nvim_set_hl(0, "ClaudeSubagentBorder", { fg = "#50FA7B", bold = true })
 
-      -- Shaded/dim for type-ahead messages queued while Claude is working. They
-      -- show muted + italic until the turn ends and they send in the normal user
-      -- colour (ClaudeUser).
-      vim.api.nvim_set_hl(0, "ClaudeQueued",   { fg = "#6272A4", italic = true })
+      -- Warm amber for type-ahead messages queued while Claude is working — reads as
+      -- "pending/waiting" and stands out from the dim comment-grey (#6272A4) used for
+      -- every other muted element. Stays italic until the turn ends and it sends in the
+      -- normal user colour (ClaudeUser).
+      vim.api.nvim_set_hl(0, "ClaudeQueued",   { fg = "#FFB86C", italic = true })
 
       -- Gray italic — the "Working…" virtual-text hint at panel bottom.
       -- Intentionally muted so it does not compete with rendered content above.

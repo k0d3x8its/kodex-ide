@@ -61,6 +61,7 @@ local friendly_model      -- model id/alias → display name (shared with init's
 local fmt_think_dur       -- ms → "3.2s" / "1m 04s"
 local FLAVOR_DONE         -- past-tense flavour words for the turn "done" line
 local maybe_send_next     -- drain one type-ahead queue item after a turn ends
+local render_queue        -- re-anchor the type-ahead queued line to the buffer bottom
 local patch_banner        -- fill the banner's version/model lines on system/init
 -- Clawd pet event sink (init injects pet.emit). nil = pet disabled → no-op, so
 -- dispatch never hard-couples to the pet. Every emit is guarded `if pet_emit`.
@@ -80,6 +81,7 @@ function Render.wire(hooks)
   fmt_think_dur    = hooks.fmt_think_dur
   FLAVOR_DONE      = hooks.FLAVOR_DONE
   maybe_send_next  = hooks.maybe_send_next
+  render_queue     = hooks.render_queue
   patch_banner     = hooks.patch_banner
   pet_emit         = hooks.pet_emit
 end
@@ -2082,6 +2084,12 @@ local function dispatch(event)
     -- the error variant instead of guessing at success semantics we don't know.
     gate.send_control_error(event.request_id, tostring((event.request or {}).subtype))
   end
+
+  -- Keep the type-ahead queued line pinned to the BUFFER BOTTOM. render_queue anchors
+  -- its virt_line to the last line at enqueue time; every event here appends new lines,
+  -- so without re-anchoring the queued line gets buried mid-transcript (and scrolls
+  -- under the statusline). Re-place it after each rendered event while a queue exists.
+  if render_queue and state.queue and #state.queue > 0 then render_queue() end
 end
 Render.dispatch = dispatch
 Render.subagent_lines = subagent_lines   -- rich drill-in formatter (widgets pulls via lazy require)

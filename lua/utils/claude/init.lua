@@ -440,12 +440,29 @@ local PH_FRAMES = { "●∙∙", "∙●∙", "∙∙●", "∙●∙" }
 -- thinking block, otherwise "Typing" (composing/emitting the reply). A tool run
 -- shows its own cornered block instead (see in_typing_phase), so the word only
 -- ever covers the two block-less compute phases.
+-- Pet work-states that OUTLIVE the tool run into the compose gap before prose
+-- streams, mapped to their transcript gerund. tick_typing_ph deliberately keeps the
+-- pet sprite on these (it lingers on the last tool action until real text streams),
+-- so the transcript activity word must show the SAME word or the two visibly
+-- disagree (sprite=reading while the line says "Typing" — user-reported 2026-07-14).
+-- One table drives both, so they can never drift apart.
+local STICKY_ACTIVITY_WORD = {
+  reading   = "Reading",
+  cleaning  = "Cleaning",
+  debugging = "Debugging",
+  building  = "Building",
+}
+
 local function activity_word()
   -- While the executor is blocked on the advisor (server_tool_use advisor sent, no
   -- advisor_tool_result yet), the compute phase IS the consult — say so. Checked
   -- first so it wins over a concurrent thinking block.
   if state.advisor_pending then return "Consulting" end
   if state.think_start then return "Thinking" end
+  -- Mirror the pet's sticky work-state through the compose gap. Real streamed text
+  -- fires `typing` (render seam) which clears c.work → we fall through to "Typing".
+  local sticky = STICKY_ACTIVITY_WORD[pet.cond and pet.cond.work]
+  if sticky then return sticky end
   return "Typing"
 end
 
@@ -557,9 +574,7 @@ local function tick_typing_ph()
     -- on reading/cleaning/debugging (the last tool action) until real text streams —
     -- which fires `typing` at its own seam (render.lua). Emitting typing here for
     -- those states was what stopped the reading sprite from ever showing.
-    local w = pet.cond and pet.cond.work
-    local sticky = (w == "reading" or w == "cleaning" or w == "debugging"
-      or w == "building")
+    local sticky = STICKY_ACTIVITY_WORD[pet.cond and pet.cond.work] ~= nil
     if not state.think_start and not state.advisor_pending and not sticky then
       pet.emit("typing")
     end
@@ -641,6 +656,13 @@ local function active_modal_win()
   end
   local w = effort.win() or advisor.win()
   if w and vim.api.nvim_win_is_valid(w) then return w end
+  -- The subagent drill-in view is a focusable read-only float too: routing it
+  -- through here hides its cursor (the backstop keys on active_modal_win) — a stray
+  -- block cursor in the transcript was user-reported 2026-07-14 — and keeps a panel
+  -- click from stranding it. q/<Esc> still close it.
+  if state.subagent_view_win and vim.api.nvim_win_is_valid(state.subagent_view_win) then
+    return state.subagent_view_win
+  end
   return nil
 end
 mod._active_modal_win = active_modal_win
@@ -2015,6 +2037,11 @@ function mod.interrupt()
   state.working = false
   stop_spinner()
   if not state.diff_pending then clear_hint() end
+  -- Resync the UI to the aborted state NOW instead of waiting for the CLI's abort
+  -- result event: drop the pet's stale work sprite → idle, and re-anchor the
+  -- type-ahead queue line to the (now static) last content line.
+  pet_emit("interrupt")
+  render_queue()
 end
 
 -- ─── Over-scroll clamp ────────────────────────────────────────────────────────

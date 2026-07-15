@@ -490,6 +490,13 @@ local function steer(text)
   state.queue = {}
   if text and text ~= "" then msgs[#msgs + 1] = text end
   if #msgs == 0 then render_queue(); return false end
+  -- Drop the mid-turn "typing" placeholder BEFORE echoing (every content-appending
+  -- branch does this — see init's PH_FRAMES note). Without it the echo lands AFTER the
+  -- placeholder's two tail lines, and the next stream event's remove_typing_ph deletes
+  -- the LAST two lines — eating the steered prompt and leaving only the orange turn
+  -- separator (user-reported 2026-07-15). The next stream event re-adds the placeholder
+  -- below the echo.
+  remove_typing_ph()
   for _, m in ipairs(msgs) do
     render_user(m, nil, true)   -- echo as a steered user line (mid-transcript)
     local msg = vim.json.encode({

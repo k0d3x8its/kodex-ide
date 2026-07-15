@@ -450,6 +450,21 @@ local function mount_diff(buf, scratch, is_new, prewrite)
     { buffer = scratch, desc = "Claude diff: accept all" })
   vim.keymap.set("n", "<leader>cx", M.reject_all,
     { buffer = scratch, desc = "Claude diff: reject all" })
+
+  -- Land on the FIRST change instead of line 1 — vimdiff opens both panes at the
+  -- top, so a change deep in the file is off-screen until the user hunts for it.
+  -- From the top, jump to the next hunk with `]c` UNLESS line 1 is itself part of a
+  -- change (a pure-addition new file, or an edit at the very top) — `]c` would then
+  -- skip past the first hunk to the second. `diff_hlID(lnum,1) > 0` means the line is
+  -- diff-highlighted (changed). Run in the orig window so the scroll-bound scratch
+  -- pane reveals the same hunk; `zz` centers it. keepjumps keeps the jumplist clean.
+  pcall(vim.api.nvim_win_call, orig_win, function()
+    vim.cmd("keepjumps normal! gg")
+    if vim.fn.diff_hlID(vim.fn.line("."), 1) <= 0 then
+      vim.cmd("keepjumps normal! ]c")
+    end
+    vim.cmd("normal! zz")
+  end)
 end
 
 local function open_diff(path)

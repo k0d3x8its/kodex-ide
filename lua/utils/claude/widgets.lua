@@ -23,12 +23,16 @@ local state = core.state
 local set_bottom_pad
 local panel_float_geom
 local harden_float_scroll
+local pet_attach_surface   -- pin Clawd to a surface float (subagent view top border)
+local pet_attach_panel     -- return Clawd to his panel-corner home
 
 --- Inject init's float/pad helpers. Called once from init after they are defined.
 function Widgets.wire(hooks)
   set_bottom_pad      = hooks.set_bottom_pad
   panel_float_geom    = hooks.panel_float_geom
   harden_float_scroll = hooks.harden_float_scroll
+  pet_attach_surface  = hooks.pet_attach_surface
+  pet_attach_panel    = hooks.pet_attach_panel
 end
 
 -- ─── Search-tool classifier ──────────────────────────────────────────────────
@@ -715,6 +719,8 @@ function Widgets.close_subagent_view()
   state.subagent_view_win = nil
   state.subagent_view     = nil
   state.subagent_view_h   = nil
+  -- View gone → Clawd returns to his panel-corner home.
+  if pet_attach_panel then pet_attach_panel() end
 end
 
 -- Pin the green title tag to the BOTTOM-right corner of the drill-in view (just
@@ -833,6 +839,12 @@ function Widgets.open_subagent_view(i)
     { buffer = buf, noremap = true, silent = true, desc = "Claude: cycle subagent views" })
   open_subagent_tag(sub, prow + total_h - 1, col, w)   -- bottom-right border corner
   state.subagent_view = i
+  -- Clawd rides the view's TOP border while it's open (same surface treatment as the
+  -- chat bar) so he sits ON the view — associating pet↔view — and clears its
+  -- bottom-right title tag. The subagent/juggling sprite (driven by any_subagent_
+  -- running) already shows the subagent state; focus-driven per-window activity waits
+  -- for the multi-session redesign that replaces this floating view with real tabs.
+  if pet_attach_surface then pet_attach_surface(state.subagent_view_win) end
   -- Land at the bottom (latest activity), like a live transcript.
   pcall(vim.api.nvim_win_set_cursor, state.subagent_view_win, { vim.api.nvim_buf_line_count(buf), 0 })
 end

@@ -475,4 +475,32 @@ local function maybe_send_next()
 end
 Process.maybe_send_next = maybe_send_next
 
+-- Steer: push pending messages INTO the running turn instead of waiting for it to
+-- end. Proven 2026-07-15 (FINDINGS § Q-STEER) — a {type:"user"} written to the live
+-- stdin mid-turn is absorbed by the model at its next step: same turn, no interrupt.
+-- Flushes any already-queued messages AND the just-typed `text`, so ctrl+Enter pushes
+-- everything pending in at once. Deliberately does NOT touch turn state (working /
+-- timers / spinner / flavor) — dispatch_send's turn-setup is for STARTING a turn; this
+-- rides the one already in flight. No-op (returns false) when idle so the caller can
+-- fall back to a normal send.
+local function steer(text)
+  if not (state.job_id and state.working) then return false end
+  local msgs = {}
+  for _, q in ipairs(state.queue) do msgs[#msgs + 1] = q end
+  state.queue = {}
+  if text and text ~= "" then msgs[#msgs + 1] = text end
+  if #msgs == 0 then render_queue(); return false end
+  for _, m in ipairs(msgs) do
+    render_user(m, nil, true)   -- echo as a steered user line (mid-transcript)
+    local msg = vim.json.encode({
+      type    = "user",
+      message = { role = "user", content = { { type = "text", text = m } } },
+    })
+    pcall(vim.fn.chansend, state.job_id, msg .. "\n")
+  end
+  render_queue()                -- queue drained → clear the amber queued lines
+  return true
+end
+Process.steer = steer
+
 return Process

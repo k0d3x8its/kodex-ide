@@ -159,7 +159,17 @@ H.check("S4 activity word reflects the thinking phase",
   claude._activity_word() == "Thinking", claude._activity_word())
 claude.state.think_start  = nil
 claude.state.think_tokens = 0
+local pet = require("utils.claude.pet")
+pet.cond.work = nil
 H.check("S4 activity word is 'Typing' outside thinking/tool",
+  claude._activity_word() == "Typing", claude._activity_word())
+-- S4b: the transcript word must mirror the pet's sticky tool state through the
+-- compose gap, or the sprite (reading) and the line ("Typing") visibly disagree.
+pet.cond.work = "reading"
+H.check("S4b activity word mirrors the pet's sticky tool state",
+  claude._activity_word() == "Reading", claude._activity_word())
+pet.cond.work = nil
+H.check("S4b activity word falls back to Typing when work clears",
   claude._activity_word() == "Typing", claude._activity_word())
 
 -- ── S5: in-body activity-line lifecycle ───────────────────────────────────────
@@ -758,6 +768,10 @@ feed({ type = "assistant", message = { content = { {
   content = { type = "advisor_result", text = "Consult the protocol, not your notes." },
 } } } })
 -- Advice arrived → flag clears, word reverts to "Typing" for the executor's resume.
+-- Clear the pet's leftover sticky tool-state (an earlier Edit set work="building"):
+-- in the live flow the executor resumes by STREAMING prose, whose `typing` emit
+-- clears it — this synthetic test feeds no prose, so mirror that clear here.
+require("utils.claude.pet").cond.work = nil
 H.check("S23 advice clears advisor_pending + word reverts to 'Typing'",
   claude.state.advisor_pending == false and claude._activity_word() == "Typing",
   tostring(claude.state.advisor_pending) .. " / " .. claude._activity_word())
@@ -1012,6 +1026,13 @@ if panel and vim.api.nvim_win_is_valid(panel) then
   H.check("S29 panel focus bounces back to the diff card",
     vim.api.nvim_get_current_win() == mwin, tostring(vim.api.nvim_get_current_win()))
   claude.state.diff_card = nil
+  -- The subagent drill-in view routes through active_modal_win too, so the cursor
+  -- backstop hides its cursor and a panel click can't strand it (user-reported
+  -- stray cursor 2026-07-14).
+  claude.state.subagent_view_win = mwin
+  H.check("S29 active_modal_win sees the subagent drill-in view",
+    claude._active_modal_win() == mwin, tostring(claude._active_modal_win()))
+  claude.state.subagent_view_win = nil
   -- Once the modal is gone the panel is no longer trapped.
   vim.api.nvim_set_current_win(panel)
   vim.wait(50)

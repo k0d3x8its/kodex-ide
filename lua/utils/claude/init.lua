@@ -962,6 +962,7 @@ render.wire({
   fmt_think_dur    = fmt_think_dur,
   FLAVOR_DONE      = FLAVOR_DONE,
   maybe_send_next  = process.maybe_send_next,
+  render_queue     = render_queue,
   patch_banner     = patch_banner,
   pet_emit         = pet_emit,
 })
@@ -1211,15 +1212,17 @@ local function set_panel_keymaps(buf)
     silent  = true,
     desc    = "Claude: reply / confirm permission / subagent view",
   })
-  -- ctrl+shift+Enter from the panel: flush ALREADY-queued messages into the running
-  -- turn (steer) without reopening the bar. No-op when idle or the queue is empty.
-  -- (ctrl+Enter is taken by Ghostty's fullscreen toggle; ctrl+shift+Enter is free.)
-  vim.keymap.set("n", "<C-S-CR>", function() process.steer(nil) end, {
-    buffer  = buf,
-    noremap = true,
-    silent  = true,
-    desc    = "Claude: steer queued message into the running turn",
-  })
+  -- ctrl+i (== <Tab>; both mapped for protocol on/off) from the panel: flush ALREADY-
+  -- queued messages into the running turn (steer) without reopening the bar. No-op when
+  -- idle or the queue is empty. (ctrl+Enter/ctrl+shift+Enter hit Ghostty's own bindings.)
+  for _, k in ipairs({ "<C-i>", "<Tab>" }) do
+    vim.keymap.set("n", k, function() process.steer(nil) end, {
+      buffer  = buf,
+      noremap = true,
+      silent  = true,
+      desc    = "Claude: steer queued message into the running turn",
+    })
+  end
   -- <Esc> rejects the pending permission when a card is up; otherwise it
   -- interrupts the current turn (control_request) while keeping the session
   -- alive. Matches the Claude Code TUI's Esc behaviour.
@@ -1795,16 +1798,20 @@ local function open_chat_float(title, callback, opts)
     { buffer = ibuf, nowait = true, silent = true })
   vim.keymap.set("i", "<Down>", function() slash.move(1) end,
     { buffer = ibuf, nowait = true, silent = true })
-  -- ctrl+shift+Enter STEERS: push this message into the running turn instead of
-  -- queueing it (see submit()'s want_steer). Tag the submission, then fire the prompt
-  -- buffer's own <CR> so the normal callback → submit() path runs. (Plain ctrl+Enter is
-  -- swallowed by Ghostty's fullscreen-toggle binding, so this uses ctrl+shift+Enter,
-  -- distinct via the kitty keyboard protocol.) If the "/" menu is open, <CR> belongs to
-  -- the menu — don't tag (would strand steer_pending); just pass it through.
-  vim.keymap.set("i", "<C-S-CR>", function()
+  -- ctrl+i (== <Tab> at the byte level; both mapped so it works whether or not the
+  -- kitty keyboard protocol distinguishes them) STEERS: push this message into the
+  -- running turn instead of queueing it (see submit()'s want_steer). Tag the
+  -- submission, then fire the prompt buffer's own <CR> so the normal callback →
+  -- submit() path runs. (ctrl+Enter / ctrl+shift+Enter were swallowed by Ghostty's own
+  -- bindings.) If the "/" menu is open, <CR> belongs to the menu — don't tag (would
+  -- strand steer_pending); just pass it through.
+  local function steer_from_bar()
     if not slash.active() then state.steer_pending = true end
     vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "n", false)
-  end, { buffer = ibuf, nowait = true, silent = true })
+  end
+  for _, k in ipairs({ "<C-i>", "<Tab>" }) do
+    vim.keymap.set("i", k, steer_from_bar, { buffer = ibuf, nowait = true, silent = true })
+  end
 
   -- Keep the bar pinned to the Claude column + bottom when the terminal/window is
   -- resized (the fixed-width panel's left edge shifts as the editor grows, so a

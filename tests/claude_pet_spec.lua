@@ -109,6 +109,15 @@ H.check("P-INT1c interrupt set error flash", pet.cond.flash == "error")
 -- The CLI's trailing abort result (non-ok) lands on the SAME error flash — no flip.
 H.check("P-INT1d trailing abort result stays error",
   pet.emit("result", { ok = false }) == "error")
+-- Queued-prompt case: after the interrupt error, the drained queued turn's first
+-- work event clears the flash so the NEW activity surfaces (error outranks work in
+-- the resolver, so it must be cleared — the work event's c.flash=nil does that).
+reset()
+pet.emit("typing")                 -- a turn is streaming
+pet.emit("interrupt", { now = 0 }) -- user aborts → error
+H.check("P-INT2 queued turn's thinking event clears error → new activity",
+  pet.emit("thinking") == "thinking")
+H.check("P-INT2b flash cleared by new turn", pet.cond.flash == nil)
 
 -- ── Diff lifecycle (P-DIFF) ──────────────────────────────────────────────────
 reset()

@@ -218,7 +218,10 @@ end
 -- note (optional): the ~-relative path of a file whose context was attached to
 -- the WIRE this turn (open-buffer awareness v2). When set, a dim "· with @<file>"
 -- line is drawn under the echo so the ambient injection is visible to the user.
-local function render_user(text, note)
+-- `steer` (optional): this message was pushed INTO a running turn (ctrl+Enter) rather
+-- than starting its own — append a dim "↳ steered into the turn" marker so the
+-- transcript shows it was absorbed mid-turn, not a fresh prompt.
+local function render_user(text, note, steer)
   if not text or text == "" then return end
   -- Draw the turn separator at the TOP of this turn (above the echo), unless a
   -- separator already sits there (banner divider on the first turn). Responses
@@ -270,6 +273,11 @@ local function render_user(text, note)
     local ln = vim.api.nvim_buf_line_count(state.panel_buf)
     buf_append({ "  · with @" .. note })
     hl_lines(ln, ln, "ClaudeDim")
+  end
+  if steer then
+    local ln = vim.api.nvim_buf_line_count(state.panel_buf)
+    buf_append({ "  ↳ steered into the turn" })
+    hl_lines(ln, ln, "ClaudeQueued")   -- warm amber, same cue as the queued line
   end
 end
 Render.render_user = render_user

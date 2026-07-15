@@ -812,9 +812,16 @@ function Widgets.open_subagent_view(i)
     pcall(vim.api.nvim_win_set_config, state.subagent_view_win, cfg)
     pcall(vim.api.nvim_win_set_buf, state.subagent_view_win, buf)   -- swap to this sub
   else
-    state.subagent_view_win = vim.api.nvim_open_win(buf, true, cfg)   -- enter → q/Esc work
+    -- Open NON-entered, assign state, THEN focus. Entering inside nvim_open_win
+    -- fires WinEnter DURING the call — before the return value is assigned — so the
+    -- cursor backstop saw state.subagent_view_win == nil (active_modal_win), left the
+    -- cursor visible, and only hid it when a later modal cycle re-fired WinEnter
+    -- (live-reported 2026-07-15). Assigning first makes the backstop hide on first
+    -- drill-in.
+    state.subagent_view_win = vim.api.nvim_open_win(buf, false, cfg)
     vim.wo[state.subagent_view_win].winhl =
       "Normal:ClaudeNormal,NormalNC:ClaudeNormal,FloatBorder:ClaudeSubagentBorder"
+    vim.api.nvim_set_current_win(state.subagent_view_win)   -- enter → q/Esc + cursor-hide
   end
   -- q/<Esc> close the view (set per shown buffer, idempotent).
   for _, k in ipairs({ "q", "<Esc>" }) do

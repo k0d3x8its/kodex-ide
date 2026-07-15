@@ -99,13 +99,16 @@ H.check("P-EVT9 result ok → happy", pet.emit("result", { ok = true, now = 100 
 H.check("P-EVT10 result failure → error",
   pet.emit("result", { ok = false }) == "error")
 
--- ── Interrupt (P-INT) — aborted turn drops the work sprite → idle, no flash ────
+-- ── Interrupt (P-INT) — aborted turn flashes error (user-chosen sprite) ────────
 reset()
 pet.emit("tool_use", { name = "Read", input = {} })   -- pet now "reading"
-H.check("P-INT1 interrupt clears work → idle (no happy/error flash)",
-  pet.emit("interrupt", { now = 0 }) == "idle")
+H.check("P-INT1 interrupt drops work → error sprite",
+  pet.emit("interrupt", { now = 0 }) == "error")
 H.check("P-INT1b interrupt cleared c.work", pet.cond.work == nil)
-H.check("P-INT1c interrupt set no flash", pet.cond.flash == nil)
+H.check("P-INT1c interrupt set error flash", pet.cond.flash == "error")
+-- The CLI's trailing abort result (non-ok) lands on the SAME error flash — no flip.
+H.check("P-INT1d trailing abort result stays error",
+  pet.emit("result", { ok = false }) == "error")
 
 -- ── Diff lifecycle (P-DIFF) ──────────────────────────────────────────────────
 reset()

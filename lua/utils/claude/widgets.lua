@@ -23,16 +23,16 @@ local state = core.state
 local set_bottom_pad
 local panel_float_geom
 local harden_float_scroll
-local pet_attach_surface   -- pin Clawd to a surface float (subagent view top border)
-local pet_attach_panel     -- return Clawd to his panel-corner home
+local pet_hide             -- tear Clawd down while the subagent view is open
+local pet_show             -- restore Clawd to his panel-corner home
 
 --- Inject init's float/pad helpers. Called once from init after they are defined.
 function Widgets.wire(hooks)
   set_bottom_pad      = hooks.set_bottom_pad
   panel_float_geom    = hooks.panel_float_geom
   harden_float_scroll = hooks.harden_float_scroll
-  pet_attach_surface  = hooks.pet_attach_surface
-  pet_attach_panel    = hooks.pet_attach_panel
+  pet_hide            = hooks.pet_hide
+  pet_show            = hooks.pet_show
 end
 
 -- ─── Search-tool classifier ──────────────────────────────────────────────────
@@ -720,7 +720,7 @@ function Widgets.close_subagent_view()
   state.subagent_view     = nil
   state.subagent_view_h   = nil
   -- View gone → Clawd returns to his panel-corner home.
-  if pet_attach_panel then pet_attach_panel() end
+  if pet_show then pet_show() end
 end
 
 -- Pin the green title tag to the BOTTOM-right corner of the drill-in view (just
@@ -839,17 +839,13 @@ function Widgets.open_subagent_view(i)
     { buffer = buf, noremap = true, silent = true, desc = "Claude: cycle subagent views" })
   open_subagent_tag(sub, prow + total_h - 1, col, w)   -- bottom-right border corner
   state.subagent_view = i
-  -- Sandwich Clawd between the view (above) and the switcher bar (below): pin him to
-  -- the SWITCHER's top border, exactly the chat-bar surface treatment — the switcher
-  -- plays the "chat bar" and the drill-in view plays the "slash menu above it". Feet
-  -- land on the switcher's top edge, body rises into the band under the view, clear of
-  -- the view's top transcript text AND its bottom-right title tag. Falls back to the
-  -- view surface if the switcher isn't up. The subagent/juggling sprite (any_subagent_
-  -- running) already shows the subagent state; focus-driven per-window activity waits
-  -- for the multi-session redesign that replaces this floating view with real tabs.
-  local pet_anchor = (state.subagent_win and vim.api.nvim_win_is_valid(state.subagent_win))
-    and state.subagent_win or state.subagent_view_win
-  if pet_attach_surface then pet_attach_surface(pet_anchor) end
+  -- Hide Clawd while the view is open. The ~8-row sprite collides with EITHER the
+  -- view's top transcript text (top anchor) or its bottom-right title tag (any bottom
+  -- anchor) no matter where it lands, and this whole floating view is transitional —
+  -- the multi-session redesign replaces it with real interactive tabs, where the pet
+  -- gets proper per-window placement + focus-driven activity state. Hiding is the
+  -- zero-collision interim; pet_show restores him on view close.
+  if pet_hide then pet_hide() end
   -- Land at the bottom (latest activity), like a live transcript.
   pcall(vim.api.nvim_win_set_cursor, state.subagent_view_win, { vim.api.nvim_buf_line_count(buf), 0 })
 end

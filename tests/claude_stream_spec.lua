@@ -1464,4 +1464,51 @@ H.check("S37 slash capture stores only string elements (filters 42 and true)",
 
 claude.state.slash_commands = prior_slash
 
+-- ── S38: steer pushes queued + typed messages INTO the running turn (Q-STEER) ────
+-- ctrl+Enter routes here. Proven (FINDINGS § Q-STEER) that a {type:"user"} written to
+-- the live stdin mid-turn is absorbed by the model at its next step. steer() flushes
+-- any already-queued messages AND the just-typed text as user stream-json lines,
+-- without touching turn state, and drains state.queue.
+local steer_sends = {}
+local prior_chansend_s38 = vim.fn.chansend
+vim.fn.chansend = function(_, data) table.insert(steer_sends, data); return #data end
+
+claude.state.working = true
+claude.state.job_id  = 42                        -- truthy live channel
+claude.state.queue   = { "queued one", "queued two" }
+
+local steered = claude._steer("typed three")
+
+local function sent_user_texts(list)
+  local out = {}
+  for _, d in ipairs(list) do
+    for line in tostring(d):gmatch("[^\n]+") do
+      local ok, ev = pcall(vim.json.decode, line)
+      if ok and type(ev) == "table" and ev.type == "user" then
+        out[#out + 1] = ev.message.content[1].text
+      end
+    end
+  end
+  return out
+end
+local s38_texts = sent_user_texts(steer_sends)
+
+H.check("S38 steer returns true while a turn is active", steered == true)
+H.check("S38 steer sent queued-then-typed messages in order",
+  #s38_texts == 3 and s38_texts[1] == "queued one" and s38_texts[2] == "queued two"
+    and s38_texts[3] == "typed three", vim.inspect(s38_texts))
+H.check("S38 steer drained the queue", #claude.state.queue == 0,
+  vim.inspect(claude.state.queue))
+
+-- Idle: steer is a no-op so the caller can fall back to a normal send.
+steer_sends = {}
+claude.state.working = false
+local s38_idle = claude._steer("nope")
+H.check("S38b steer is a no-op when no turn is active",
+  s38_idle == false and #steer_sends == 0)
+
+claude.state.job_id  = nil
+claude.state.queue   = {}
+vim.fn.chansend = prior_chansend_s38
+
 H.summary("claude_stream")

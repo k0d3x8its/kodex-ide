@@ -1211,9 +1211,10 @@ local function set_panel_keymaps(buf)
     silent  = true,
     desc    = "Claude: reply / confirm permission / subagent view",
   })
-  -- ctrl+Enter from the panel: flush ALREADY-queued messages into the running turn
-  -- (steer) without reopening the bar. No-op when idle or the queue is empty.
-  vim.keymap.set("n", "<C-CR>", function() process.steer(nil) end, {
+  -- ctrl+shift+Enter from the panel: flush ALREADY-queued messages into the running
+  -- turn (steer) without reopening the bar. No-op when idle or the queue is empty.
+  -- (ctrl+Enter is taken by Ghostty's fullscreen toggle; ctrl+shift+Enter is free.)
+  vim.keymap.set("n", "<C-S-CR>", function() process.steer(nil) end, {
     buffer  = buf,
     noremap = true,
     silent  = true,
@@ -1794,11 +1795,13 @@ local function open_chat_float(title, callback, opts)
     { buffer = ibuf, nowait = true, silent = true })
   vim.keymap.set("i", "<Down>", function() slash.move(1) end,
     { buffer = ibuf, nowait = true, silent = true })
-  -- ctrl+Enter STEERS: push this message into the running turn instead of queueing it
-  -- (see submit()'s want_steer). Tag the submission, then fire the prompt buffer's own
-  -- <CR> so the normal callback → submit() path runs. If the "/" menu is open, <CR>
-  -- belongs to the menu — don't tag (would strand steer_pending); just pass it through.
-  vim.keymap.set("i", "<C-CR>", function()
+  -- ctrl+shift+Enter STEERS: push this message into the running turn instead of
+  -- queueing it (see submit()'s want_steer). Tag the submission, then fire the prompt
+  -- buffer's own <CR> so the normal callback → submit() path runs. (Plain ctrl+Enter is
+  -- swallowed by Ghostty's fullscreen-toggle binding, so this uses ctrl+shift+Enter,
+  -- distinct via the kitty keyboard protocol.) If the "/" menu is open, <CR> belongs to
+  -- the menu — don't tag (would strand steer_pending); just pass it through.
+  vim.keymap.set("i", "<C-S-CR>", function()
     if not slash.active() then state.steer_pending = true end
     vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "n", false)
   end, { buffer = ibuf, nowait = true, silent = true })

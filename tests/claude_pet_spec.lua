@@ -99,6 +99,14 @@ H.check("P-EVT9 result ok → happy", pet.emit("result", { ok = true, now = 100 
 H.check("P-EVT10 result failure → error",
   pet.emit("result", { ok = false }) == "error")
 
+-- ── Interrupt (P-INT) — aborted turn drops the work sprite → idle, no flash ────
+reset()
+pet.emit("tool_use", { name = "Read", input = {} })   -- pet now "reading"
+H.check("P-INT1 interrupt clears work → idle (no happy/error flash)",
+  pet.emit("interrupt", { now = 0 }) == "idle")
+H.check("P-INT1b interrupt cleared c.work", pet.cond.work == nil)
+H.check("P-INT1c interrupt set no flash", pet.cond.flash == nil)
+
 -- ── Diff lifecycle (P-DIFF) ──────────────────────────────────────────────────
 reset()
 H.check("P-DIFF1 diff_open → diff_wait", pet.emit("diff_open") == "diff_wait")

@@ -839,12 +839,17 @@ function Widgets.open_subagent_view(i)
     { buffer = buf, noremap = true, silent = true, desc = "Claude: cycle subagent views" })
   open_subagent_tag(sub, prow + total_h - 1, col, w)   -- bottom-right border corner
   state.subagent_view = i
-  -- Clawd rides the view's TOP border while it's open (same surface treatment as the
-  -- chat bar) so he sits ON the view — associating pet↔view — and clears its
-  -- bottom-right title tag. The subagent/juggling sprite (driven by any_subagent_
+  -- Sandwich Clawd between the view (above) and the switcher bar (below): pin him to
+  -- the SWITCHER's top border, exactly the chat-bar surface treatment — the switcher
+  -- plays the "chat bar" and the drill-in view plays the "slash menu above it". Feet
+  -- land on the switcher's top edge, body rises into the band under the view, clear of
+  -- the view's top transcript text AND its bottom-right title tag. Falls back to the
+  -- view surface if the switcher isn't up. The subagent/juggling sprite (any_subagent_
   -- running) already shows the subagent state; focus-driven per-window activity waits
   -- for the multi-session redesign that replaces this floating view with real tabs.
-  if pet_attach_surface then pet_attach_surface(state.subagent_view_win) end
+  local pet_anchor = (state.subagent_win and vim.api.nvim_win_is_valid(state.subagent_win))
+    and state.subagent_win or state.subagent_view_win
+  if pet_attach_surface then pet_attach_surface(pet_anchor) end
   -- Land at the bottom (latest activity), like a live transcript.
   pcall(vim.api.nvim_win_set_cursor, state.subagent_view_win, { vim.api.nvim_buf_line_count(buf), 0 })
 end

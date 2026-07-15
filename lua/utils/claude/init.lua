@@ -1211,6 +1211,14 @@ local function set_panel_keymaps(buf)
     silent  = true,
     desc    = "Claude: reply / confirm permission / subagent view",
   })
+  -- ctrl+Enter from the panel: flush ALREADY-queued messages into the running turn
+  -- (steer) without reopening the bar. No-op when idle or the queue is empty.
+  vim.keymap.set("n", "<C-CR>", function() process.steer(nil) end, {
+    buffer  = buf,
+    noremap = true,
+    silent  = true,
+    desc    = "Claude: steer queued message into the running turn",
+  })
   -- <Esc> rejects the pending permission when a card is up; otherwise it
   -- interrupts the current turn (control_request) while keeping the session
   -- alive. Matches the Claude Code TUI's Esc behaviour.
@@ -1446,10 +1454,12 @@ process.wire({
 -- teardown paths, interrupt control_request) + re-export the specs' test hooks.
 local send            = process.send
 local enqueue         = process.enqueue
+local steer           = process.steer
 local stop_process    = process.stop_process
 local uuid4           = process.uuid4
 mod._send             = process.send
 mod._maybe_send_next  = process.maybe_send_next
+mod._steer            = process.steer
 mod._stop_process     = process.stop_process
 
 -- Public submit used by the input float: send immediately when idle, otherwise
@@ -1493,9 +1503,17 @@ local function submit(text)
   -- actually runs it (it won't parse a command buried mid-message). No command → the
   -- whole prose is both echoed and sent. (In-flight turns queue the command; the rare
   -- mid-sentence-during-work case dispatches the command without the prose echo.)
+  -- ctrl+Enter (steer): push this message INTO the running turn instead of queueing
+  -- it. Only meaningful while a turn is in flight; if idle, fall through to a normal
+  -- send. The flag is set by the chat bar's <C-CR> map just before it triggers submit.
+  local want_steer = state.steer_pending and state.working
+  state.steer_pending = nil
+
   if command then
+    if want_steer and steer(command) then return end
     if state.working then enqueue(command) else send(text, command) end
   else
+    if want_steer and steer(text) then return end
     if state.working then enqueue(text) else send(text) end
   end
 end
@@ -1776,6 +1794,14 @@ local function open_chat_float(title, callback, opts)
     { buffer = ibuf, nowait = true, silent = true })
   vim.keymap.set("i", "<Down>", function() slash.move(1) end,
     { buffer = ibuf, nowait = true, silent = true })
+  -- ctrl+Enter STEERS: push this message into the running turn instead of queueing it
+  -- (see submit()'s want_steer). Tag the submission, then fire the prompt buffer's own
+  -- <CR> so the normal callback → submit() path runs. If the "/" menu is open, <CR>
+  -- belongs to the menu — don't tag (would strand steer_pending); just pass it through.
+  vim.keymap.set("i", "<C-CR>", function()
+    if not slash.active() then state.steer_pending = true end
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "n", false)
+  end, { buffer = ibuf, nowait = true, silent = true })
 
   -- Keep the bar pinned to the Claude column + bottom when the terminal/window is
   -- resized (the fixed-width panel's left edge shifts as the editor grows, so a

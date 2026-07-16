@@ -5,6 +5,7 @@
 /.work/FINDINGS.md filter=git-crypt diff=git-crypt
 /.work/PROGRESS.md filter=git-crypt diff=git-crypt
 /.work/PLAN.md filter=git-crypt diff=git-crypt
+/.work/CLAUDE-PANEL-TODOS.md filter=git-crypt diff=git-crypt
 # Post-mortems narrate internal architecture + vulnerable code paths on a PUBLIC
 # repo — same sensitivity class as the files above. Encrypt the whole dir. To
 # publish one deliberately (teaching/portfolio, zero-sensitivity), move it out of

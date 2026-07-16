@@ -2053,15 +2053,21 @@ local function dispatch(event)
     local tool = req.tool_name or ""
     if gate.EDIT_TOOLS[tool] then
       local input = req.input or {}
-      local gated = gate.GATED_EDIT_TOOLS[tool]
-        and gate.try_prewrite_gate(event.request_id, tool, input)
-      if not gated then
-        -- Post-write flow (MultiEdit/NotebookEdit, or a gated edit the pre-write
-        -- diff couldn't reconstruct/show): pre-load the target so the
-        -- FileChangedShell interceptor catches the write, then auto-allow — the
-        -- vimdiff review happens AFTER the CLI writes. (Gated tools skip watch()
-        -- at tool_use time, so the fallback must watch here; for the others this
-        -- is a harmless re-watch of the same path.)
+      if gate.GATED_EDIT_TOOLS[tool] then
+        local gated = gate.try_prewrite_gate(event.request_id, tool, input)
+        if not gated then
+          -- Pre-write diff reconstruction failed (stale old_string against a
+          -- fast-moving file, unreadable target, or claude_diff.open_prewrite
+          -- itself failing to open) — do NOT silently auto-allow a gated edit
+          -- tool just because the nicer pre-write UI couldn't render. Fall back
+          -- to the generic permission card so a decision surface still appears
+          -- before the write lands (security: this used to auto-allow here).
+          gate.show_permission_card(event)
+        end
+      else
+        -- MultiEdit/NotebookEdit: never gated by design — pre-load the target so
+        -- the FileChangedShell interceptor catches the write, then auto-allow.
+        -- The vimdiff review happens AFTER the CLI writes.
         require("utils.claude_diff").watch(input.file_path or input.notebook_path)
         gate.send_permission_response(event.request_id, "allow", { input = req.input })
       end

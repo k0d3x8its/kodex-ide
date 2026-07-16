@@ -445,9 +445,12 @@ H.check("T16 no rules → 2 options (Allow once, Reject)",
     and claude.state.perm.options[2].kind == "deny",
   vim.inspect(claude.state.perm and claude.state.perm.options))
 
--- Edit tool with NO old_string: unreconstructable for the pre-write gate (T20+),
--- so it falls back to auto-allow + the post-write FileChangedShell+vimdiff flow.
--- Must NOT disturb the pending card (cards are one-at-a-time; edits never queue one).
+-- Edit tool with NO old_string: unreconstructable for the pre-write gate (T20+).
+-- Security fix (2026-07-16): this used to silently auto-allow here — it must NOT.
+-- Falls back to the generic permission card instead, same as any other gated
+-- tool; since req-web-1's card is still up, it QUEUES rather than showing
+-- immediately (cards are one-at-a-time — must NOT disturb the pending card).
+local sends_edit1 = #chansend_calls
 feed({
   type       = "control_request",
   request_id = "req-edit-1",
@@ -457,10 +460,13 @@ feed({
     input     = { file_path = "/tmp/x.lua" },
   },
 })
-local r2 = last_control_response()
-H.check("T16 edit tool auto-allowed (kept for vimdiff)",
-  r2 and r2.response.request_id == "req-edit-1"
-    and r2.response.response.behavior == "allow", vim.inspect(r2))
+H.check("T16 unreconstructable edit shows a card too (no silent auto-allow)",
+  #chansend_calls == sends_edit1, "sends delta=" .. (#chansend_calls - sends_edit1))
+H.check("T16 unreconstructable edit queues behind the open card",
+  claude.state.perm and claude.state.perm.request_id == "req-web-1"
+    and claude.state.perm_queue and #claude.state.perm_queue == 1
+    and claude.state.perm_queue[1].request_id == "req-edit-1",
+  vim.inspect({ perm = claude.state.perm, queue = claude.state.perm_queue }))
 
 -- ── T17: card resolution — Allow once / Allow always (persists) / Reject ──────
 
@@ -474,6 +480,17 @@ H.check("T17 allow-once sends allow with echoed request_id + input",
   vim.inspect(r3))
 H.check("T17 allow-once does NOT persist a rule (no updatedPermissions)",
   r3 and r3.response.response.updatedPermissions == nil, vim.inspect(r3))
+H.check("T17 resolving drains the queued edit fallback card next (not cleared)",
+  claude.state.perm and claude.state.perm.request_id == "req-edit-1",
+  vim.inspect(claude.state.perm))
+
+-- Drain the queued edit fallback card too (Allow once) so state.perm is clean
+-- before the next block — it answers the same wire shape as any other card.
+claude._resolve_permission("once")
+local r2b = last_control_response()
+H.check("T17 queued edit fallback card allow-once sends allow",
+  r2b and r2b.response.request_id == "req-edit-1"
+    and r2b.response.response.behavior == "allow", vim.inspect(r2b))
 H.check("T17 card cleared after resolve (state.perm nil)",
   claude.state.perm == nil, vim.inspect(claude.state.perm))
 
@@ -978,8 +995,12 @@ H.check("T21 replace_all reconstructs every occurrence",
 claude.on_prewrite_resolve(false) -- clean up the held request
 
 -- ── T22: gate fallbacks — reconstruction failure / diff already open ──────────
--- old_string absent from the file → can't reconstruct → auto-allow immediately
--- (old post-write contract), nothing held.
+-- old_string absent from the file → can't reconstruct. Security fix (2026-07-16):
+-- this used to auto-allow immediately (old post-write contract) — it must NOT.
+-- Falls back to the generic permission card instead (no diff preview, but still a
+-- real decision surface), so a stale/failed reconstruction can never write to
+-- disk without the user ever seeing a card.
+local sends_edit4 = #chansend_calls
 feed({
   type       = "control_request",
   request_id = "req-edit-4",
@@ -989,15 +1010,17 @@ feed({
     input     = { file_path = t21, old_string = "NOT THERE", new_string = "x" },
   },
 })
-local re4 = last_control_response()
-H.check("T22 unreconstructable Edit auto-allows (fallback)",
-  re4 and re4.response.request_id == "req-edit-4"
-    and re4.response.response.behavior == "allow"
+H.check("T22 unreconstructable Edit shows a card (no silent auto-allow)",
+  #chansend_calls == sends_edit4, "sends delta=" .. (#chansend_calls - sends_edit4))
+H.check("T22 unreconstructable Edit armed as the fallback card",
+  claude.state.perm and claude.state.perm.request_id == "req-edit-4"
     and claude.state.prewrite == nil,
-  vim.inspect(re4))
+  vim.inspect(claude.state.perm))
+claude._resolve_permission("deny")  -- clear it before the next case
 
--- open_prewrite says no (a post-write diff is already up) → same fallback.
+-- open_prewrite says no (a post-write diff is already up) → same fallback card.
 prewrite_result = false
+local sends_write2 = #chansend_calls
 feed({
   type       = "control_request",
   request_id = "req-write-2",
@@ -1007,12 +1030,13 @@ feed({
     input     = { file_path = "/tmp/pw_other.txt", content = "x" },
   },
 })
-local rw2 = last_control_response()
-H.check("T22 occupied diff → Write auto-allows (fallback)",
-  rw2 and rw2.response.request_id == "req-write-2"
-    and rw2.response.response.behavior == "allow"
+H.check("T22 occupied diff → Write shows a card (no silent auto-allow)",
+  #chansend_calls == sends_write2, "sends delta=" .. (#chansend_calls - sends_write2))
+H.check("T22 occupied-diff Write armed as the fallback card",
+  claude.state.perm and claude.state.perm.request_id == "req-write-2"
     and claude.state.prewrite == nil,
-  vim.inspect(rw2))
+  vim.inspect(claude.state.perm))
+claude._resolve_permission("deny")  -- clear it before subsequent tests
 prewrite_result = true
 vim.fn.delete(t21)
 

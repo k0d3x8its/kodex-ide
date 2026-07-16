@@ -1157,9 +1157,15 @@ local function ensure_panel_buf()
   -- modal indicator persists while typing.
   vim.bo[buf].filetype   = "claude"
   -- foldmethod is window-local, not buffer-local; set it in open_panel_window.
-  -- Name the buffer "claude" so bufferline and lualine show something readable
-  -- instead of "[No Name]". pcall guards the rare E95 name-collision.
-  pcall(vim.api.nvim_buf_set_name, buf, "claude")
+  -- Name the buffer so bufferline and lualine show something readable instead of
+  -- "[No Name]". MUST use a scheme:// prefix, not a bare "claude": a relative
+  -- name resolves against cwd, and in a project that has a real ./claude dir
+  -- (e.g. ~/dev/dotfiles/claude) netrw sees isdirectory("claude")==true and
+  -- hijacks this scratch buffer into a directory listing — wiping filetype
+  -- "claude" and killing both the banner render and the modal statusline.
+  -- "neoclaude://" can never be a real dir, so netrw never fires. pcall guards
+  -- the rare E95 name-collision when a second panel reuses the same name.
+  pcall(vim.api.nvim_buf_set_name, buf, "neoclaude://neoclaude")
 
   state.panel_buf = buf
   state.hint_ns   = vim.api.nvim_create_namespace("claude_hint")

@@ -1,8 +1,9 @@
 -- lua/utils/project_picker.lua
--- Shown on dock launch (KODEX_IDE=1 / KODEX_CLAUDE=1). Lets the user pick a
--- project or resume the last session before the AI panel opens.
--- Both sites that open the panel branch on KODEX_CLAUDE to route to the correct
--- panel (FINDINGS.md § A1 / Goal 9 MG 9.3).
+-- Shown on dock launch (KODEX_IDE=1). Lets the user pick a project or resume the
+-- last session, THEN choose which AI panel to open, before it launches.
+-- Panel choice is a runtime prompt (Goal 11 redesign 2026-06-28), no longer the
+-- KODEX_CLAUDE launch env var — a single launcher, one chooser. Both sites that
+-- open the panel read the stored choice (chosen_panel) to route correctly.
 
 local mod = {}
 
@@ -30,11 +31,27 @@ local function latest_project_session(session_dir, projects)
   return best.name
 end
 
+-- Which AI panel the user picked for this launch: "claude" or "opencode".
+-- Set by pick_panel() (fired from finish()) BEFORE open_workspace opens anything;
+-- read at both open_workspace launch sites via open_panel(). Replaces the old
+-- KODEX_CLAUDE launch-env branch (Goal 11 redesign 2026-06-28).
+local chosen_panel = "opencode"
+
+-- Open the AI panel the user chose, seeded with the project root.
+-- Single routing point for both open_workspace sites (resumed + fresh-file).
+local function open_panel(proj)
+  if chosen_panel == "claude" then
+    require("utils.claude").open(proj)
+  else
+    require("utils.opencode").open()
+  end
+end
+
 -- After the project root is resolved, open the file-tree sidebar and arrange
 -- for the AI panel to launch when the user opens their first file.
 -- User decision (2026-06-13): the AI panel starts AFTER a file is chosen,
 -- seeded with that file, rather than immediately on project pick.
--- Which panel opens is determined by the launcher env var at both call sites.
+-- Which panel opens is the user's runtime choice (chosen_panel) at both sites.
 local function open_workspace(proj)
   -- Resumed session: a real file window is already open. Launch OpenCode now,
   -- seeded with that file. Do NOT open the sidebar — the tree is only wanted on
@@ -50,12 +67,7 @@ local function open_workspace(proj)
 
   if file_win then
     vim.api.nvim_set_current_win(file_win)
-    -- Branch: KODEX_CLAUDE=1 → Claude panel; KODEX_IDE=1 → OpenCode panel.
-    if vim.env.KODEX_CLAUDE == "1" then
-      require("utils.claude").open(proj)
-    else
-      require("utils.opencode").open()
-    end
+    open_panel(proj)
     return
   end
 
@@ -75,12 +87,8 @@ local function open_workspace(proj)
       local ft = vim.bo[args.buf].filetype
       if ft == "alpha" or ft == "NvimTree" then return end
       vim.api.nvim_del_augroup_by_id(group)
-      -- Branch: same logic as the resumed-session path above (MG 9.3 site 2).
-      if vim.env.KODEX_CLAUDE == "1" then
-        require("utils.claude").open(proj)
-      else
-        require("utils.opencode").open()
-      end
+      -- Same routing as the resumed-session path above (MG 9.3 site 2).
+      open_panel(proj)
       -- Return focus to the sidebar instead of the AI panel's insert prompt.
       -- Deferred so it runs after toggleterm finishes opening + entering insert.
       vim.schedule(function()
@@ -135,12 +143,22 @@ function mod.pick()
     -- nil means the user dismissed the picker — do nothing.
     if not choice then return end
 
-    -- Shared tail. Defer 200 ms so any restore_session() source() call finishes
-    -- opening buffers before open_workspace inspects the window layout.
+    -- Shared tail. Ask which AI panel to open — AFTER the repo + session
+    -- decisions, BEFORE the panel launches (Goal 11 redesign 2026-06-28). The
+    -- choice is stored in chosen_panel, read at both open_workspace sites.
+    -- Then defer 200 ms so any restore_session() source() call finishes opening
+    -- buffers before open_workspace inspects the window layout.
     local function finish(proj)
-      vim.defer_fn(function()
-        open_workspace(proj)
-      end, 200)
+      vim.ui.select({ "OpenCode", "Claude Code" }, {
+        prompt = "Open which AI panel?",
+      }, function(panel)
+        -- Dismiss (Esc) defaults to OpenCode — the historical dock default,
+        -- least surprising for anyone who just hits Enter/Esc through the flow.
+        chosen_panel = (panel == "Claude Code") and "claude" or "opencode"
+        vim.defer_fn(function()
+          open_workspace(proj)
+        end, 200)
+      end)
     end
 
     if choice == RESUME then

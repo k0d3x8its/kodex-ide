@@ -59,12 +59,17 @@ package.loaded["utils.term_layout"] = {
 -- claude_diff_spec.lua; here we test claude.lua's side of the contract.
 local prewrite_calls  = {}
 local prewrite_result = true
+-- watch_calls records claude_diff.watch(path) invocations — asserted on the
+-- gated-fallback branch (T16/T22) to confirm a failed pre-write reconstruction
+-- still arms the post-write vimdiff review instead of writing with NO review
+-- shown at any point (the blind-allow regression the security fix must avoid).
+local watch_calls = {}
 package.loaded["utils.claude_diff"] = {
   on_panel_open  = function() end,
   on_panel_close = function() end,
   on_diff_open   = function() end,
   on_diff_close  = function() end,
-  watch          = function() end,
+  watch          = function(path) table.insert(watch_calls, path) end,
   poll           = function() end,
   open_prewrite  = function(path, proposed)
     table.insert(prewrite_calls, { path = path, proposed = proposed })
@@ -467,6 +472,8 @@ H.check("T16 unreconstructable edit queues behind the open card",
     and claude.state.perm_queue and #claude.state.perm_queue == 1
     and claude.state.perm_queue[1].request_id == "req-edit-1",
   vim.inspect({ perm = claude.state.perm, queue = claude.state.perm_queue }))
+H.check("T16 unreconstructable edit still arms post-write review (watch called)",
+  watch_calls[#watch_calls] == "/tmp/x.lua", vim.inspect(watch_calls))
 
 -- ── T17: card resolution — Allow once / Allow always (persists) / Reject ──────
 
@@ -1016,6 +1023,8 @@ H.check("T22 unreconstructable Edit armed as the fallback card",
   claude.state.perm and claude.state.perm.request_id == "req-edit-4"
     and claude.state.prewrite == nil,
   vim.inspect(claude.state.perm))
+H.check("T22 unreconstructable Edit still arms post-write review (watch called)",
+  watch_calls[#watch_calls] == t21, vim.inspect(watch_calls))
 claude._resolve_permission("deny")  -- clear it before the next case
 
 -- open_prewrite says no (a post-write diff is already up) → same fallback card.
@@ -1036,6 +1045,8 @@ H.check("T22 occupied-diff Write armed as the fallback card",
   claude.state.perm and claude.state.perm.request_id == "req-write-2"
     and claude.state.prewrite == nil,
   vim.inspect(claude.state.perm))
+H.check("T22 occupied-diff Write still arms post-write review (watch called)",
+  watch_calls[#watch_calls] == "/tmp/pw_other.txt", vim.inspect(watch_calls))
 claude._resolve_permission("deny")  -- clear it before subsequent tests
 prewrite_result = true
 vim.fn.delete(t21)

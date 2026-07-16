@@ -2062,6 +2062,11 @@ local function dispatch(event)
           -- tool just because the nicer pre-write UI couldn't render. Fall back
           -- to the generic permission card so a decision surface still appears
           -- before the write lands (security: this used to auto-allow here).
+          -- Gated tools skip watch() at tool_use time (see the MultiEdit/
+          -- NotebookEdit branch below), so THIS is the only place left to arm
+          -- the post-write vimdiff review for this request — without it, an
+          -- "Allow once" here would write with no diff shown at any point.
+          require("utils.claude_diff").watch(input.file_path)
           gate.show_permission_card(event)
         end
       else

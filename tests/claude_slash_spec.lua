@@ -113,6 +113,20 @@ H.check("S4 no-match query opens an empty menu (no crash)",
   slash.active() == true and slash.selected() == nil)
 slash.close()
 
+-- ── S4c: an ALREADY-OPEN menu with real matches losing them to a no-match query.
+-- Distinct from the fresh-open case above (S4's own docs call this "vanish" in
+-- the TODO, but the design never auto-closes the menu — Slash.open's re-filter
+-- branch just re-renders empty). This exercises that re-filter (`else` branch,
+-- slash.lua ~688), not a fresh open.
+slash.open(ibuf, "c", 3, function() end)   -- real matches (changelog/compact)
+H.check("S4c starts open with matches", slash.active() == true and slash.selected() ~= nil)
+slash.open(ibuf, "zzz", 3, function() end)   -- same ibuf, query now matches nothing
+H.check("S4c menu stays OPEN (does not vanish) when an existing filter loses all matches",
+  slash.active() == true, tostring(slash.active()))
+H.check("S4c selection clears to nil (no stale highlighted row)",
+  slash.selected() == nil, tostring(slash.selected()))
+slash.close()
+
 -- ── S4b: disk-discovered skills populate the menu (new-skill auto-population) ───
 -- The reported bug: skills created AFTER the CLI advertised its slash_commands[]
 -- snapshot never showed. Fix: the menu also sources names from the on-disk skill/

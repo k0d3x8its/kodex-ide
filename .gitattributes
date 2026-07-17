@@ -6,6 +6,7 @@
 /.work/PROGRESS.md filter=git-crypt diff=git-crypt
 /.work/PLAN.md filter=git-crypt diff=git-crypt
 /.work/CLAUDE-PANEL-TODOS.md filter=git-crypt diff=git-crypt
+/.work/VERIFY.md filter=git-crypt diff=git-crypt
 # Wildcard catch-all: any markdown dropped in .work/ (recon notes, checklists,
 # archived gates, feature briefs) is private by convention — encrypt the lot
 # instead of adding a rule per new filename. Individual rules above stay for

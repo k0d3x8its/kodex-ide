@@ -680,4 +680,49 @@ claude.state.folds = {}
 claude.state.subagents = nil
 claude.state.panel_buf = nil
 
+-- ── T24: abandoned review recovers (deadlock safety net) ────────────────────
+-- Live deadlock 2026-07-16: if a review window is closed WITHOUT going through
+-- accept/reject (a bare `:q`, a layout change), close_diff never runs, so
+-- diff_pending sticks true forever — the chat bar wedges ("⚠ Awaiting review")
+-- and <leader>ca/cx are bound to a scratch buffer no longer on screen. The
+-- WinClosed safety net must catch the stray close, unlock input, and — because
+-- the CLI already wrote disk — KEEP Claude's change (never revert on abandon).
+D.state.current = nil
+H.ext_write(file1, { "aband1", "aband2" })
+D.checktime_all()
+vim.wait(300, function() return D.state.current ~= nil end)
+H.check("T24 diff open + input locked",
+  D.state.current == file1 and claude.state.diff_pending == true,
+  "current=" .. tostring(D.state.current) .. " pending=" .. tostring(claude.state.diff_pending))
+local aband_scratch_win = D.state.scratch_win
+-- Simulate the user closing the diff window directly (NOT accept/reject).
+pcall(vim.api.nvim_win_close, aband_scratch_win, true)
+vim.wait(300, function() return D.state.current == nil end)
+H.check("T24 abandon recovered diff state", D.state.current == nil,
+  "current=" .. tostring(D.state.current))
+H.check("T24 abandon unlocked the input bar", claude.state.diff_pending == false,
+  "pending=" .. tostring(claude.state.diff_pending))
+H.check("T24 abandon KEPT Claude's change on disk (no revert)",
+  table.concat(vim.fn.readfile(file1), "|") == "aband1|aband2",
+  table.concat(vim.fn.readfile(file1), "|"))
+
+-- ── T25: orig buffer is read-only while under review (stale-write guard) ─────
+-- The orig buffer is deliberately held at pre-edit content for the diff while
+-- the CLI rewrites disk (autoread off). A stray `:w`/autowriteall of that stale
+-- buffer would revert the CLI's write (the CLAUDE.md "modified since read" loop).
+-- It must be 'readonly' for the life of the review and restored on resolve.
+local ro_prior = vim.bo[buf1].readonly
+H.ext_write(file1, { "ro1", "ro2" })
+D.checktime_all()
+vim.wait(300, function() return D.state.current ~= nil end)
+H.check("T25 orig buffer readonly during review", vim.bo[buf1].readonly == true,
+  "readonly=" .. tostring(vim.bo[buf1].readonly))
+D.accept_all()
+vim.wait(300, function() return D.state.current == nil end)
+H.check("T25 accept still succeeded despite readonly (write! punches through)",
+  H.buf_lines(buf1) == "ro1|ro2", H.buf_lines(buf1))
+H.check("T25 orig readonly restored to its prior value after resolve",
+  vim.bo[buf1].readonly == ro_prior,
+  "readonly=" .. tostring(vim.bo[buf1].readonly) .. " prior=" .. tostring(ro_prior))
+
 H.summary("claude_diff")

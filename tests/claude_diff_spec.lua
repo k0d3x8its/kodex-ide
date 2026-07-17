@@ -8,6 +8,9 @@
 --   T17/T18: new-file path (pending-new → sweep_new whole-file-additions diff)
 --   T19: Goal 14.3 diff-review panel card — armed on open, resolves like the
 --        winbar/<leader>ca/cx fallback, fallback also clears a stale card
+--   T23: accept-time edit hunk anchors under its OWN header, not the buffer
+--        tail, when other content (e.g. an advisor escalation) streamed in
+--        while the review sat open
 -- The remaining CORRECTION behaviors (3,4,5) are exercised implicitly by T2/T7/T5.
 -- Run: nvim --headless -u NONE --cmd "set runtimepath+=." -c "luafile tests/claude_diff_spec.lua"
 
@@ -611,5 +614,70 @@ H.check("T22 created file is open in a window with its content",
     and H.buf_lines(vim.fn.bufnr(pwn2)) == "created-1|created-2",
   "winid=" .. vim.fn.bufwinid(vim.fn.bufnr(pwn2))
     .. " content=" .. H.buf_lines(vim.fn.bufnr(pwn2)))
+
+-- ── T23: accept-time edit hunk anchors under its OWN header, not the tail ────
+-- Live bug 2026-07-16 (screenshot: edit-advisoring-issue.png): while a
+-- post-write review sat open, the model escalated to the advisor mid-turn —
+-- "● Advising using <model>" + the "Consulting" activity line streamed into
+-- the transcript BEFORE the user accepted the review. render_edit_block used
+-- to buf_append at the (by-then-moved) buffer tail, so the edit's own hunk
+-- rendered nested under "● Advising" instead of under its own "● Edit(...)"
+-- header. Fixed via an anchor extmark (claude_diff.watch → mark_anchor)
+-- captured at the header's own trailing-blank line; render_edit_hunk inserts
+-- there instead of appending at the tail. This drives claude.render_edit_block
+-- (== render.render_edit_hunk) DIRECTLY — not through accept_all's pcall,
+-- which would swallow a throw and let a broken insert pass silently.
+local anchor_panel = vim.api.nvim_create_buf(false, true)
+claude.state.panel_buf = anchor_panel
+vim.bo[anchor_panel].modifiable = true
+vim.api.nvim_buf_set_lines(anchor_panel, 0, -1, false, {
+  "● Edit(alpha.txt)",         -- 0: the edit's own header
+  "",                          -- 1: its trailing blank == the anchor
+  "● Advising using Opus 4.8", -- 2: streamed in WHILE the review sat open
+  "  └ Consulting",            -- 3
+  "",                          -- 4
+})
+vim.bo[anchor_panel].modifiable = false
+local anchor_row = 1   -- 0-indexed: the blank line right after the Edit header
+
+-- Bookkeeping BELOW the anchor that is plain-line-keyed, not extmark-backed —
+-- seeded to prove shift_line_bookkeeping rekeys both after the mid-buffer
+-- insert (Vim's own fold ranges shift on their own; these two tables don't).
+claude.state.folds = { [4] = "3.2s" }                           -- 1-indexed fold-start key
+claude.state.subagents = { { header_lnum = 3, model = nil } }   -- 0-indexed, rewrite pending
+
+claude.render_edit_block("alpha.txt", { "a1", "a2", "a3" }, { "a1", "aX", "a3" }, anchor_row)
+
+local out = vim.api.nvim_buf_get_lines(anchor_panel, 0, -1, false)
+local advising_idx = nil
+for i, l in ipairs(out) do
+  if l:match("● Advising") then advising_idx = i - 1; break end
+end
+H.check("T23 'Advising' header still present after the hunk insert",
+  advising_idx ~= nil, vim.inspect(out))
+
+local hunk_before, hunk_after = 0, 0
+if advising_idx then
+  for i, l in ipairs(out) do
+    if l:match("^%s*%d+ [%+%-] ") then
+      if (i - 1) < advising_idx then hunk_before = hunk_before + 1 else hunk_after = hunk_after + 1 end
+    end
+  end
+end
+H.check("T23 hunk lines land BEFORE 'Advising', none after (anchor path taken, not tail fallback)",
+  hunk_before > 0 and hunk_after == 0,
+  "before=" .. hunk_before .. " after=" .. hunk_after .. " out=" .. vim.inspect(out))
+
+local shift = advising_idx and (advising_idx - 2) or 0   -- "Advising" started at 0-indexed row 2
+H.check("T23 fold duration key rekeyed by the insert shift",
+  claude.state.folds[4] == nil and claude.state.folds[4 + shift] == "3.2s",
+  vim.inspect(claude.state.folds))
+H.check("T23 pending subagent header_lnum rekeyed by the insert shift",
+  claude.state.subagents[1].header_lnum == 3 + shift,
+  vim.inspect(claude.state.subagents))
+
+claude.state.folds = {}
+claude.state.subagents = nil
+claude.state.panel_buf = nil
 
 H.summary("claude_diff")

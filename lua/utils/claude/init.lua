@@ -1527,6 +1527,7 @@ local function submit(text)
     if state.working then enqueue(text) else send(text) end
   end
 end
+mod._submit = submit   -- test hook: command-anywhere parse + echo-split
 
 -- ─── Chat input float (Goal 6.5) ─────────────────────────────────────────────
 

@@ -588,7 +588,35 @@ end
 Render.reset_hunk_fg_cache = reset_hunk_fg_cache
 Render._hunk_fg_group = hunk_fg_group   -- exposed for the regression spec (S21)
 
-local function render_edit_hunk(path, old_lines, new_lines)
+-- A mid-buffer insert (render_edit_hunk's anchor path below) shifts every line
+-- at/after the insertion point down. Vim's own manual folds auto-adjust with
+-- the buffer edit, but two of our OWN bookkeeping tables key on a raw line
+-- number captured at render time and do NOT: state.folds (thinking-block
+-- duration lookup, keyed by the fold's 1-indexed start line — see
+-- render_thinking) and a subagent's header_lnum (0-indexed, used to rewrite
+-- the "● neoclaude(...)" header once its model is known — see the parent_
+-- tool_use_id branch in dispatch). Rekey both so they still point at the
+-- right line after the shift. insert_row is 0-indexed; delta is always >= 0
+-- here (we only ever grow the buffer at the anchor).
+local function shift_line_bookkeeping(insert_row, delta)
+  if delta == 0 then return end
+  if state.folds then
+    local shifted = {}
+    for k, v in pairs(state.folds) do
+      shifted[(k > insert_row) and (k + delta) or k] = v
+    end
+    state.folds = shifted
+  end
+  if state.subagents then
+    for _, sub in ipairs(state.subagents) do
+      if sub.header_lnum and not sub.model and sub.header_lnum >= insert_row then
+        sub.header_lnum = sub.header_lnum + delta
+      end
+    end
+  end
+end
+
+local function render_edit_hunk(path, old_lines, new_lines, anchor_row)
   local buf = state.panel_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   local old_text = table.concat(old_lines or {}, "\n")
@@ -694,21 +722,48 @@ local function render_edit_hunk(path, old_lines, new_lines)
     end
   end
 
-  -- Sit flush under the ● Editing / └ block: drop any trailing blank rows first
-  -- (render_tool leaves a randomizer blank below the corner) so there's no gap
-  -- between the header and the hunk.
-  local lc = vim.api.nvim_buf_line_count(buf)
-  while lc > 0 and (vim.api.nvim_buf_get_lines(buf, lc - 1, lc, false)[1] or "") == "" do
+  -- Sit flush under the ● Editing / └ block. Normally the buffer TAIL still IS
+  -- that block (render_tool's trailing randomizer blank is the last line) — drop
+  -- it and append. But render_edit_hunk fires at ACCEPT time, which can be well
+  -- after other content streamed in (e.g. the model escalates to the advisor
+  -- while a post-write review modal sits open) — by then the tail has moved on,
+  -- and appending there nests the hunk under whatever's now last (live bug
+  -- 2026-07-16: an edit's diff + the advisor's "Consulting" line both rendered
+  -- under "● Advising"). `anchor_row` is the header's own trailing-blank line,
+  -- captured via extmark at watch()-time (claude_diff.lua) right when the
+  -- header rendered — insert there instead of at the tail whenever it's still
+  -- a live blank line. Falls back to the old tail-append when no anchor was
+  -- passed (or it's gone stale) so nothing regresses for callers that predate it.
+  local texts = {}
+  for i, d in ipairs(disp) do texts[i] = d.text end
+
+  local buf_lc = vim.api.nvim_buf_line_count(buf)
+  local first, inserted_at_anchor
+  if anchor_row and anchor_row >= 0 and anchor_row < buf_lc
+      and (vim.api.nvim_buf_get_lines(buf, anchor_row, anchor_row + 1, false)[1] or "") == "" then
     local was = vim.bo[buf].modifiable
     vim.bo[buf].modifiable = true
-    vim.api.nvim_buf_set_lines(buf, lc - 1, lc, false, {})
+    vim.api.nvim_buf_set_lines(buf, anchor_row, anchor_row + 1, false, texts)
+    vim.api.nvim_buf_set_lines(buf, anchor_row + #texts, anchor_row + #texts, false, { "" })
     vim.bo[buf].modifiable = was
-    lc = lc - 1
+    -- One blank removed, #texts + 1 lines added → everything from anchor_row on
+    -- shifted down by #texts net. Rekey the raw-line bookkeeping that can't
+    -- auto-adjust the way extmarks do.
+    shift_line_bookkeeping(anchor_row, #texts)
+    first = anchor_row
+    inserted_at_anchor = true
+  else
+    local lc = buf_lc
+    while lc > 0 and (vim.api.nvim_buf_get_lines(buf, lc - 1, lc, false)[1] or "") == "" do
+      local was = vim.bo[buf].modifiable
+      vim.bo[buf].modifiable = true
+      vim.api.nvim_buf_set_lines(buf, lc - 1, lc, false, {})
+      vim.bo[buf].modifiable = was
+      lc = lc - 1
+    end
+    first = vim.api.nvim_buf_line_count(buf)
+    buf_append(texts)
   end
-
-  local first, texts = vim.api.nvim_buf_line_count(buf), {}
-  for i, d in ipairs(disp) do texts[i] = d.text end
-  buf_append(texts)
 
   -- Highlight: full-line bg band for add/del (line_hl_group fills the EOL gap to
   -- the window edge); dim the line-number gutter on the first chunk; dim the ⋮
@@ -728,7 +783,9 @@ local function render_edit_hunk(path, old_lines, new_lines)
       end
     end
   end
-  buf_append({ "" })   -- trailing blank so the next content/spinner anchors below
+  if not inserted_at_anchor then
+    buf_append({ "" })   -- trailing blank so the next content/spinner anchors below
+  end
 end
 Render.render_edit_hunk = render_edit_hunk
 

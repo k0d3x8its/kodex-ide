@@ -22,6 +22,11 @@ local M = {}
 -- Shared panel state: claude_active gates the interceptor, diff_queue holds
 -- pending file paths. Owned by utils/claude so reset() can clear both.
 local claude = require("utils.claude")
+-- core.opts.width_pct: the panel's designed width fraction, needed directly
+-- (not via core.panel_width()) because that function prefers the LIVE window
+-- width when one exists — exactly wrong right after a squashing split, where
+-- the live width IS the squashed value we're trying to correct.
+local core = require("utils.claude.core")
 
 M.state = {
   current  = nil,   -- file currently shown in diff
@@ -64,9 +69,31 @@ M.state = {
   -- TAIL happens to be instead of under its own header (live bug 2026-07-16).
   anchor_mark = nil,
   anchor_buf  = nil,
+  -- Window ids of the CURRENT review, captured at mount. A WinClosed on either
+  -- that did NOT go through accept/reject (user `:q` on the diff, a layout change)
+  -- means the review was abandoned — recover_abandoned then unlocks the input bar
+  -- so diff_pending can't stick true forever (the wedged chat bar + dead
+  -- <leader>ca/cx deadlock, live-observed 2026-07-16).
+  orig_win    = nil,
+  scratch_win = nil,
+  -- The orig file buffer is deliberately HELD at pre-edit content for the diff's
+  -- "before" side while the CLI rewrites disk (autoread is off — see
+  -- on_panel_open). A stray `:w` or an autowriteall of that stale buffer would
+  -- OVERWRITE the CLI's write and revert Claude's edit (root cause of the
+  -- CLAUDE.md "modified since read" retry loop, 2026-07-16). We set the buffer
+  -- 'readonly' for the life of the review; this holds the prior value so
+  -- close_diff can restore it.
+  orig_prev_readonly = nil,
 }
 
 local anchor_ns = vim.api.nvim_create_namespace("claude_diff_anchor")
+
+-- Reentrancy guard for the WinClosed safety net (below): true only while
+-- close_diff is tearing the review down ITSELF — it closes the scratch window,
+-- which fires WinClosed. Without this the safety-net autocmd would re-enter
+-- close_diff on that self-inflicted close. See the WinClosed autocmd in
+-- ensure_autocmds.
+local in_close = false
 
 local function log(msg)
   if M.state.debug then
@@ -154,6 +181,15 @@ end
 
 local function close_diff()
   local s = M.state
+  -- Mark the teardown in progress so the WinClosed safety net doesn't re-enter
+  -- when we close the scratch window ourselves below.
+  in_close = true
+  -- Restore the orig buffer's writability before any teardown — a new-file orig
+  -- gets wiped further down, so restore while it is still valid.
+  if s.orig_buf and vim.api.nvim_buf_is_valid(s.orig_buf)
+      and s.orig_prev_readonly ~= nil then
+    vim.bo[s.orig_buf].readonly = s.orig_prev_readonly
+  end
   if s.orig_buf and vim.api.nvim_buf_is_valid(s.orig_buf) then
     local win = vim.fn.bufwinid(s.orig_buf)
     if win ~= -1 then
@@ -213,12 +249,15 @@ local function close_diff()
   if s.current then M.state.new_files[s.current] = nil end
   s.current, s.scratch, s.orig_buf = nil, nil, nil
   s.orig_win_created, s.orig_prev_buf = nil, nil
+  s.orig_win, s.scratch_win = nil, nil
+  s.orig_prev_readonly = nil
   s.kind = "edit"
   s.prewrite = false
   s.anchor_mark, s.anchor_buf = nil, nil
   -- Notify the Claude panel that the diff is resolved so it can unlock the
   -- input bar (MG 7.2 — mirrors the on_diff_open call in open_diff below).
   claude.on_diff_close()
+  in_close = false
   vim.schedule(M.process_next)
 end
 
@@ -373,6 +412,26 @@ function M.reject_all()
   close_diff()
 end
 
+-- A review's windows were closed OUTSIDE accept/reject (user `:q` on the diff, a
+-- layout change). close_diff never ran, so diff_pending would stick true forever —
+-- the chat bar refuses input ("⚠ Awaiting review") and <leader>ca/cx are bound to a
+-- scratch buffer no longer reachable on screen. Recover by resolving the held state
+-- so input unlocks:
+--   prewrite — a can_use_tool request is still armed; DENY it (reject_all's prewrite
+--     branch releases it and writes NOTHING to disk) so the CLI isn't left blocked.
+--   post-write — the CLI already wrote disk; abandoning review KEEPS that change, so
+--     just tear down state (close_diff). Never revert here — that is reject's job.
+local function recover_abandoned()
+  local s = M.state
+  if s.current == nil then return end
+  log("recover-abandoned:" .. tostring(s.current))
+  if s.prewrite then
+    M.reject_all()
+  else
+    close_diff()
+  end
+end
+
 -- Pick a normal editor window to host the diff — never the Claude panel and
 -- never a terminal. RC1 (claude.lua tool_result poll) now fires checktime while
 -- focus is in the Claude terminal panel, so the current window is NOT safe to
@@ -406,6 +465,7 @@ local function mount_diff(buf, scratch, is_new, prewrite)
   -- Reset teardown bookkeeping for this mount (see M.state field docs).
   M.state.orig_win_created = nil
   M.state.orig_prev_buf    = nil
+
   local win = vim.fn.bufwinid(buf)
   local created_win = false
   if win ~= -1 then
@@ -423,7 +483,10 @@ local function mount_diff(buf, scratch, is_new, prewrite)
       M.state.orig_prev_buf = vim.api.nvim_win_get_buf(target)
     else
       -- Panel is the only window: open an editor split to its LEFT so the panel
-      -- stays put on the right where it lives.
+      -- stays put on the right where it lives. `vsplit` splits the CURRENT
+      -- window in half — and the panel IS current here (it's the only window)
+      -- — so this halves the panel itself. Restored to its designed width below
+      -- (see the comment after the scratch split lands).
       vim.cmd("topleft vsplit")
       created_win = true
     end
@@ -431,12 +494,42 @@ local function mount_diff(buf, scratch, is_new, prewrite)
   end
   vim.cmd("diffthis")
   local orig_win = vim.api.nvim_get_current_win()
+  M.state.orig_win = orig_win
   -- A window WE created off the panel must be CLOSED on teardown, not have a
   -- buffer restored into it (its alternate is the panel buffer → phantom panel).
   if created_win then M.state.orig_win_created = orig_win end
+  -- Hold the orig buffer read-only for the life of the review so a stray `:w` or
+  -- an autowriteall of its (deliberately stale) content can't overwrite disk and
+  -- revert the CLI's write. accept_all/reject_all use `write!` (CORRECTION #5), so
+  -- they punch through this unchanged; close_diff restores the prior value.
+  M.state.orig_prev_readonly = vim.bo[buf].readonly
+  vim.bo[buf].readonly = true
+  log("mount-branch:" .. (created_win and "only-window"
+    or (win ~= -1 and "buf-onscreen" or "reused-target")))
   vim.cmd("rightbelow vsplit")
   vim.api.nvim_win_set_buf(0, scratch)
   vim.cmd("diffthis")
+
+  -- Live bug (screenshots 2026-07-16): the Claude panel gets squashed when a
+  -- diff mounts, compounding on each subsequent diff, until the panel is
+  -- closed and reopened. Confirmed empirically (headless repro) for the
+  -- only-window branch (`topleft vsplit` splits the CURRENT window, and the
+  -- panel IS current there since it's the only window — winfixwidth guards
+  -- against automatic resizes elsewhere, not an explicit split of the fixed
+  -- window itself). NOT independently confirmed against the reused-window
+  -- branch in a real session (a bare `-u NONE` headless harness loads none of
+  -- this plugin's own autocmds, so it can't rule out an interaction there) —
+  -- resize unconditionally rather than gate on the branch, since restoring an
+  -- already-correct width is a harmless no-op. `mount-branch` above records
+  -- which path fired; enable `M.state.debug = true` and inspect `.log` to
+  -- confirm which branch the real squash comes from if it recurs.
+  local panel_win = claude.state.panel_win
+  if panel_win and vim.api.nvim_win_is_valid(panel_win) then
+    local designed_w = math.floor(vim.o.columns * core.opts.width_pct)
+    vim.api.nvim_win_set_width(panel_win, designed_w)
+    log("panel-w-after:" .. vim.api.nvim_win_get_width(panel_win)
+      .. " designed:" .. designed_w)
+  end
 
   -- Wrap long lines INSIDE each diff column (BUG: proposed/original content ran
   -- off the right edge past the user's view). diffthis leaves the global `wrap`
@@ -446,6 +539,7 @@ local function mount_diff(buf, scratch, is_new, prewrite)
   -- can nudge left/right column alignment apart on very long lines — acceptable
   -- vs. content the user can't see at all.
   local scratch_win = vim.api.nvim_get_current_win()
+  M.state.scratch_win = scratch_win
   for _, w in ipairs({ orig_win, scratch_win }) do
     vim.wo[w].wrap        = true
     vim.wo[w].linebreak   = true
@@ -802,6 +896,29 @@ local function ensure_autocmds()
       if claude.state.claude_active then
         M.checktime_all()
       end
+    end,
+  })
+
+  -- Safety net for the review deadlock: if either diff window is closed WITHOUT
+  -- going through accept/reject (a bare `:q`, a layout change), close_diff never
+  -- runs and diff_pending sticks true — the chat bar wedges and <leader>ca/cx are
+  -- bound to an unreachable buffer. Detect the stray close and recover. The
+  -- in_close guard skips the close_diff-initiated scratch-window close (its own
+  -- teardown), so this only fires on an ABANDONED review.
+  vim.api.nvim_create_autocmd("WinClosed", {
+    group = grp,
+    callback = function(ev)
+      if in_close then return end
+      if not claude.state.claude_active then return end
+      if M.state.current == nil then return end
+      local closed = tonumber(ev.match)
+      if closed ~= M.state.scratch_win and closed ~= M.state.orig_win then return end
+      -- Scheduled: window/buffer ops in recover_abandoned are unsafe to run
+      -- synchronously inside a WinClosed callback.
+      vim.schedule(function()
+        if M.state.current == nil then return end -- resolved in the meantime
+        recover_abandoned()
+      end)
     end,
   })
 end

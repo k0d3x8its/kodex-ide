@@ -55,12 +55,37 @@ M.state = {
   -- resurrects the panel (a phantom 2nd panel column, live-observed 2026-07-03).
   orig_win_created = nil, -- win id we created via `topleft vsplit` (panel-only), else nil
   orig_prev_buf    = nil, -- buffer a REUSED editor window showed before the diff
+  -- Anchor for the accept-time transcript hunk (render.render_edit_block): an
+  -- extmark on the tool header's own trailing blank line, captured the instant
+  -- watch() runs (which is always right after render_tool appends that header —
+  -- see the EDIT_NAMES branch in render.lua's dispatch). accept_all() can fire
+  -- much later, after arbitrary other content (e.g. an advisor escalation)
+  -- streamed past that point; without this the hunk lands wherever the buffer
+  -- TAIL happens to be instead of under its own header (live bug 2026-07-16).
+  anchor_mark = nil,
+  anchor_buf  = nil,
 }
+
+local anchor_ns = vim.api.nvim_create_namespace("claude_diff_anchor")
 
 local function log(msg)
   if M.state.debug then
     table.insert(M.state.log, msg)
   end
+end
+
+-- Mark "right here" in the panel transcript as where a hunk for the CURRENT
+-- review belongs. Called at the top of watch() — the only two call sites
+-- (render.lua's ordinary post-write path and the gated-fallback path) both run
+-- immediately after the tool's own header block was appended, so the buffer
+-- tail at this instant IS that header's trailing blank line.
+local function mark_anchor()
+  local buf = claude.state.panel_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  local n = vim.api.nvim_buf_line_count(buf)
+  if n < 1 then return end
+  M.state.anchor_mark = vim.api.nvim_buf_set_extmark(buf, anchor_ns, n - 1, 0, {})
+  M.state.anchor_buf  = buf
 end
 
 -- Fetched live, never cached: claude.reset() replaces the diff_queue table
@@ -99,6 +124,7 @@ end
 function M.watch(path)
   if not path or path == "" then return end
   if not claude.state.claude_active then return end
+  mark_anchor()
   -- Absolute + slash-normalised so bufadd matches the name checktime/FCS report
   -- (a relative path would create a SECOND buffer for the same file → no FCS on
   -- the one we loaded).
@@ -189,6 +215,7 @@ local function close_diff()
   s.orig_win_created, s.orig_prev_buf = nil, nil
   s.kind = "edit"
   s.prewrite = false
+  s.anchor_mark, s.anchor_buf = nil, nil
   -- Notify the Claude panel that the diff is resolved so it can unlock the
   -- input bar (MG 7.2 — mirrors the on_diff_open call in open_diff below).
   claude.on_diff_close()
@@ -213,9 +240,20 @@ function M.accept_all()
   -- rendered its content inline as a numbered body at tool_use time
   -- (render.render_write_body), so the accept-time red/green hunk would double it up.
   local is_new = s.kind == "new"
+  -- Resolve the anchor NOW, before close_diff() below can reset it — the
+  -- extmark tracks the header's blank line through anything that streamed
+  -- in while this review sat open (see mark_anchor()).
+  local anchor_row
+  if s.anchor_mark and s.anchor_buf and vim.api.nvim_buf_is_valid(s.anchor_buf) then
+    local ok, pos = pcall(vim.api.nvim_buf_get_extmark_by_id,
+      s.anchor_buf, anchor_ns, s.anchor_mark, {})
+    if ok and pos and pos[1] then anchor_row = pos[1] end
+  end
   local function emit_transcript_block()
     if is_new then return end
-    if blk_old and blk_new then pcall(claude.render_edit_block, blk_path, blk_old, blk_new) end
+    if blk_old and blk_new then
+      pcall(claude.render_edit_block, blk_path, blk_old, blk_new, anchor_row)
+    end
   end
   -- Pre-write gate: nothing to write — accepting RELEASES the held permission
   -- request as "allow"; the CLI does the write itself right after. Flag the path

@@ -1284,4 +1284,30 @@ claude.state.permission_mode = "default"
 claude.state.stored_root = prev_root
 vim.cmd("cd " .. vim.fn.fnameescape(prev_cwd))
 
+-- ── T30: submit() command-anywhere parse + echo-split ──────────────────────────
+-- A slash command can sit anywhere in the prompt (not just line-leading). submit()
+-- must echo the user's FULL prose into the transcript but dispatch to the CLI only
+-- the extracted "/command ..." substring (see init.lua submit(), process.lua send()
+-- dispatch_override). Use /compact (a BUILTIN_DESC entry, so is_command() is true
+-- even pre-init) — /effort and /advisor are intercepted locally before any send.
+local t30_prev_host_ctx = claude.state.host_ctx_enabled
+claude.state.host_ctx_enabled = false   -- unrelated concern: no file-context note mutating the dispatch
+claude.state.working = false
+local t30_sends_before = #chansend_calls
+claude._submit("please /compact now, thanks")
+vim.wait(50, function() return #chansend_calls > t30_sends_before end)
+H.check("T30 full prose echoed into the transcript",
+  panel_text():find("please /compact now, thanks", 1, true) ~= nil, panel_text())
+H.check("T30 only the extracted command dispatched to the CLI",
+  last_sent_text() == "/compact now, thanks", tostring(last_sent_text()))
+
+-- No command anywhere in the text → prose is both echoed and dispatched verbatim.
+claude.state.working = false   -- T30's turn never resolved (no result event fed)
+local t30b_sends_before = #chansend_calls
+claude._submit("just a normal message, no slash here")
+vim.wait(50, function() return #chansend_calls > t30b_sends_before end)
+H.check("T30b no command → dispatched text equals the full prose",
+  last_sent_text() == "just a normal message, no slash here", tostring(last_sent_text()))
+claude.state.host_ctx_enabled = t30_prev_host_ctx
+
 H.summary("claude")

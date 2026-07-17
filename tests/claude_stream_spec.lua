@@ -1004,6 +1004,11 @@ if panel and vim.api.nvim_win_is_valid(panel) then
   vim.wait(100, function() return vim.api.nvim_get_current_win() == mwin end)
   H.check("S29 focusing the panel bounces back to the modal",
     vim.api.nvim_get_current_win() == mwin, tostring(vim.api.nvim_get_current_win()))
+  -- The BACKSTOP mechanism itself (ClaudeCursorBackstop, init.lua ~2425) is a
+  -- global `guicursor` toggle, not just the win-focus bounce above — assert the
+  -- actual value it sets, not a proxy. Landing on the modal win must hide it.
+  H.check("S29 guicursor hidden while focused on the modal",
+    vim.o.guicursor == "a:ver1-ClaudeCursorHidden", tostring(vim.o.guicursor))
   -- REGRESSION (live 2026-07-14): active_modal_win built its card list as a bare
   -- { state.perm, state.qask, state.diff_card } — with NO perm card open, the nil
   -- at index 1 is a table HOLE and ipairs stops there, so a question/diff card was
@@ -1038,6 +1043,21 @@ if panel and vim.api.nvim_win_is_valid(panel) then
   vim.wait(50)
   H.check("S29 no bounce once no modal is open",
     vim.api.nvim_get_current_win() == panel, tostring(vim.api.nvim_get_current_win()))
+  -- Genuine "visible on editor" arm: a THIRD window that is neither the panel nor
+  -- any registered modal slot (all nil at this point). The backstop's restore-arm
+  -- (init.lua ~2443) must un-hide the cursor here — this is the leak class it was
+  -- built to close (live-reported 2026-07-11: editor left with the dark hidden
+  -- cursor after a modal→editor focus change).
+  local known_visible = "a:block,a:blinkon0"
+  claude.state.real_guicursor = known_visible
+  local ebuf = vim.api.nvim_create_buf(false, true)
+  local ewin = vim.api.nvim_open_win(ebuf, true, {
+    relative = "editor", row = 5, col = 1, width = 12, height = 3, style = "minimal",
+  })
+  vim.wait(50)
+  H.check("S29 guicursor restored to visible on a plain editor window",
+    vim.o.guicursor == known_visible, tostring(vim.o.guicursor))
+  pcall(vim.api.nvim_win_close, ewin, true)
   pcall(vim.api.nvim_win_close, mwin, true)
 end
 

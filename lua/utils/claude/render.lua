@@ -685,8 +685,10 @@ local function render_edit_hunk(path, old_lines, new_lines, anchor_row)
     if r.kind == "gap" then
       disp[#disp + 1] = { text = ind .. pad .. " ⋮", sep = true }
     elseif r.kind == "more" then
-      disp[#disp + 1] = { text = ind .. pad .. "   … +" .. r.n .. " more changed line"
-        .. (r.n == 1 and "" or "s"), sep = true }
+      -- Mirrors the real CC TUI's "─── ✂ ─── N lines hidden" truncation banner
+      -- (found via `strings` on the CC binary) rather than a trailing "+N more".
+      disp[#disp + 1] = { text = ind .. pad .. "  ✂ " .. r.n .. " line"
+        .. (r.n == 1 and "" or "s") .. " hidden", sep = true }
     else
       local sign = (r.kind == "add" and "+") or (r.kind == "del" and "-") or " "
       local head = ind .. string.format("%" .. gw .. "d %s ", r.num, sign)  -- prefix_b bytes total

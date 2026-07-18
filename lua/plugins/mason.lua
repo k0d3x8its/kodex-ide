@@ -31,6 +31,7 @@ return {
 				"jsonls",
 				"arduino_language_server",
 				"yamlls",
+				"clangd",
 			},
 			automatic_installation = true,
 			automatic_enable = false,

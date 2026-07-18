@@ -15,6 +15,7 @@ return {
 				"cpp",
 				"javascript",
 				"typescript",
+				"tsx",
 				"html",
 				"css",
 				"solidity",

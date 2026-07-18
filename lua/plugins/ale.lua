@@ -62,5 +62,13 @@ return {
 
 		vim.g.ale_arduino_executable = "arduino-cli"
 		vim.g.ale_arduino_fqbn = "arduino:avr:uno"
+
+		-- solhint/htmllint auto-discover global fallback configs
+		-- unreliably (confirmed: same file works via explicit path, silently
+		-- no-ops via implicit search) — pass the path explicitly instead of
+		-- relying on their config discovery. Project-local configs should be
+		-- passed the same way if a project needs to override these.
+		vim.g.ale_solidity_solhint_options = "--config " .. vim.fn.expand("~/.solhint.json")
+		vim.g.ale_html_htmllint_options = "--rc " .. vim.fn.expand("~/.htmllintrc")
 	end,
 }

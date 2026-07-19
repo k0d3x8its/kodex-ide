@@ -48,6 +48,15 @@ M.state = {
   -- interceptor consumes the flag and silently reloads instead of queueing a diff —
   -- without this the approved write would be double-gated by the post-write flow.
   approved = {},
+  -- abs path → emit_transcript_block closure, for an approved pre-write edit whose
+  -- accept-time hunk render is DEFERRED until the CLI's own write is confirmed.
+  -- accept_all() can't know the write succeeded (it only released the permission
+  -- gate — the CLI does the write itself, asynchronously, after this function
+  -- returns), so rendering the "success" hunk synchronously at approval time would
+  -- lie if the write then fails (bad perms, disk full, readonly target). The
+  -- confirmation arrives via the write's own tool_result (render.lua's EDIT_NAMES
+  -- dispatch, which already carries is_error) calling resolve_prewrite_result().
+  pending_emit = {},
   -- abs path of an approved pre-write NEW file, awaiting reveal. Unlike an edit
   -- (whose loaded buffer FCS-reloads), a new file has no buffer to repaint, so
   -- poll() opens it in an editor window once the CLI's write lands. Single-shot.
@@ -300,6 +309,12 @@ function M.accept_all()
   if s.prewrite then
     if s.current and s.kind ~= "new" then
       M.state.approved[s.current] = true
+      -- Defer the hunk render until the write's own tool_result confirms it
+      -- (see pending_emit's doc comment above). is_new already no-ops
+      -- emit_transcript_block, so only the edit-to-existing-file case needs this.
+      if blk_old and blk_new then
+        M.state.pending_emit[s.current] = emit_transcript_block
+      end
     elseif s.current and s.kind == "new" then
       -- New file: no real-path buffer catches the CLI's async write (one would be
       -- BF_NEW and trip W13, the trap open_prewrite dodges with a throwaway scratch),
@@ -312,7 +327,6 @@ function M.accept_all()
     log("prewrite-accept:" .. tostring(s.current))
     claude.on_prewrite_resolve(true)
     close_diff()
-    emit_transcript_block()
     return
   end
   -- The original buffer can be :bd'd while the scratch diff is still open;
@@ -776,6 +790,33 @@ function M.sweep_new()
       M.push(abs)                    -- dedups against current + queue
       log("new-created:" .. abs)
     end
+  end
+end
+
+-- Resolve a deferred prewrite hunk render (see pending_emit's doc comment) once the
+-- CLI's write actually lands or fails. Called from render.lua's tool_result dispatch
+-- for EDIT_NAMES tools, which already carries the write's is_error — the ONLY place
+-- that signal exists. Success: render the hunk now (finally true). Failure: drop it
+-- silently — render.lua's own EDIT_NAMES branch already shows a red tool_result body
+-- for is_error, so a second notification here would just duplicate it — and clear
+-- the `approved` flag so a later unrelated write to the same path isn't mistaken for
+-- this one's silent-reload (the flag would otherwise dangle forever: no write landed,
+-- so no FileChangedShell ever fires to consume it).
+function M.resolve_prewrite_result(path, is_error)
+  -- Normalize: pending_emit is keyed by open_prewrite's fnamemodify(path, ":p")
+  -- (s.current), but the caller here hands the RAW tool_use input.file_path —
+  -- same source string, but un-normalized. A silent mismatch would mean the
+  -- hunk never renders even on success, which is worse than the original bug.
+  path = vim.fn.fnamemodify(path, ":p")
+  local emit = M.state.pending_emit[path]
+  if not emit then return end
+  M.state.pending_emit[path] = nil
+  if is_error then
+    M.state.approved[path] = nil
+    log("prewrite-write-FAILED:" .. tostring(path))
+  else
+    log("prewrite-write-confirmed:" .. tostring(path))
+    emit()
   end
 end
 

@@ -1925,6 +1925,15 @@ local function dispatch(event)
       if (block.type or "") == "tool_result" then
         local meta = state.tool_meta and state.tool_meta[block.tool_use_id]
         local sb   = state.search_blocks and state.search_blocks[block.tool_use_id]
+        -- Resolve any DEFERRED prewrite accept-time hunk for this path — a no-op
+        -- unless accept_all() actually deferred one (claude_diff.pending_emit).
+        -- Must run before the branches below so a failed write's is_error still
+        -- reaches resolve_prewrite_result even though it then falls through to
+        -- the plain render_tool_result branch for its own red error body.
+        if meta and EDIT_NAMES[meta.name] and meta.path then
+          require("utils.claude_diff").resolve_prewrite_result(
+            meta.path, block.is_error == true)
+        end
         -- NOTE: do NOT treat the parent-turn Agent tool_result as "done" — for a
         -- BACKGROUND agent it's only a "launched successfully" ack that arrives
         -- immediately while the agent keeps running (probed 2026-07-06, FINDINGS

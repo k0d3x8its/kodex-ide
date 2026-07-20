@@ -25,20 +25,20 @@ H.stub_project_root("/tmp")
 -- without spawning a real process.
 
 local captured_stdout_cb = nil
-local captured_exit_cb   = nil
-local jobstart_calls     = {}   -- list of argv tables, one per spawn
-local chansend_calls     = {}   -- list of { job, data } payloads
+local captured_exit_cb = nil
+local jobstart_calls = {} -- list of argv tables, one per spawn
+local chansend_calls = {} -- list of { job, data } payloads
 
 vim.fn.jobstart = function(cmd, opts)
-  table.insert(jobstart_calls, cmd)
-  captured_stdout_cb = opts.on_stdout
-  captured_exit_cb   = opts.on_exit
-  return 99  -- fake job_id; > 0 means success
+	table.insert(jobstart_calls, cmd)
+	captured_stdout_cb = opts.on_stdout
+	captured_exit_cb = opts.on_exit
+	return 99 -- fake job_id; > 0 means success
 end
 vim.fn.jobstop = function() end
 vim.fn.chansend = function(job, data)
-  table.insert(chansend_calls, { job = job, data = data })
-  return #data
+	table.insert(chansend_calls, { job = job, data = data })
+	return #data
 end
 vim.fn.chanclose = function() end
 
@@ -46,7 +46,7 @@ vim.fn.chanclose = function() end
 
 -- term_layout: place_vertical does window ops irrelevant to these tests.
 package.loaded["utils.term_layout"] = {
-  place_vertical = function() end,
+	place_vertical = function() end,
 }
 
 -- claude_diff: on_panel_open would register FileChangedShell autocmds that
@@ -57,31 +57,39 @@ package.loaded["utils.term_layout"] = {
 -- up, hold the request", false = "couldn't show it, fall back to auto-allow").
 -- The REAL open_prewrite (windows, accept/reject routing) is covered in
 -- claude_diff_spec.lua; here we test claude.lua's side of the contract.
-local prewrite_calls  = {}
+local prewrite_calls = {}
 local prewrite_result = true
 -- watch_calls records claude_diff.watch(path) invocations — asserted on the
 -- gated-fallback branch (T16/T22) to confirm a failed pre-write reconstruction
 -- still arms the post-write vimdiff review instead of writing with NO review
 -- shown at any point (the blind-allow regression the security fix must avoid).
 local watch_calls = {}
+-- watch_result controls what the stubbed watch() reports back — T31 flips it to
+-- false to prove MultiEdit/NotebookEdit's auto-allow refuses to fire when watch()
+-- no-ops (the sole review path for those two tools; real watch() returns false on
+-- empty/nil path, panel inactive, or bufadd failure — see claude_diff.lua).
+local watch_result = true
 package.loaded["utils.claude_diff"] = {
-  on_panel_open  = function() end,
-  on_panel_close = function() end,
-  on_diff_open   = function() end,
-  on_diff_close  = function() end,
-  watch          = function(path) table.insert(watch_calls, path) end,
-  poll           = function() end,
-  open_prewrite  = function(path, proposed)
-    table.insert(prewrite_calls, { path = path, proposed = proposed })
-    return prewrite_result
-  end,
+	on_panel_open = function() end,
+	on_panel_close = function() end,
+	on_diff_open = function() end,
+	on_diff_close = function() end,
+	watch = function(path)
+		table.insert(watch_calls, path)
+		return watch_result
+	end,
+	poll = function() end,
+	open_prewrite = function(path, proposed)
+		table.insert(prewrite_calls, { path = path, proposed = proposed })
+		return prewrite_result
+	end,
 }
 
 -- opencode: the mutex check in claude.toggle() does pcall(require, "utils.opencode").
 -- Return a stub with opencode_active=false so the mutex branch is skipped.
 package.loaded["utils.opencode"] = {
-  state  = { opencode_active = false },
-  toggle = function() end,
+	state = { opencode_active = false },
+	toggle = function() end,
 }
 
 -- ── Load module under test ────────────────────────────────────────────────────
@@ -90,16 +98,22 @@ local claude = require("utils.claude")
 claude.setup({ width_pct = 0.40 })
 
 -- Patch is_available: the real binary may not be installed on the test machine.
-claude.is_available = function() return true end
+claude.is_available = function()
+	return true
+end
 
 -- Drive the input float headlessly. The real _open_chat_float opens an
 -- interactive nvim_open_win prompt buffer; the stub invokes the callback
 -- synchronously with whatever `next_answer` is set to (nil = user cancelled).
 local next_answer = nil
-claude._open_chat_float = function(_title, cb) cb(next_answer) end
+claude._open_chat_float = function(_title, cb)
+	cb(next_answer)
+end
 -- ask_selection now uses a SEPARATE selection-anchored float; stub it the same
 -- way (synchronous callback) so T10/T11 drive it without an interactive window.
-claude._open_selection_float = function(_title, cb) cb(next_answer) end
+claude._open_selection_float = function(_title, cb)
+	cb(next_answer)
+end
 
 -- ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -109,36 +123,50 @@ claude._open_selection_float = function(_title, cb) cb(next_answer) end
 -- { line, "" } (the trailing "" is the empty next-line tail). We must mirror
 -- that exactly — appending a literal "\n" would NOT match real delivery.
 local function feed(ev)
-  local line = vim.json.encode(ev)
-  captured_stdout_cb(99, { line, "" }, "stdout")
-  vim.wait(50)
+	local line = vim.json.encode(ev)
+	captured_stdout_cb(99, { line, "" }, "stdout")
+	vim.wait(50)
 end
 
 -- Read all panel buffer lines as a single pipe-joined string for easy matching.
 local function panel_text()
-  local buf = claude.state.panel_buf
-  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return "" end
-  return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "|")
+	local buf = claude.state.panel_buf
+	if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+		return ""
+	end
+	return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "|")
 end
 
 -- argv of the most recent jobstart spawn.
-local function last_argv() return jobstart_calls[#jobstart_calls] end
+local function last_argv()
+	return jobstart_calls[#jobstart_calls]
+end
 
 -- The text of the most recently sent stream-json user message (decoded from the
 -- last chansend payload). Returns nil if nothing was sent or it wasn't a user
 -- message (e.g. a control_request).
 local function last_sent_text()
-  local last = chansend_calls[#chansend_calls]
-  if not last then return nil end
-  local ok, ev = pcall(vim.json.decode, last.data)
-  if not ok or type(ev) ~= "table" then return nil end
-  if ev.type ~= "user" then return nil end
-  return ev.message.content[1].text
+	local last = chansend_calls[#chansend_calls]
+	if not last then
+		return nil
+	end
+	local ok, ev = pcall(vim.json.decode, last.data)
+	if not ok or type(ev) ~= "table" then
+		return nil
+	end
+	if ev.type ~= "user" then
+		return nil
+	end
+	return ev.message.content[1].text
 end
 
 local function argv_contains(argv, val)
-  for _, a in ipairs(argv or {}) do if a == val then return true end end
-  return false
+	for _, a in ipairs(argv or {}) do
+		if a == val then
+			return true
+		end
+	end
+	return false
 end
 
 -- Trigger a real send through the public input path. Clears only the in-flight
@@ -146,40 +174,44 @@ end
 -- the persistent process is reused across turns, so the second send must NOT
 -- respawn. Tests that want a fresh spawn null job_id explicitly.
 local function user_send(text)
-  claude.state.working = false
-  next_answer = text
-  claude.prompt_input()
-  vim.wait(20)
+	claude.state.working = false
+	next_answer = text
+	claude.prompt_input()
+	vim.wait(20)
 end
 
 -- Set visual-selection marks manually (mirrors opencode_spec.lua).
 local function with_selection(lines, s_line, s_col, e_line, e_col, sel_mode)
-  local buf = vim.api.nvim_create_buf(true, false)
-  vim.api.nvim_set_current_buf(buf)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.o.selection = sel_mode or "inclusive"
-  vim.fn.setpos("'<", { buf, s_line, s_col, 0 })
-  vim.fn.setpos("'>", { buf, e_line, e_col, 0 })
-  return buf
+	local buf = vim.api.nvim_create_buf(true, false)
+	vim.api.nvim_set_current_buf(buf)
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+	vim.o.selection = sel_mode or "inclusive"
+	vim.fn.setpos("'<", { buf, s_line, s_col, 0 })
+	vim.fn.setpos("'>", { buf, e_line, e_col, 0 })
+	return buf
 end
 
 -- ── T1: Binary resolution ─────────────────────────────────────────────────────
 
-H.check("T1 CLAUDE_BIN expands to full path",
-  claude.CLAUDE_BIN == vim.fn.expand("~/.local/bin/claude"),
-  "got: " .. claude.CLAUDE_BIN)
+H.check(
+	"T1 CLAUDE_BIN expands to full path",
+	claude.CLAUDE_BIN == vim.fn.expand("~/.local/bin/claude"),
+	"got: " .. claude.CLAUDE_BIN
+)
 
 local real_available = claude.is_available
-claude.is_available = function() return vim.fn.executable(claude.CLAUDE_BIN) == 1 end
+claude.is_available = function()
+	return vim.fn.executable(claude.CLAUDE_BIN) == 1
+end
 H.check("T1 is_available returns bool", type(claude.is_available()) == "boolean")
-claude.is_available = real_available  -- restore stub
+claude.is_available = real_available -- restore stub
 
 -- ── T2: State table shape ─────────────────────────────────────────────────────
 
 H.check("T2 state.claude_active starts false", claude.state.claude_active == false)
-H.check("T2 state.job_id starts nil",          claude.state.job_id == nil)
-H.check("T2 state.session_id starts nil",       claude.state.session_id == nil)
-H.check("T2 state.panel_buf starts nil",        claude.state.panel_buf == nil)
+H.check("T2 state.job_id starts nil", claude.state.job_id == nil)
+H.check("T2 state.session_id starts nil", claude.state.session_id == nil)
+H.check("T2 state.panel_buf starts nil", claude.state.panel_buf == nil)
 
 -- ── T3: toggle() opens the panel but does NOT spawn (per-message arch) ─────────
 -- The panel anchors to the live cwd (vim.fn.getcwd()), so pin it to a known dir.
@@ -188,52 +220,62 @@ vim.cmd("cd /tmp")
 claude.toggle()
 vim.wait(50)
 
-H.check("T3 no subprocess spawned by toggle",   claude.state.job_id == nil
-  and #jobstart_calls == 0)
-H.check("T3 claude_active true after toggle",   claude.state.claude_active == true)
-H.check("T3 panel_buf created",                 claude.state.panel_buf ~= nil
-  and vim.api.nvim_buf_is_valid(claude.state.panel_buf))
-H.check("T3 panel_buf is nomodifiable",
-  not vim.bo[claude.state.panel_buf].modifiable)
+H.check("T3 no subprocess spawned by toggle", claude.state.job_id == nil and #jobstart_calls == 0)
+H.check("T3 claude_active true after toggle", claude.state.claude_active == true)
+H.check("T3 panel_buf created", claude.state.panel_buf ~= nil and vim.api.nvim_buf_is_valid(claude.state.panel_buf))
+H.check("T3 panel_buf is nomodifiable", not vim.bo[claude.state.panel_buf].modifiable)
 -- Cold-start banner renders the glyph + the cwd line before any model is known.
-H.check("T3 cold banner glyph present",         panel_text():match("▐▛███▜▌") ~= nil,
-  panel_text())
-H.check("T3 cold banner cwd present",           panel_text():match("/tmp") ~= nil,
-  panel_text())
+H.check("T3 cold banner glyph present", panel_text():match("▐▛███▜▌") ~= nil, panel_text())
+H.check("T3 cold banner cwd present", panel_text():match("/tmp") ~= nil, panel_text())
 
 -- ── T4: first send spawns the persistent stream-json process ──────────────────
 
-claude.state.job_id = nil   -- ensure a clean first spawn
+claude.state.job_id = nil -- ensure a clean first spawn
 local spawns_before = #jobstart_calls
 user_send("hello claude")
-H.check("T4 first send spawns subprocess",      claude.state.job_id == 99)
-H.check("T4 stdout callback captured",          captured_stdout_cb ~= nil)
+H.check("T4 first send spawns subprocess", claude.state.job_id == 99)
+H.check("T4 stdout callback captured", captured_stdout_cb ~= nil)
 local a4 = last_argv()
-H.check("T4 spawn uses stream-json input mode",
-  argv_contains(a4, "--input-format") and argv_contains(a4, "stream-json"), table.concat(a4, " "))
-H.check("T4 spawn carries --print + permission-mode default",
-  argv_contains(a4, "--print") and argv_contains(a4, "default"), table.concat(a4, " "))
-H.check("T4 spawn carries --permission-prompt-tool stdio (permission gate)",
-  argv_contains(a4, "--permission-prompt-tool") and argv_contains(a4, "stdio"),
-  table.concat(a4, " "))
-H.check("T4 spawn has NO positional message / session flags",
-  not argv_contains(a4, "hello claude")
-  and not argv_contains(a4, "--session-id")
-  and not argv_contains(a4, "--resume"), table.concat(a4, " "))
-H.check("T4 default spawn omits --effort (level unset)",
-  not argv_contains(a4, "--effort"), table.concat(a4, " "))
-H.check("T4 message sent as stream-json over stdin",
-  last_sent_text() == "hello claude", tostring(last_sent_text()))
-H.check("T4 working flag set during send",       claude.state.working == true)
+H.check(
+	"T4 spawn uses stream-json input mode",
+	argv_contains(a4, "--input-format") and argv_contains(a4, "stream-json"),
+	table.concat(a4, " ")
+)
+H.check(
+	"T4 spawn carries --print + permission-mode default",
+	argv_contains(a4, "--print") and argv_contains(a4, "default"),
+	table.concat(a4, " ")
+)
+H.check(
+	"T4 spawn carries --permission-prompt-tool stdio (permission gate)",
+	argv_contains(a4, "--permission-prompt-tool") and argv_contains(a4, "stdio"),
+	table.concat(a4, " ")
+)
+H.check(
+	"T4 spawn has NO positional message / session flags",
+	not argv_contains(a4, "hello claude")
+		and not argv_contains(a4, "--session-id")
+		and not argv_contains(a4, "--resume"),
+	table.concat(a4, " ")
+)
+H.check("T4 default spawn omits --effort (level unset)", not argv_contains(a4, "--effort"), table.concat(a4, " "))
+H.check("T4 message sent as stream-json over stdin", last_sent_text() == "hello claude", tostring(last_sent_text()))
+H.check("T4 working flag set during send", claude.state.working == true)
 
 -- ── T5: second send REUSES the same process (no respawn) ──────────────────────
 
 user_send("second message")
-H.check("T5 second send does NOT respawn",       #jobstart_calls == spawns_before + 1,
-  "spawns=" .. tostring(#jobstart_calls) .. " expected=" .. tostring(spawns_before + 1))
-H.check("T5 process handle unchanged",           claude.state.job_id == 99)
-H.check("T5 second message sent as stream-json over stdin",
-  last_sent_text() == "second message", tostring(last_sent_text()))
+H.check(
+	"T5 second send does NOT respawn",
+	#jobstart_calls == spawns_before + 1,
+	"spawns=" .. tostring(#jobstart_calls) .. " expected=" .. tostring(spawns_before + 1)
+)
+H.check("T5 process handle unchanged", claude.state.job_id == 99)
+H.check(
+	"T5 second message sent as stream-json over stdin",
+	last_sent_text() == "second message",
+	tostring(last_sent_text())
+)
 
 -- ── T6: system/init event → banner model + version filled ─────────────────────
 -- Friendly name is rendered (NOT the raw model id), version appears on line 0.
@@ -241,35 +283,34 @@ H.check("T5 second message sent as stream-json over stdin",
 feed({ type = "system", subtype = "init", model = "claude-sonnet-4-6", claude_code_version = "1.2.0" })
 
 local banner_text = panel_text()
-H.check("T6 banner line1 glyph present",  banner_text:match("▐▛███▜▌") ~= nil, banner_text)
-H.check("T6 banner line2 belly present",  banner_text:match("▝▜█████▛▘") ~= nil, banner_text)
-H.check("T6 banner line3 feet present",   banner_text:match("▘▘ ▝▝") ~= nil, banner_text)
+H.check("T6 banner line1 glyph present", banner_text:match("▐▛███▜▌") ~= nil, banner_text)
+H.check("T6 banner line2 belly present", banner_text:match("▝▜█████▛▘") ~= nil, banner_text)
+H.check("T6 banner line3 feet present", banner_text:match("▘▘ ▝▝") ~= nil, banner_text)
 H.check("T6 friendly model name in banner", banner_text:match("Sonnet 4%.6") ~= nil, banner_text)
-H.check("T6 raw model id NOT shown",      banner_text:match("claude%-sonnet%-4%-6") == nil, banner_text)
-H.check("T6 version in banner",           banner_text:match("v1%.2%.0") ~= nil, banner_text)
-H.check("T6 system_ready flipped",        claude.state.system_ready == true)
+H.check("T6 raw model id NOT shown", banner_text:match("claude%-sonnet%-4%-6") == nil, banner_text)
+H.check("T6 version in banner", banner_text:match("v1%.2%.0") ~= nil, banner_text)
+H.check("T6 system_ready flipped", claude.state.system_ready == true)
 
 -- ── T7: assistant text event → prose rendered ─────────────────────────────────
 
 local lines_before = vim.api.nvim_buf_line_count(claude.state.panel_buf)
 feed({ type = "assistant", message = { content = {
-  { type = "text", text = "This is assistant prose." }
+	{ type = "text", text = "This is assistant prose." },
 } } })
-H.check("T7 prose appended to panel buffer",
-  vim.api.nvim_buf_line_count(claude.state.panel_buf) > lines_before)
-H.check("T7 prose text in buffer",
-  panel_text():match("This is assistant prose") ~= nil, panel_text())
+H.check("T7 prose appended to panel buffer", vim.api.nvim_buf_line_count(claude.state.panel_buf) > lines_before)
+H.check("T7 prose text in buffer", panel_text():match("This is assistant prose") ~= nil, panel_text())
 
 -- ── T8: tool_use event → tool line rendered ───────────────────────────────────
 
 lines_before = vim.api.nvim_buf_line_count(claude.state.panel_buf)
-feed({ type = "assistant", message = { content = {
-  { type = "tool_use", name = "Read", input = { file_path = "lua/utils/claude.lua" } }
-} } })
-H.check("T8 tool line appended",
-  vim.api.nvim_buf_line_count(claude.state.panel_buf) > lines_before)
-H.check("T8 tool verb and target in buffer",
-  panel_text():match("Reading.*claude%.lua") ~= nil, panel_text())
+feed({
+	type = "assistant",
+	message = { content = {
+		{ type = "tool_use", name = "Read", input = { file_path = "lua/utils/claude.lua" } },
+	} },
+})
+H.check("T8 tool line appended", vim.api.nvim_buf_line_count(claude.state.panel_buf) > lines_before)
+H.check("T8 tool verb and target in buffer", panel_text():match("Reading.*claude%.lua") ~= nil, panel_text())
 
 -- ── T9: result event → churn done-line + no trailing separator + working clear ─
 -- The result text is NOT echoed (it duplicates the prose and can contain newlines
@@ -280,16 +321,17 @@ H.check("T8 tool verb and target in buffer",
 claude.state.working = true
 lines_before = vim.api.nvim_buf_line_count(claude.state.panel_buf)
 feed({ type = "result", result = "Done." })
-H.check("T9 result appends the '✻ … for <time>' churn done-line",
-  panel_text():match("✻ %a+ for ") ~= nil, panel_text())
-H.check("T9 result text NOT echoed (no duplicate, no crash)",
-  panel_text():match("Done%.") == nil, panel_text())
+H.check(
+	"T9 result appends the '✻ … for <time>' churn done-line",
+	panel_text():match("✻ %a+ for ") ~= nil,
+	panel_text()
+)
+H.check("T9 result text NOT echoed (no duplicate, no crash)", panel_text():match("Done%.") == nil, panel_text())
 H.check("T9 working cleared on result", claude.state.working == false)
 -- The earlier turns (T4/T5 sends) each placed a separator above their ❯ echo.
 -- panel_text() joins buffer lines with "|", so an all-dash line immediately
 -- preceding an echo line reads as "─…─|❯".
-H.check("T9 turn separator sits above the user echo",
-  panel_text():match("─|❯") ~= nil, panel_text())
+H.check("T9 turn separator sits above the user echo", panel_text():match("─|❯") ~= nil, panel_text())
 
 -- Result with embedded newlines must not crash render (regression: the old
 -- code passed multi-line text straight to nvim_buf_set_lines).
@@ -301,50 +343,63 @@ H.check("T9 multi-line result does not crash", ok_multiline)
 -- Format: "question\n\n```\nselection\n```" sent as the turn's stream-json user
 -- message (not a CLI positional arg).
 
-claude.state.job_id       = nil
-claude.state.working      = false
+claude.state.job_id = nil
+claude.state.working = false
 claude.state.diff_pending = false
 local sends_before = #chansend_calls
 
 next_answer = "explain this"
 with_selection({ "local x = 42" }, 1, 1, 1, 12)
 claude.ask_selection()
-vim.wait(100, function() return #chansend_calls > sends_before end)
+vim.wait(100, function()
+	return #chansend_calls > sends_before
+end)
 
-H.check("T10 ask_selection sends one message",
-  #chansend_calls == sends_before + 1, "sends=" .. (#chansend_calls - sends_before))
-H.check("T10 ask_selection message is fenced selection",
-  last_sent_text() == "explain this\n\n```\nlocal x = 42\n```",
-  vim.inspect(last_sent_text()))
+H.check(
+	"T10 ask_selection sends one message",
+	#chansend_calls == sends_before + 1,
+	"sends=" .. (#chansend_calls - sends_before)
+)
+H.check(
+	"T10 ask_selection message is fenced selection",
+	last_sent_text() == "explain this\n\n```\nlocal x = 42\n```",
+	vim.inspect(last_sent_text())
+)
 
 -- ── T11: ask_selection — selection=exclusive trims the trailing column ────────
 
-claude.state.job_id  = nil
+claude.state.job_id = nil
 claude.state.working = false
 sends_before = #chansend_calls
 next_answer = "q"
 with_selection({ "world foo" }, 1, 1, 1, 6, "exclusive")
 claude.ask_selection()
-vim.wait(100, function() return #chansend_calls > sends_before end)
-H.check("T11 exclusive end col trimmed — no trailing space",
-  last_sent_text() == "q\n\n```\nworld\n```",
-  vim.inspect(last_sent_text()))
+vim.wait(100, function()
+	return #chansend_calls > sends_before
+end)
+H.check(
+	"T11 exclusive end col trimmed — no trailing space",
+	last_sent_text() == "q\n\n```\nworld\n```",
+	vim.inspect(last_sent_text())
+)
 vim.o.selection = "inclusive"
 
 -- ── T12: on_exit resets state (clean exit, code 0) ────────────────────────────
 
 claude.state.job_id = 99
 H.check("T12 job_id non-nil before exit", claude.state.job_id ~= nil)
-captured_exit_cb(99, 0, "exit")  -- simulate clean exit (code=0)
+captured_exit_cb(99, 0, "exit") -- simulate clean exit (code=0)
 vim.wait(50)
-H.check("T12 job_id cleared on exit",        claude.state.job_id == nil)
-H.check("T12 system_ready cleared on exit",  claude.state.system_ready == false)
+H.check("T12 job_id cleared on exit", claude.state.job_id == nil)
+H.check("T12 system_ready cleared on exit", claude.state.system_ready == false)
 -- Clean exit (0/143/-1) keeps the panel open for the next turn.
 H.check("T12 panel stays active on clean exit", claude.state.claude_active == true)
 
 -- ── T13: availability guard — toggle/ask_selection no-op when binary missing ──
 
-claude.is_available = function() return false end
+claude.is_available = function()
+	return false
+end
 claude.state.job_id = nil
 local calls_guard = #jobstart_calls
 claude.toggle()
@@ -354,21 +409,22 @@ H.check("T13 no spawn when binary unavailable", #jobstart_calls == calls_guard)
 next_answer = "ignored"
 claude.ask_selection()
 vim.wait(50)
-H.check("T13 ask_selection is no-op when binary unavailable",
-  #jobstart_calls == calls_guard)
-claude.is_available = function() return true end  -- restore
+H.check("T13 ask_selection is no-op when binary unavailable", #jobstart_calls == calls_guard)
+claude.is_available = function()
+	return true
+end -- restore
 
 -- ── T14: chunk accumulation — event split across two stdout chunks ────────────
 -- The JSON line-buffer must reassemble lines that arrive in separate chunks.
 
 claude.state.system_ready = true
-claude.state.job_id       = 99
+claude.state.job_id = 99
 
 local full_line = vim.json.encode({
-  type = "assistant",
-  message = { content = { { type = "text", text = "chunk-test" } } }
+	type = "assistant",
+	message = { content = { { type = "text", text = "chunk-test" } } },
 })
-local mid   = math.floor(#full_line / 2)
+local mid = math.floor(#full_line / 2)
 local part1 = full_line:sub(1, mid)
 local part2 = full_line:sub(mid + 1)
 
@@ -380,34 +436,35 @@ vim.wait(20)
 captured_stdout_cb(99, { part2, "" }, "stdout")
 vim.wait(50)
 local after_count = vim.api.nvim_buf_line_count(claude.state.panel_buf)
-H.check("T14 split-chunk event reassembled + rendered",
-  after_count > before_count,
-  "before=" .. before_count .. " after=" .. after_count)
-H.check("T14 chunk-test text rendered",
-  panel_text():match("chunk%-test") ~= nil, panel_text())
+H.check(
+	"T14 split-chunk event reassembled + rendered",
+	after_count > before_count,
+	"before=" .. before_count .. " after=" .. after_count
+)
+H.check("T14 chunk-test text rendered", panel_text():match("chunk%-test") ~= nil, panel_text())
 
 -- ── T15: type-ahead queue — submit while working enqueues, drains on turn end ──
 
 claude.state.diff_pending = false
-claude.state.queue        = {}
-claude.state.working      = true     -- a turn is in flight
-claude.state.job_id       = 99
+claude.state.queue = {}
+claude.state.working = true -- a turn is in flight
+claude.state.job_id = 99
 local q_sends = #chansend_calls
 
 next_answer = "queued msg"
-claude.prompt_input()                -- working → should enqueue, not send
+claude.prompt_input() -- working → should enqueue, not send
 vim.wait(20)
-H.check("T15 message queued while working",
-  #claude.state.queue == 1 and claude.state.queue[1] == "queued msg",
-  vim.inspect(claude.state.queue))
+H.check(
+	"T15 message queued while working",
+	#claude.state.queue == 1 and claude.state.queue[1] == "queued msg",
+	vim.inspect(claude.state.queue)
+)
 H.check("T15 queued message not sent yet", #chansend_calls == q_sends)
 
-feed({ type = "result", result = "done" })  -- turn ends → drain queue
+feed({ type = "result", result = "done" }) -- turn ends → drain queue
 vim.wait(50)
-H.check("T15 queue drained on turn end", #claude.state.queue == 0,
-  vim.inspect(claude.state.queue))
-H.check("T15 queued message sent after turn", last_sent_text() == "queued msg",
-  tostring(last_sent_text()))
+H.check("T15 queue drained on turn end", #claude.state.queue == 0, vim.inspect(claude.state.queue))
+H.check("T15 queued message sent after turn", last_sent_text() == "queued msg", tostring(last_sent_text()))
 H.check("T15 working re-armed for the drained turn", claude.state.working == true)
 
 -- ── T16: can_use_tool gate — cards for non-edits, auto-allow for edits ────────
@@ -418,37 +475,49 @@ H.check("T15 working re-armed for the drained turn", claude.state.working == tru
 
 -- Decode the most recent chansend payload as a control_response (or nil).
 local function last_control_response()
-  local last = chansend_calls[#chansend_calls]
-  if not last then return nil end
-  local ok, ev = pcall(vim.json.decode, last.data)
-  if not ok or type(ev) ~= "table" or ev.type ~= "control_response" then return nil end
-  return ev
+	local last = chansend_calls[#chansend_calls]
+	if not last then
+		return nil
+	end
+	local ok, ev = pcall(vim.json.decode, last.data)
+	if not ok or type(ev) ~= "table" or ev.type ~= "control_response" then
+		return nil
+	end
+	return ev
 end
 
 claude.state.job_id = 99
-claude.state.working = true   -- a turn is in flight when a tool asks permission
+claude.state.working = true -- a turn is in flight when a tool asks permission
 
 -- Non-edit tool with no rule suggestions → card with [Allow once] [Reject].
 local sends_b = #chansend_calls
 feed({
-  type       = "control_request",
-  request_id = "req-web-1",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "WebFetch",
-    input     = { url = "https://example.com" },
-  },
+	type = "control_request",
+	request_id = "req-web-1",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "WebFetch",
+		input = { url = "https://example.com" },
+	},
 })
-H.check("T16 non-edit tool shows a card (no auto control_response)",
-  #chansend_calls == sends_b, "sends delta=" .. (#chansend_calls - sends_b))
-H.check("T16 card state armed (state.perm set)",
-  claude.state.perm ~= nil and claude.state.perm.request_id == "req-web-1",
-  vim.inspect(claude.state.perm))
-H.check("T16 no rules → 2 options (Allow once, Reject)",
-  claude.state.perm and #claude.state.perm.options == 2
-    and claude.state.perm.options[1].kind == "once"
-    and claude.state.perm.options[2].kind == "deny",
-  vim.inspect(claude.state.perm and claude.state.perm.options))
+H.check(
+	"T16 non-edit tool shows a card (no auto control_response)",
+	#chansend_calls == sends_b,
+	"sends delta=" .. (#chansend_calls - sends_b)
+)
+H.check(
+	"T16 card state armed (state.perm set)",
+	claude.state.perm ~= nil and claude.state.perm.request_id == "req-web-1",
+	vim.inspect(claude.state.perm)
+)
+H.check(
+	"T16 no rules → 2 options (Allow once, Reject)",
+	claude.state.perm
+		and #claude.state.perm.options == 2
+		and claude.state.perm.options[1].kind == "once"
+		and claude.state.perm.options[2].kind == "deny",
+	vim.inspect(claude.state.perm and claude.state.perm.options)
+)
 
 -- Edit tool with NO old_string: unreconstructable for the pre-write gate (T20+).
 -- Security fix (2026-07-16): this used to silently auto-allow here — it must NOT.
@@ -457,92 +526,121 @@ H.check("T16 no rules → 2 options (Allow once, Reject)",
 -- immediately (cards are one-at-a-time — must NOT disturb the pending card).
 local sends_edit1 = #chansend_calls
 feed({
-  type       = "control_request",
-  request_id = "req-edit-1",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "Edit",
-    input     = { file_path = "/tmp/x.lua" },
-  },
+	type = "control_request",
+	request_id = "req-edit-1",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "Edit",
+		input = { file_path = "/tmp/x.lua" },
+	},
 })
-H.check("T16 unreconstructable edit shows a card too (no silent auto-allow)",
-  #chansend_calls == sends_edit1, "sends delta=" .. (#chansend_calls - sends_edit1))
-H.check("T16 unreconstructable edit queues behind the open card",
-  claude.state.perm and claude.state.perm.request_id == "req-web-1"
-    and claude.state.perm_queue and #claude.state.perm_queue == 1
-    and claude.state.perm_queue[1].request_id == "req-edit-1",
-  vim.inspect({ perm = claude.state.perm, queue = claude.state.perm_queue }))
-H.check("T16 unreconstructable edit still arms post-write review (watch called)",
-  watch_calls[#watch_calls] == "/tmp/x.lua", vim.inspect(watch_calls))
+H.check(
+	"T16 unreconstructable edit shows a card too (no silent auto-allow)",
+	#chansend_calls == sends_edit1,
+	"sends delta=" .. (#chansend_calls - sends_edit1)
+)
+H.check(
+	"T16 unreconstructable edit queues behind the open card",
+	claude.state.perm
+		and claude.state.perm.request_id == "req-web-1"
+		and claude.state.perm_queue
+		and #claude.state.perm_queue == 1
+		and claude.state.perm_queue[1].request_id == "req-edit-1",
+	vim.inspect({ perm = claude.state.perm, queue = claude.state.perm_queue })
+)
+H.check(
+	"T16 unreconstructable edit still arms post-write review (watch called)",
+	watch_calls[#watch_calls] == "/tmp/x.lua",
+	vim.inspect(watch_calls)
+)
 
 -- ── T17: card resolution — Allow once / Allow always (persists) / Reject ──────
 
 -- Allow once → control_response allow, echoes request_id + input, NO persist.
 claude._resolve_permission("once")
 local r3 = last_control_response()
-H.check("T17 allow-once sends allow with echoed request_id + input",
-  r3 and r3.response.request_id == "req-web-1"
-    and r3.response.response.behavior == "allow"
-    and r3.response.response.updatedInput.url == "https://example.com",
-  vim.inspect(r3))
-H.check("T17 allow-once does NOT persist a rule (no updatedPermissions)",
-  r3 and r3.response.response.updatedPermissions == nil, vim.inspect(r3))
-H.check("T17 resolving drains the queued edit fallback card next (not cleared)",
-  claude.state.perm and claude.state.perm.request_id == "req-edit-1",
-  vim.inspect(claude.state.perm))
+H.check(
+	"T17 allow-once sends allow with echoed request_id + input",
+	r3
+		and r3.response.request_id == "req-web-1"
+		and r3.response.response.behavior == "allow"
+		and r3.response.response.updatedInput.url == "https://example.com",
+	vim.inspect(r3)
+)
+H.check(
+	"T17 allow-once does NOT persist a rule (no updatedPermissions)",
+	r3 and r3.response.response.updatedPermissions == nil,
+	vim.inspect(r3)
+)
+H.check(
+	"T17 resolving drains the queued edit fallback card next (not cleared)",
+	claude.state.perm and claude.state.perm.request_id == "req-edit-1",
+	vim.inspect(claude.state.perm)
+)
 
 -- Drain the queued edit fallback card too (Allow once) so state.perm is clean
 -- before the next block — it answers the same wire shape as any other card.
 claude._resolve_permission("once")
 local r2b = last_control_response()
-H.check("T17 queued edit fallback card allow-once sends allow",
-  r2b and r2b.response.request_id == "req-edit-1"
-    and r2b.response.response.behavior == "allow", vim.inspect(r2b))
-H.check("T17 card cleared after resolve (state.perm nil)",
-  claude.state.perm == nil, vim.inspect(claude.state.perm))
+H.check(
+	"T17 queued edit fallback card allow-once sends allow",
+	r2b and r2b.response.request_id == "req-edit-1" and r2b.response.response.behavior == "allow",
+	vim.inspect(r2b)
+)
+H.check("T17 card cleared after resolve (state.perm nil)", claude.state.perm == nil, vim.inspect(claude.state.perm))
 
 -- Tool WITH rule suggestions → card offers Allow always; choosing it persists.
-local suggestions = { {
-  type = "addRules", destination = "localSettings", behavior = "allow",
-  rules = { { toolName = "Bash", ruleContent = "ls:*" } },
-} }
+local suggestions = {
+	{
+		type = "addRules",
+		destination = "localSettings",
+		behavior = "allow",
+		rules = { { toolName = "Bash", ruleContent = "ls:*" } },
+	},
+}
 feed({
-  type       = "control_request",
-  request_id = "req-bash-1",
-  request    = {
-    subtype                = "can_use_tool",
-    tool_name              = "Bash",
-    input                  = { command = "ls" },
-    permission_suggestions = suggestions,
-  },
+	type = "control_request",
+	request_id = "req-bash-1",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "Bash",
+		input = { command = "ls" },
+		permission_suggestions = suggestions,
+	},
 })
-H.check("T17 rules present → 3 options incl. Allow always",
-  claude.state.perm and #claude.state.perm.options == 3
-    and claude.state.perm.options[2].kind == "always",
-  vim.inspect(claude.state.perm and claude.state.perm.options))
+H.check(
+	"T17 rules present → 3 options incl. Allow always",
+	claude.state.perm and #claude.state.perm.options == 3 and claude.state.perm.options[2].kind == "always",
+	vim.inspect(claude.state.perm and claude.state.perm.options)
+)
 claude._resolve_permission("always")
 local r4 = last_control_response()
-H.check("T17 allow-always persists the rule (updatedPermissions = suggestions)",
-  r4 and r4.response.response.behavior == "allow"
-    and type(r4.response.response.updatedPermissions) == "table"
-    and r4.response.response.updatedPermissions[1].rules[1].ruleContent == "ls:*",
-  vim.inspect(r4))
+H.check(
+	"T17 allow-always persists the rule (updatedPermissions = suggestions)",
+	r4
+		and r4.response.response.behavior == "allow"
+		and type(r4.response.response.updatedPermissions) == "table"
+		and r4.response.response.updatedPermissions[1].rules[1].ruleContent == "ls:*",
+	vim.inspect(r4)
+)
 
 -- Reject → control_response deny.
 feed({
-  type       = "control_request",
-  request_id = "req-bash-2",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "Bash",
-    input     = { command = "rm -rf /" },
-  },
+	type = "control_request",
+	request_id = "req-bash-2",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "Bash",
+		input = { command = "rm -rf /" },
+	},
 })
 claude._resolve_permission("deny")
 local r5 = last_control_response()
-H.check("T17 reject sends deny",
-  r5 and r5.response.request_id == "req-bash-2"
-    and r5.response.response.behavior == "deny", vim.inspect(r5))
+H.check(
+	"T17 reject sends deny",
+	r5 and r5.response.request_id == "req-bash-2" and r5.response.response.behavior == "deny",
+	vim.inspect(r5)
+)
 
 -- ── T17b: concurrent permission requests QUEUE (parallel tool_use) ────────────
 -- Claude can emit multiple tool_use blocks in one assistant turn; the canUseTool
@@ -554,86 +652,102 @@ claude.state.perm = nil
 claude.state.perm_queue = nil
 
 feed({
-  type = "control_request", request_id = "req-par-a",
-  request = { subtype = "can_use_tool", tool_name = "Bash",
-              input = { command = "ls /a" } },
+	type = "control_request",
+	request_id = "req-par-a",
+	request = { subtype = "can_use_tool", tool_name = "Bash", input = { command = "ls /a" } },
 })
-feed({  -- arrives while card A is still open → must queue, NOT overwrite
-  type = "control_request", request_id = "req-par-b",
-  request = { subtype = "can_use_tool", tool_name = "Bash",
-              input = { command = "ls /b" } },
+feed({ -- arrives while card A is still open → must queue, NOT overwrite
+	type = "control_request",
+	request_id = "req-par-b",
+	request = { subtype = "can_use_tool", tool_name = "Bash", input = { command = "ls /b" } },
 })
-H.check("T17b first request stays on the card (not overwritten by the second)",
-  claude.state.perm ~= nil and claude.state.perm.request_id == "req-par-a",
-  vim.inspect(claude.state.perm))
-H.check("T17b second request is queued",
-  type(claude.state.perm_queue) == "table" and #claude.state.perm_queue == 1,
-  vim.inspect(claude.state.perm_queue))
+H.check(
+	"T17b first request stays on the card (not overwritten by the second)",
+	claude.state.perm ~= nil and claude.state.perm.request_id == "req-par-a",
+	vim.inspect(claude.state.perm)
+)
+H.check(
+	"T17b second request is queued",
+	type(claude.state.perm_queue) == "table" and #claude.state.perm_queue == 1,
+	vim.inspect(claude.state.perm_queue)
+)
 -- Only ONE permission float exists (the second did not open an orphan).
 local function perm_float_count()
-  local n = 0
-  for _, w in ipairs(vim.api.nvim_list_wins()) do
-    local ok, cfg = pcall(vim.api.nvim_win_get_config, w)
-    if ok and cfg and cfg.relative ~= "" and cfg.title then
-      for _, seg in ipairs(cfg.title) do
-        if type(seg) == "table" and tostring(seg[1]):match("Permission required") then
-          n = n + 1
-        end
-      end
-    end
-  end
-  return n
+	local n = 0
+	for _, w in ipairs(vim.api.nvim_list_wins()) do
+		local ok, cfg = pcall(vim.api.nvim_win_get_config, w)
+		if ok and cfg and cfg.relative ~= "" and cfg.title then
+			for _, seg in ipairs(cfg.title) do
+				if type(seg) == "table" and tostring(seg[1]):match("Permission required") then
+					n = n + 1
+				end
+			end
+		end
+	end
+	return n
 end
-H.check("T17b exactly one permission float open (no orphan)",
-  perm_float_count() == 1, "floats=" .. perm_float_count())
+H.check("T17b exactly one permission float open (no orphan)", perm_float_count() == 1, "floats=" .. perm_float_count())
 
 -- Resolve A → response for req-par-a, then the queued B auto-shows.
 claude._resolve_permission("once")
 local ra = last_control_response()
-H.check("T17b resolving first sends response for req-par-a",
-  ra and ra.response.request_id == "req-par-a"
-    and ra.response.response.behavior == "allow", vim.inspect(ra))
-H.check("T17b queued second auto-shows after first resolves",
-  claude.state.perm ~= nil and claude.state.perm.request_id == "req-par-b"
-    and #(claude.state.perm_queue or {}) == 0, vim.inspect(claude.state.perm))
-H.check("T17b still exactly one permission float after drain",
-  perm_float_count() == 1, "floats=" .. perm_float_count())
+H.check(
+	"T17b resolving first sends response for req-par-a",
+	ra and ra.response.request_id == "req-par-a" and ra.response.response.behavior == "allow",
+	vim.inspect(ra)
+)
+H.check(
+	"T17b queued second auto-shows after first resolves",
+	claude.state.perm ~= nil and claude.state.perm.request_id == "req-par-b" and #(claude.state.perm_queue or {}) == 0,
+	vim.inspect(claude.state.perm)
+)
+H.check("T17b still exactly one permission float after drain", perm_float_count() == 1, "floats=" .. perm_float_count())
 
 -- Resolve B → response for req-par-b, everything cleared.
 claude._resolve_permission("deny")
 local rb = last_control_response()
-H.check("T17b resolving second sends response for req-par-b",
-  rb and rb.response.request_id == "req-par-b"
-    and rb.response.response.behavior == "deny", vim.inspect(rb))
-H.check("T17b all cleared after both resolved",
-  claude.state.perm == nil and #(claude.state.perm_queue or {}) == 0
-    and perm_float_count() == 0, vim.inspect(claude.state.perm))
+H.check(
+	"T17b resolving second sends response for req-par-b",
+	rb and rb.response.request_id == "req-par-b" and rb.response.response.behavior == "deny",
+	vim.inspect(rb)
+)
+H.check(
+	"T17b all cleared after both resolved",
+	claude.state.perm == nil and #(claude.state.perm_queue or {}) == 0 and perm_float_count() == 0,
+	vim.inspect(claude.state.perm)
+)
 
 -- ── T17c: newline-carrying request fields must not crash the card ─────────────
 -- nvim_buf_set_lines throws on ANY item containing "\n"; description/display are
 -- CLI-supplied and can be multi-line (live crash 2026-07-11: card never populated,
 -- request invisible). Every body insert must be split into real buffer lines.
 feed({
-  type = "control_request", request_id = "req-nl-1",
-  request = {
-    subtype      = "can_use_tool",
-    tool_name    = "Bash",
-    display_name = "Run command",
-    description  = "line one\nline two\nline three",
-    input        = { command = "echo a\necho b" },
-  },
+	type = "control_request",
+	request_id = "req-nl-1",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "Bash",
+		display_name = "Run command",
+		description = "line one\nline two\nline three",
+		input = { command = "echo a\necho b" },
+	},
 })
-H.check("T17c multi-line desc/input still opens the card",
-  claude.state.perm ~= nil and claude.state.perm.request_id == "req-nl-1"
-    and perm_float_count() == 1,
-  vim.inspect(claude.state.perm))
-H.check("T17c card buffer holds the split description lines",
-  (function()
-    local b = claude.state.perm and claude.state.perm.buf
-    if not (b and vim.api.nvim_buf_is_valid(b)) then return false end
-    local txt = table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\1")
-    return txt:find("line two", 1, true) ~= nil
-  end)())
+H.check(
+	"T17c multi-line desc/input still opens the card",
+	claude.state.perm ~= nil and claude.state.perm.request_id == "req-nl-1" and perm_float_count() == 1,
+	vim.inspect(claude.state.perm)
+)
+H.check(
+	"T17c card buffer holds the split description lines",
+	(function()
+		local b = claude.state.perm and claude.state.perm.buf
+		if not (b and vim.api.nvim_buf_is_valid(b)) then
+			return false
+		end
+		local txt = table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\1")
+		return txt:find("line two", 1, true) ~= nil
+	end)()
+)
 claude._resolve_permission("deny")
 H.check("T17c cleanup", claude.state.perm == nil and perm_float_count() == 0)
 
@@ -648,205 +762,294 @@ claude.state.working = true
 -- Single question → card armed, no auto control_response, NOT routed to a perm card.
 local sends_q = #chansend_calls
 feed({
-  type       = "control_request",
-  request_id = "req-ask-1",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "AskUserQuestion",
-    input     = { questions = { {
-      question    = "Indent style?",
-      header      = "Indent",
-      multiSelect = false,
-      options     = { { label = "Tabs", description = "hard tabs" },
-                      { label = "Spaces", description = "soft" } },
-    } } },
-  },
+	type = "control_request",
+	request_id = "req-ask-1",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "AskUserQuestion",
+		input = {
+			questions = {
+				{
+					question = "Indent style?",
+					header = "Indent",
+					multiSelect = false,
+					options = {
+						{ label = "Tabs", description = "hard tabs" },
+						{ label = "Spaces", description = "soft" },
+					},
+				},
+			},
+		},
+	},
 })
-H.check("T18 question tool shows a card (no auto control_response)",
-  #chansend_calls == sends_q, "sends delta=" .. (#chansend_calls - sends_q))
-H.check("T18 card armed (state.qask set, perm untouched)",
-  claude.state.qask ~= nil and claude.state.qask.request_id == "req-ask-1"
-    and claude.state.perm == nil, vim.inspect(claude.state.qask))
-H.check("T18 one question, index starts at 1",
-  claude.state.qask and #claude.state.qask.questions == 1
-    and claude.state.qask.qi == 1, vim.inspect(claude.state.qask and claude.state.qask.qi))
+H.check(
+	"T18 question tool shows a card (no auto control_response)",
+	#chansend_calls == sends_q,
+	"sends delta=" .. (#chansend_calls - sends_q)
+)
+H.check(
+	"T18 card armed (state.qask set, perm untouched)",
+	claude.state.qask ~= nil and claude.state.qask.request_id == "req-ask-1" and claude.state.perm == nil,
+	vim.inspect(claude.state.qask)
+)
+H.check(
+	"T18 one question, index starts at 1",
+	claude.state.qask and #claude.state.qask.questions == 1 and claude.state.qask.qi == 1,
+	vim.inspect(claude.state.qask and claude.state.qask.qi)
+)
 -- Card reserves bottom padding so existing output is pushed ABOVE it (not covered).
-H.check("T18 card reserves bottom pad (pushes output up)",
-  claude.state.pad_rows >= 1, "pad_rows=" .. tostring(claude.state.pad_rows))
+H.check(
+	"T18 card reserves bottom pad (pushes output up)",
+	claude.state.pad_rows >= 1,
+	"pad_rows=" .. tostring(claude.state.pad_rows)
+)
 
 -- Move down to option 2 (Spaces), select → allow with answers keyed by text.
 claude._move_question_choice(1)
 claude._select_question_choice()
 local rq = last_control_response()
-H.check("T18 select sends allow echoing request_id",
-  rq and rq.response.request_id == "req-ask-1"
-    and rq.response.response.behavior == "allow", vim.inspect(rq))
-H.check("T18 answers map keyed by question TEXT, value = chosen label",
-  rq and rq.response.response.updatedInput
-    and rq.response.response.updatedInput.answers
-    and rq.response.response.updatedInput.answers["Indent style?"] == "Spaces",
-  vim.inspect(rq and rq.response.response.updatedInput))
-H.check("T18 card cleared after submit (state.qask nil)",
-  claude.state.qask == nil, vim.inspect(claude.state.qask))
-H.check("T18 bottom pad released after submit",
-  claude.state.pad_rows == 0, "pad_rows=" .. tostring(claude.state.pad_rows))
+H.check(
+	"T18 select sends allow echoing request_id",
+	rq and rq.response.request_id == "req-ask-1" and rq.response.response.behavior == "allow",
+	vim.inspect(rq)
+)
+H.check(
+	"T18 answers map keyed by question TEXT, value = chosen label",
+	rq
+		and rq.response.response.updatedInput
+		and rq.response.response.updatedInput.answers
+		and rq.response.response.updatedInput.answers["Indent style?"] == "Spaces",
+	vim.inspect(rq and rq.response.response.updatedInput)
+)
+H.check("T18 card cleared after submit (state.qask nil)", claude.state.qask == nil, vim.inspect(claude.state.qask))
+H.check(
+	"T18 bottom pad released after submit",
+	claude.state.pad_rows == 0,
+	"pad_rows=" .. tostring(claude.state.pad_rows)
+)
 
 -- reanchor_pad is the fold-toggle hook that re-pins the last line above a reserved
 -- pad when a thinking fold's height change moves it (the real lift needs a live
 -- screen, so only the no-pad no-op contract is headless-verifiable here).
-H.check("T18 _reanchor_pad exported", type(claude._reanchor_pad) == "function",
-  type(claude._reanchor_pad))
+H.check("T18 _reanchor_pad exported", type(claude._reanchor_pad) == "function", type(claude._reanchor_pad))
 claude.state.pad_rows = 0
 local ok_re = pcall(claude._reanchor_pad)
-H.check("T18 _reanchor_pad no-ops with no pad reserved",
-  ok_re and claude.state.pad_rows == 0,
-  "ok=" .. tostring(ok_re) .. " pad_rows=" .. tostring(claude.state.pad_rows))
+H.check(
+	"T18 _reanchor_pad no-ops with no pad reserved",
+	ok_re and claude.state.pad_rows == 0,
+	"ok=" .. tostring(ok_re) .. " pad_rows=" .. tostring(claude.state.pad_rows)
+)
 
 -- Multi-question: ALL arrive in one request; first select advances (no response),
 -- last select submits ONE response with every answer.
 feed({
-  type       = "control_request",
-  request_id = "req-ask-2",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "AskUserQuestion",
-    input     = { questions = {
-      { question = "A?", header = "A", multiSelect = false,
-        options = { { label = "X" }, { label = "Y" } } },
-      { question = "B?", header = "B", multiSelect = false,
-        options = { { label = "P" }, { label = "Q" } } },
-    } },
-  },
+	type = "control_request",
+	request_id = "req-ask-2",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "AskUserQuestion",
+		input = {
+			questions = {
+				{
+					question = "A?",
+					header = "A",
+					multiSelect = false,
+					options = { { label = "X" }, { label = "Y" } },
+				},
+				{
+					question = "B?",
+					header = "B",
+					multiSelect = false,
+					options = { { label = "P" }, { label = "Q" } },
+				},
+			},
+		},
+	},
 })
 local sends_multi = #chansend_calls
-claude._select_question_choice()          -- answer Q1 = X (default choice 1)
-H.check("T18 first of two questions does NOT submit yet",
-  #chansend_calls == sends_multi and claude.state.qask ~= nil
-    and claude.state.qask.qi == 2, "qi=" .. tostring(claude.state.qask and claude.state.qask.qi))
-claude._move_question_choice(1)           -- Q2 choice → Q
-claude._select_question_choice()          -- submit
+claude._select_question_choice() -- answer Q1 = X (default choice 1)
+H.check(
+	"T18 first of two questions does NOT submit yet",
+	#chansend_calls == sends_multi and claude.state.qask ~= nil and claude.state.qask.qi == 2,
+	"qi=" .. tostring(claude.state.qask and claude.state.qask.qi)
+)
+claude._move_question_choice(1) -- Q2 choice → Q
+claude._select_question_choice() -- submit
 local rq2 = last_control_response()
-H.check("T18 multi-question submits ONE response with all answers",
-  rq2 and rq2.response.request_id == "req-ask-2"
-    and rq2.response.response.updatedInput.answers["A?"] == "X"
-    and rq2.response.response.updatedInput.answers["B?"] == "Q",
-  vim.inspect(rq2 and rq2.response.response.updatedInput))
+H.check(
+	"T18 multi-question submits ONE response with all answers",
+	rq2
+		and rq2.response.request_id == "req-ask-2"
+		and rq2.response.response.updatedInput.answers["A?"] == "X"
+		and rq2.response.response.updatedInput.answers["B?"] == "Q",
+	vim.inspect(rq2 and rq2.response.response.updatedInput)
+)
 
 -- multiSelect → answer value is an ARRAY of labels.
 feed({
-  type       = "control_request",
-  request_id = "req-ask-3",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "AskUserQuestion",
-    input     = { questions = { {
-      question = "Colors?", header = "Color", multiSelect = true,
-      options  = { { label = "Red" }, { label = "Green" }, { label = "Blue" } },
-    } } },
-  },
+	type = "control_request",
+	request_id = "req-ask-3",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "AskUserQuestion",
+		input = {
+			questions = {
+				{
+					question = "Colors?",
+					header = "Color",
+					multiSelect = true,
+					options = { { label = "Red" }, { label = "Green" }, { label = "Blue" } },
+				},
+			},
+		},
+	},
 })
-claude._toggle_question_choice()          -- Red on (choice 1)
-claude._move_question_choice(1)           -- → Green
-claude._move_question_choice(1)           -- → Blue
-claude._toggle_question_choice()          -- Blue on
+claude._toggle_question_choice() -- Red on (choice 1)
+claude._move_question_choice(1) -- → Green
+claude._move_question_choice(1) -- → Blue
+claude._toggle_question_choice() -- Blue on
 claude._select_question_choice()
 local rq3 = last_control_response()
-local arr = rq3 and rq3.response.response.updatedInput.answers
-            and rq3.response.response.updatedInput.answers["Colors?"]
-H.check("T18 multiSelect answer is an array of chosen labels",
-  type(arr) == "table" and arr[1] == "Red" and arr[2] == "Blue" and #arr == 2,
-  vim.inspect(arr))
+local arr = rq3 and rq3.response.response.updatedInput.answers and rq3.response.response.updatedInput.answers["Colors?"]
+H.check(
+	"T18 multiSelect answer is an array of chosen labels",
+	type(arr) == "table" and arr[1] == "Red" and arr[2] == "Blue" and #arr == 2,
+	vim.inspect(arr)
+)
 
 -- No note set → updatedInput carries NO annotations key (only added when a note
 -- exists). Re-check the multiSelect submit above (rq3) which set no note.
-H.check("T18 no note → no annotations key in updatedInput",
-  rq3 and rq3.response.response.updatedInput.annotations == nil,
-  vim.inspect(rq3 and rq3.response.response.updatedInput))
+H.check(
+	"T18 no note → no annotations key in updatedInput",
+	rq3 and rq3.response.response.updatedInput.annotations == nil,
+	vim.inspect(rq3 and rq3.response.response.updatedInput)
+)
 
 -- Note ("n to add notes"): rides updatedInput.annotations, keyed by question TEXT
 -- with a `notes` sub-field, PER QUESTION. This is the schema-backed channel — a note
 -- stuffed into `answers` is dropped by the tool's answer key-matching (the reported
 -- "Claude never saw my note" bug), so it MUST travel here.
 feed({
-  type       = "control_request",
-  request_id = "req-ask-note",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "AskUserQuestion",
-    input     = { questions = {
-      { question = "Depth?", header = "Depth", multiSelect = false,
-        options = { { label = "Low" }, { label = "High" } } },
-      { question = "Scope?", header = "Scope", multiSelect = false,
-        options = { { label = "Repo" }, { label = "File" } } },
-    } },
-  },
+	type = "control_request",
+	request_id = "req-ask-note",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "AskUserQuestion",
+		input = {
+			questions = {
+				{
+					question = "Depth?",
+					header = "Depth",
+					multiSelect = false,
+					options = { { label = "Low" }, { label = "High" } },
+				},
+				{
+					question = "Scope?",
+					header = "Scope",
+					multiSelect = false,
+					options = { { label = "Repo" }, { label = "File" } },
+				},
+			},
+		},
+	},
 })
-claude.state.qask.notes[1] = "trace T4 sinks only"   -- note on Q1 (via `n` in real UI)
-claude._select_question_choice()                     -- answer Q1 = Low, advance to Q2
-claude._select_question_choice()                     -- answer Q2 = Repo, submit
+claude.state.qask.notes[1] = "trace T4 sinks only" -- note on Q1 (via `n` in real UI)
+claude._select_question_choice() -- answer Q1 = Low, advance to Q2
+claude._select_question_choice() -- answer Q2 = Repo, submit
 local rqn = last_control_response()
 local ann = rqn and rqn.response.response.updatedInput.annotations
-H.check("T18 note delivered via annotations[question].notes (per question)",
-  ann and ann["Depth?"] and ann["Depth?"].notes == "trace T4 sinks only",
-  vim.inspect(rqn and rqn.response.response.updatedInput))
-H.check("T18 un-noted question gets no annotation entry",
-  ann and ann["Scope?"] == nil, vim.inspect(ann))
-H.check("T18 answers still ride alongside the note",
-  rqn and rqn.response.response.updatedInput.answers["Depth?"] == "Low"
-    and rqn.response.response.updatedInput.answers["Scope?"] == "Repo",
-  vim.inspect(rqn and rqn.response.response.updatedInput.answers))
+H.check(
+	"T18 note delivered via annotations[question].notes (per question)",
+	ann and ann["Depth?"] and ann["Depth?"].notes == "trace T4 sinks only",
+	vim.inspect(rqn and rqn.response.response.updatedInput)
+)
+H.check("T18 un-noted question gets no annotation entry", ann and ann["Scope?"] == nil, vim.inspect(ann))
+H.check(
+	"T18 answers still ride alongside the note",
+	rqn
+		and rqn.response.response.updatedInput.answers["Depth?"] == "Low"
+		and rqn.response.response.updatedInput.answers["Scope?"] == "Repo",
+	vim.inspect(rqn and rqn.response.response.updatedInput.answers)
+)
 
 -- Cancel → allow with NO answers key (the clean dismiss).
 feed({
-  type       = "control_request",
-  request_id = "req-ask-4",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "AskUserQuestion",
-    input     = { questions = { {
-      question = "Proceed?", header = "Go", multiSelect = false,
-      options  = { { label = "Yes" }, { label = "No" } },
-    } } },
-  },
+	type = "control_request",
+	request_id = "req-ask-4",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "AskUserQuestion",
+		input = {
+			questions = {
+				{
+					question = "Proceed?",
+					header = "Go",
+					multiSelect = false,
+					options = { { label = "Yes" }, { label = "No" } },
+				},
+			},
+		},
+	},
 })
 claude._cancel_question()
 local rq4 = last_control_response()
-H.check("T18 cancel sends allow with NO answers key",
-  rq4 and rq4.response.request_id == "req-ask-4"
-    and rq4.response.response.behavior == "allow"
-    and rq4.response.response.updatedInput.answers == nil, vim.inspect(rq4))
+H.check(
+	"T18 cancel sends allow with NO answers key",
+	rq4
+		and rq4.response.request_id == "req-ask-4"
+		and rq4.response.response.behavior == "allow"
+		and rq4.response.response.updatedInput.answers == nil,
+	vim.inspect(rq4)
+)
 
 -- ── T19: question-card parity — free nav, Type something, Chat about this ─────
 
 -- Free navigation between questions WITHOUT answering (Tab/⇥ + arrows). Two
 -- questions arrive together; moving forward/back must not submit.
 feed({
-  type       = "control_request",
-  request_id = "req-ask-5",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "AskUserQuestion",
-    input     = { questions = {
-      { question = "One?", header = "1", multiSelect = false,
-        options = { { label = "a" }, { label = "b" } } },
-      { question = "Two?", header = "2", multiSelect = false,
-        options = { { label = "c" }, { label = "d" } } },
-    } },
-  },
+	type = "control_request",
+	request_id = "req-ask-5",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "AskUserQuestion",
+		input = {
+			questions = {
+				{
+					question = "One?",
+					header = "1",
+					multiSelect = false,
+					options = { { label = "a" }, { label = "b" } },
+				},
+				{
+					question = "Two?",
+					header = "2",
+					multiSelect = false,
+					options = { { label = "c" }, { label = "d" } },
+				},
+			},
+		},
+	},
 })
 local sends_nav = #chansend_calls
 claude._next_question()
-H.check("T19 next-question moves without answering (no submit)",
-  #chansend_calls == sends_nav and claude.state.qask
-    and claude.state.qask.qi == 2, "qi=" .. tostring(claude.state.qask and claude.state.qask.qi))
+H.check(
+	"T19 next-question moves without answering (no submit)",
+	#chansend_calls == sends_nav and claude.state.qask and claude.state.qask.qi == 2,
+	"qi=" .. tostring(claude.state.qask and claude.state.qask.qi)
+)
 claude._next_question()
-H.check("T19 next-question clamps at the last question",
-  claude.state.qask and claude.state.qask.qi == 2, "qi=" .. tostring(claude.state.qask and claude.state.qask.qi))
+H.check(
+	"T19 next-question clamps at the last question",
+	claude.state.qask and claude.state.qask.qi == 2,
+	"qi=" .. tostring(claude.state.qask and claude.state.qask.qi)
+)
 claude._prev_question()
-H.check("T19 prev-question moves back without answering",
-  #chansend_calls == sends_nav and claude.state.qask
-    and claude.state.qask.qi == 1, "qi=" .. tostring(claude.state.qask and claude.state.qask.qi))
-claude._cancel_question()   -- tidy up the open card before the next case
+H.check(
+	"T19 prev-question moves back without answering",
+	#chansend_calls == sends_nav and claude.state.qask and claude.state.qask.qi == 1,
+	"qi=" .. tostring(claude.state.qask and claude.state.qask.qi)
+)
+claude._cancel_question() -- tidy up the open card before the next case
 
 -- "Chat about this" (always the last synthetic option) is NOT a dismiss: it denies
 -- with a `message` carrying the canned clarify text + the per-question summary (the
@@ -855,63 +1058,84 @@ claude._cancel_question()   -- tidy up the open card before the next case
 -- pick was recorded (highlight moves don't answer), so the summary reports
 -- "(No answer provided)".
 feed({
-  type       = "control_request",
-  request_id = "req-ask-6",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "AskUserQuestion",
-    input     = { questions = { {
-      question = "Bail?", header = "B", multiSelect = false,
-      options  = { { label = "stay" }, { label = "go" } },
-    } } },
-  },
+	type = "control_request",
+	request_id = "req-ask-6",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "AskUserQuestion",
+		input = {
+			questions = {
+				{
+					question = "Bail?",
+					header = "B",
+					multiSelect = false,
+					options = { { label = "stay" }, { label = "go" } },
+				},
+			},
+		},
+	},
 })
-claude._move_question_choice(1)   -- 2 (go)
-claude._move_question_choice(1)   -- 3 (Type something)
-claude._move_question_choice(1)   -- 4 (Chat about this)
+claude._move_question_choice(1) -- 2 (go)
+claude._move_question_choice(1) -- 3 (Type something)
+claude._move_question_choice(1) -- 4 (Chat about this)
 claude._select_question_choice()
 local rq6 = last_control_response()
 local fb6 = rq6 and rq6.response.response.message
-H.check("T19 'Chat about this' denies (NOT a dismiss), no answers/updatedInput",
-  rq6 and rq6.response.request_id == "req-ask-6"
-    and rq6.response.response.behavior == "deny"
-    and rq6.response.response.updatedInput == nil
-    and claude.state.qask == nil, vim.inspect(rq6))
-H.check("T19 'Chat about this' deny message carries the canned clarify text + summary",
-  type(fb6) == "string"
-    and fb6:find("wants to clarify these questions", 1, true)
-    and fb6:find("Questions asked:", 1, true)
-    and fb6:find('"Bail?"', 1, true), vim.inspect(fb6))
+H.check(
+	"T19 'Chat about this' denies (NOT a dismiss), no answers/updatedInput",
+	rq6
+		and rq6.response.request_id == "req-ask-6"
+		and rq6.response.response.behavior == "deny"
+		and rq6.response.response.updatedInput == nil
+		and claude.state.qask == nil,
+	vim.inspect(rq6)
+)
+H.check(
+	"T19 'Chat about this' deny message carries the canned clarify text + summary",
+	type(fb6) == "string"
+		and fb6:find("wants to clarify these questions", 1, true)
+		and fb6:find("Questions asked:", 1, true)
+		and fb6:find('"Bail?"', 1, true),
+	vim.inspect(fb6)
+)
 
 -- "Type something" routes to the custom input (now a dedicated focused float, not
 -- vim.ui.input — the old backend drew behind the card). Selecting the row opens the
 -- input WITHOUT submitting; the float's <CR> handler then calls _set_question_custom
 -- with the typed text, which records it raw (label-match bypassed) + submits.
 feed({
-  type       = "control_request",
-  request_id = "req-ask-7",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "AskUserQuestion",
-    input     = { questions = { {
-      question = "Freeform?", header = "F", multiSelect = false,
-      options  = { { label = "x" }, { label = "y" } },
-    } } },
-  },
+	type = "control_request",
+	request_id = "req-ask-7",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "AskUserQuestion",
+		input = {
+			questions = {
+				{
+					question = "Freeform?",
+					header = "F",
+					multiSelect = false,
+					options = { { label = "x" }, { label = "y" } },
+				},
+			},
+		},
+	},
 })
-claude._move_question_choice(1)   -- 2 (y)
-claude._move_question_choice(1)   -- 3 (Type something)
-claude._select_question_choice()  -- opens the input float; nothing submitted yet
-H.check("T19 'Type something' opens input without submitting",
-  claude.state.qask ~= nil, vim.inspect(claude.state.qask))
-claude._set_question_custom("frobnicate the widget")  -- float <CR> commit path
+claude._move_question_choice(1) -- 2 (y)
+claude._move_question_choice(1) -- 3 (Type something)
+claude._select_question_choice() -- opens the input float; nothing submitted yet
+H.check("T19 'Type something' opens input without submitting", claude.state.qask ~= nil, vim.inspect(claude.state.qask))
+claude._set_question_custom("frobnicate the widget") -- float <CR> commit path
 local rq7 = last_control_response()
-H.check("T19 'Type something' sends the typed text as the answer value",
-  rq7 and rq7.response.request_id == "req-ask-7"
-    and rq7.response.response.updatedInput.answers
-    and rq7.response.response.updatedInput.answers["Freeform?"] == "frobnicate the widget"
-    and claude.state.qask == nil,
-  vim.inspect(rq7 and rq7.response.response.updatedInput))
+H.check(
+	"T19 'Type something' sends the typed text as the answer value",
+	rq7
+		and rq7.response.request_id == "req-ask-7"
+		and rq7.response.response.updatedInput.answers
+		and rq7.response.response.updatedInput.answers["Freeform?"] == "frobnicate the widget"
+		and claude.state.qask == nil,
+	vim.inspect(rq7 and rq7.response.response.updatedInput)
+)
 
 -- ── T20: Issue-B pre-write gate — Write/Edit HELD behind a reconstructed diff ──
 -- Gated edit tools no longer auto-allow: the can_use_tool request stays open
@@ -923,82 +1147,100 @@ H.check("T19 'Type something' sends the typed text as the answer value",
 -- Write: proposed content is the input's `content` verbatim.
 local sends_pw = #chansend_calls
 feed({
-  type       = "control_request",
-  request_id = "req-write-1",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "Write",
-    input     = { file_path = "/tmp/pw_new.txt", content = "alpha\nbeta" },
-  },
+	type = "control_request",
+	request_id = "req-write-1",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "Write",
+		input = { file_path = "/tmp/pw_new.txt", content = "alpha\nbeta" },
+	},
 })
-H.check("T20 gated Write sends NO immediate control_response",
-  #chansend_calls == sends_pw, "sends delta=" .. (#chansend_calls - sends_pw))
-H.check("T20 pre-write diff opened with the proposed content",
-  #prewrite_calls == 1
-    and prewrite_calls[1].path == "/tmp/pw_new.txt"
-    and table.concat(prewrite_calls[1].proposed, "\n") == "alpha\nbeta",
-  vim.inspect(prewrite_calls))
-H.check("T20 held request armed (state.prewrite)",
-  claude.state.prewrite ~= nil
-    and claude.state.prewrite.request_id == "req-write-1",
-  vim.inspect(claude.state.prewrite))
+H.check(
+	"T20 gated Write sends NO immediate control_response",
+	#chansend_calls == sends_pw,
+	"sends delta=" .. (#chansend_calls - sends_pw)
+)
+H.check(
+	"T20 pre-write diff opened with the proposed content",
+	#prewrite_calls == 1
+		and prewrite_calls[1].path == "/tmp/pw_new.txt"
+		and table.concat(prewrite_calls[1].proposed, "\n") == "alpha\nbeta",
+	vim.inspect(prewrite_calls)
+)
+H.check(
+	"T20 held request armed (state.prewrite)",
+	claude.state.prewrite ~= nil and claude.state.prewrite.request_id == "req-write-1",
+	vim.inspect(claude.state.prewrite)
+)
 
 -- Accept → allow, echoing the request input back as updatedInput.
 claude.on_prewrite_resolve(true)
 local rw1 = last_control_response()
-H.check("T20 accept releases allow with echoed input",
-  rw1 and rw1.response.request_id == "req-write-1"
-    and rw1.response.response.behavior == "allow"
-    and rw1.response.response.updatedInput.content == "alpha\nbeta",
-  vim.inspect(rw1))
-H.check("T20 held request cleared after resolve",
-  claude.state.prewrite == nil, vim.inspect(claude.state.prewrite))
+H.check(
+	"T20 accept releases allow with echoed input",
+	rw1
+		and rw1.response.request_id == "req-write-1"
+		and rw1.response.response.behavior == "allow"
+		and rw1.response.response.updatedInput.content == "alpha\nbeta",
+	vim.inspect(rw1)
+)
+H.check("T20 held request cleared after resolve", claude.state.prewrite == nil, vim.inspect(claude.state.prewrite))
 
 -- ── T21: Edit reconstruction — old_string→new_string mirrored from disk ───────
 local t21 = "/tmp/claude_prewrite_t21.txt"
 vim.fn.writefile({ "one foo two", "three foo four", "five" }, t21)
 
 feed({
-  type       = "control_request",
-  request_id = "req-edit-2",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "Edit",
-    input     = { file_path = t21, old_string = "three foo", new_string = "three bar" },
-  },
+	type = "control_request",
+	request_id = "req-edit-2",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "Edit",
+		input = { file_path = t21, old_string = "three foo", new_string = "three bar" },
+	},
 })
 local pc = prewrite_calls[#prewrite_calls]
-H.check("T21 single replacement reconstructed from disk",
-  claude.state.prewrite ~= nil and pc and pc.path == t21
-    and table.concat(pc.proposed, "\n") == "one foo two\nthree bar four\nfive",
-  vim.inspect(pc and pc.proposed))
+H.check(
+	"T21 single replacement reconstructed from disk",
+	claude.state.prewrite ~= nil
+		and pc
+		and pc.path == t21
+		and table.concat(pc.proposed, "\n") == "one foo two\nthree bar four\nfive",
+	vim.inspect(pc and pc.proposed)
+)
 
 -- Reject → deny with a reason; the file was never written so disk is untouched.
 claude.on_prewrite_resolve(false)
 local re2 = last_control_response()
-H.check("T21 reject releases deny with a message",
-  re2 and re2.response.request_id == "req-edit-2"
-    and re2.response.response.behavior == "deny"
-    and type(re2.response.response.message) == "string",
-  vim.inspect(re2))
-H.check("T21 disk untouched after deny",
-  table.concat(vim.fn.readfile(t21), "\n") == "one foo two\nthree foo four\nfive")
+H.check(
+	"T21 reject releases deny with a message",
+	re2
+		and re2.response.request_id == "req-edit-2"
+		and re2.response.response.behavior == "deny"
+		and type(re2.response.response.message) == "string",
+	vim.inspect(re2)
+)
+H.check(
+	"T21 disk untouched after deny",
+	table.concat(vim.fn.readfile(t21), "\n") == "one foo two\nthree foo four\nfive"
+)
 
 -- replace_all: every occurrence replaced, not just the first.
 feed({
-  type       = "control_request",
-  request_id = "req-edit-3",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "Edit",
-    input     = { file_path = t21, old_string = "foo",
-                  new_string = "baz", replace_all = true },
-  },
+	type = "control_request",
+	request_id = "req-edit-3",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "Edit",
+		input = { file_path = t21, old_string = "foo", new_string = "baz", replace_all = true },
+	},
 })
 local pc3 = prewrite_calls[#prewrite_calls]
-H.check("T21 replace_all reconstructs every occurrence",
-  pc3 and table.concat(pc3.proposed, "\n") == "one baz two\nthree baz four\nfive",
-  vim.inspect(pc3 and pc3.proposed))
+H.check(
+	"T21 replace_all reconstructs every occurrence",
+	pc3 and table.concat(pc3.proposed, "\n") == "one baz two\nthree baz four\nfive",
+	vim.inspect(pc3 and pc3.proposed)
+)
 claude.on_prewrite_resolve(false) -- clean up the held request
 
 -- ── T22: gate fallbacks — reconstruction failure / diff already open ──────────
@@ -1009,45 +1251,59 @@ claude.on_prewrite_resolve(false) -- clean up the held request
 -- disk without the user ever seeing a card.
 local sends_edit4 = #chansend_calls
 feed({
-  type       = "control_request",
-  request_id = "req-edit-4",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "Edit",
-    input     = { file_path = t21, old_string = "NOT THERE", new_string = "x" },
-  },
+	type = "control_request",
+	request_id = "req-edit-4",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "Edit",
+		input = { file_path = t21, old_string = "NOT THERE", new_string = "x" },
+	},
 })
-H.check("T22 unreconstructable Edit shows a card (no silent auto-allow)",
-  #chansend_calls == sends_edit4, "sends delta=" .. (#chansend_calls - sends_edit4))
-H.check("T22 unreconstructable Edit armed as the fallback card",
-  claude.state.perm and claude.state.perm.request_id == "req-edit-4"
-    and claude.state.prewrite == nil,
-  vim.inspect(claude.state.perm))
-H.check("T22 unreconstructable Edit still arms post-write review (watch called)",
-  watch_calls[#watch_calls] == t21, vim.inspect(watch_calls))
-claude._resolve_permission("deny")  -- clear it before the next case
+H.check(
+	"T22 unreconstructable Edit shows a card (no silent auto-allow)",
+	#chansend_calls == sends_edit4,
+	"sends delta=" .. (#chansend_calls - sends_edit4)
+)
+H.check(
+	"T22 unreconstructable Edit armed as the fallback card",
+	claude.state.perm and claude.state.perm.request_id == "req-edit-4" and claude.state.prewrite == nil,
+	vim.inspect(claude.state.perm)
+)
+H.check(
+	"T22 unreconstructable Edit still arms post-write review (watch called)",
+	watch_calls[#watch_calls] == t21,
+	vim.inspect(watch_calls)
+)
+claude._resolve_permission("deny") -- clear it before the next case
 
 -- open_prewrite says no (a post-write diff is already up) → same fallback card.
 prewrite_result = false
 local sends_write2 = #chansend_calls
 feed({
-  type       = "control_request",
-  request_id = "req-write-2",
-  request    = {
-    subtype   = "can_use_tool",
-    tool_name = "Write",
-    input     = { file_path = "/tmp/pw_other.txt", content = "x" },
-  },
+	type = "control_request",
+	request_id = "req-write-2",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "Write",
+		input = { file_path = "/tmp/pw_other.txt", content = "x" },
+	},
 })
-H.check("T22 occupied diff → Write shows a card (no silent auto-allow)",
-  #chansend_calls == sends_write2, "sends delta=" .. (#chansend_calls - sends_write2))
-H.check("T22 occupied-diff Write armed as the fallback card",
-  claude.state.perm and claude.state.perm.request_id == "req-write-2"
-    and claude.state.prewrite == nil,
-  vim.inspect(claude.state.perm))
-H.check("T22 occupied-diff Write still arms post-write review (watch called)",
-  watch_calls[#watch_calls] == "/tmp/pw_other.txt", vim.inspect(watch_calls))
-claude._resolve_permission("deny")  -- clear it before subsequent tests
+H.check(
+	"T22 occupied diff → Write shows a card (no silent auto-allow)",
+	#chansend_calls == sends_write2,
+	"sends delta=" .. (#chansend_calls - sends_write2)
+)
+H.check(
+	"T22 occupied-diff Write armed as the fallback card",
+	claude.state.perm and claude.state.perm.request_id == "req-write-2" and claude.state.prewrite == nil,
+	vim.inspect(claude.state.perm)
+)
+H.check(
+	"T22 occupied-diff Write still arms post-write review (watch called)",
+	watch_calls[#watch_calls] == "/tmp/pw_other.txt",
+	vim.inspect(watch_calls)
+)
+claude._resolve_permission("deny") -- clear it before subsequent tests
 prewrite_result = true
 vim.fn.delete(t21)
 
@@ -1061,49 +1317,57 @@ local hostpath = "/tmp/claude_host_" .. tostring(vim.loop.now()) .. ".lua"
 vim.fn.writefile({ "-- host file", "local x = 1", "return x" }, hostpath)
 local host_abs = vim.fn.fnamemodify(hostpath, ":p")
 
-vim.cmd("tabnew " .. host_abs)           -- clean editor window backed by a real file
+vim.cmd("tabnew " .. host_abs) -- clean editor window backed by a real file
 local ewin = vim.api.nvim_get_current_win()
 
 local hf = claude._host_file_of(ewin)
-H.check("T23 host_file_of returns abs path for a real file",
-  type(hf) == "table" and hf.path == host_abs, vim.inspect(hf))
+H.check(
+	"T23 host_file_of returns abs path for a real file",
+	type(hf) == "table" and hf.path == host_abs,
+	vim.inspect(hf)
+)
 
 -- nofile scratch buffer → not a host file
-local sbuf = vim.api.nvim_create_buf(false, true)   -- buftype=nofile
+local sbuf = vim.api.nvim_create_buf(false, true) -- buftype=nofile
 vim.api.nvim_win_set_buf(ewin, sbuf)
-H.check("T23 host_file_of nil for a nofile buffer",
-  claude._host_file_of(ewin) == nil)
+H.check("T23 host_file_of nil for a nofile buffer", claude._host_file_of(ewin) == nil)
 
 -- unnamed (never-saved) buffer → not a host file
 local ubuf = vim.api.nvim_create_buf(true, false)
 vim.api.nvim_win_set_buf(ewin, ubuf)
-H.check("T23 host_file_of nil for an unnamed buffer",
-  claude._host_file_of(ewin) == nil)
+H.check("T23 host_file_of nil for an unnamed buffer", claude._host_file_of(ewin) == nil)
 
 -- current_host_file scans the tabpage and finds the real-file window
 vim.cmd("edit " .. host_abs)
-H.check("T24 current_host_file finds the open file",
-  (claude._current_host_file() or {}).path == host_abs,
-  vim.inspect(claude._current_host_file()))
+H.check(
+	"T24 current_host_file finds the open file",
+	(claude._current_host_file() or {}).path == host_abs,
+	vim.inspect(claude._current_host_file())
+)
 
 -- attach_host_context (v2): once per FILE (host_ctx_last_path gate), returns
 -- (wire, note) where note = the display path when an attach fired this turn.
-vim.cmd("edit " .. host_abs)   -- make host_abs the live editor file
+vim.cmd("edit " .. host_abs) -- make host_abs the live editor file
 claude.state.host_ctx_last_path = nil
 claude.state.host_file = { path = host_abs, disp = host_abs }
 local w1, n1 = claude._attach_host_context("hello")
-H.check("T25 first turn appends @<path> mention",
-  w1:find("@" .. host_abs, 1, true) ~= nil and w1:find("hello", 1, true) ~= nil, w1)
+H.check(
+	"T25 first turn appends @<path> mention",
+	w1:find("@" .. host_abs, 1, true) ~= nil and w1:find("hello", 1, true) ~= nil,
+	w1
+)
 local host_disp = vim.fn.fnamemodify(host_abs, ":~:.")
 H.check("T25 attach returns the display path as the note", n1 == host_disp, tostring(n1))
-H.check("T25 host_ctx_last_path records the attached file",
-  claude.state.host_ctx_last_path == host_abs)
+H.check("T25 host_ctx_last_path records the attached file", claude.state.host_ctx_last_path == host_abs)
 local w2, n2 = claude._attach_host_context("second")
-H.check("T25 same file gets a plain breadcrumb (path, NO @) and no note",
-  w2:find(host_abs, 1, true) ~= nil
-    and w2:find("@" .. host_abs, 1, true) == nil
-    and w2:find("second", 1, true) ~= nil
-    and n2 == nil, w2)
+H.check(
+	"T25 same file gets a plain breadcrumb (path, NO @) and no note",
+	w2:find(host_abs, 1, true) ~= nil
+		and w2:find("@" .. host_abs, 1, true) == nil
+		and w2:find("second", 1, true) ~= nil
+		and n2 == nil,
+	w2
+)
 
 -- v2b: switching to a DIFFERENT file re-attaches its context
 local host2 = "/tmp/claude_host2_" .. tostring(vim.loop.now()) .. ".lua"
@@ -1112,25 +1376,28 @@ local host_abs2 = vim.fn.fnamemodify(host2, ":p")
 vim.cmd("edit " .. host_abs2)
 local host_disp2 = vim.fn.fnamemodify(host_abs2, ":~:.")
 local w2b, n2b = claude._attach_host_context("now this one")
-H.check("T25 v2b file switch re-attaches the new file",
-  w2b:find("@" .. host_abs2, 1, true) ~= nil and n2b == host_disp2, w2b)
-H.check("T25 v2b host_ctx_last_path advanced to the new file",
-  claude.state.host_ctx_last_path == host_abs2)
+H.check(
+	"T25 v2b file switch re-attaches the new file",
+	w2b:find("@" .. host_abs2, 1, true) ~= nil and n2b == host_disp2,
+	w2b
+)
+H.check("T25 v2b host_ctx_last_path advanced to the new file", claude.state.host_ctx_last_path == host_abs2)
 vim.fn.delete(host_abs2)
-vim.cmd("edit " .. host_abs)   -- restore the primary host file as the open one
+vim.cmd("edit " .. host_abs) -- restore the primary host file as the open one
 
 -- no double-attach when the user already referenced the file themselves (still
 -- marked seen so later turns stay verbatim)
 claude.state.host_ctx_last_path = nil
 local w3, n3 = claude._attach_host_context("look at " .. host_abs)
-H.check("T25 no double-attach when path already present",
-  w3 == "look at " .. host_abs and n3 == nil
-    and claude.state.host_ctx_last_path == host_abs)
+H.check(
+	"T25 no double-attach when path already present",
+	w3 == "look at " .. host_abs and n3 == nil and claude.state.host_ctx_last_path == host_abs
+)
 
 -- no host file → text is untouched
 claude.state.host_ctx_last_path = nil
 claude.state.host_file = nil
-vim.cmd("tabnew")   -- empty unnamed buffer, no real-file window in this tab
+vim.cmd("tabnew") -- empty unnamed buffer, no real-file window in this tab
 local w4, n4 = claude._attach_host_context("plain")
 H.check("T25 attach is a no-op with no open file", w4 == "plain" and n4 == nil)
 
@@ -1139,9 +1406,8 @@ claude.state.host_ctx_last_path = nil
 claude.state.host_file = { path = host_abs, disp = host_abs }
 claude.state.host_ctx_enabled = false
 local w5, n5 = claude._attach_host_context("hi")
-H.check("T25 attach is a no-op when open-buffer context is OFF",
-  w5 == "hi" and n5 == nil)
-claude.state.host_ctx_enabled = true   -- restore
+H.check("T25 attach is a no-op when open-buffer context is OFF", w5 == "hi" and n5 == nil)
+claude.state.host_ctx_enabled = true -- restore
 
 -- v2c: send() drives render_user with the note → a dim "· with @<file>" line
 -- appears under the echo when an attach fires this turn.
@@ -1151,8 +1417,11 @@ claude.state.working = false
 claude._send("what does this do")
 vim.wait(30)
 local uecho = panel_text()
-H.check("T25 v2c echo shows the dim '· with @file' context note",
-  uecho:find("· with @" .. host_disp, 1, true) ~= nil, uecho)
+H.check(
+	"T25 v2c echo shows the dim '· with @file' context note",
+	uecho:find("· with @" .. host_disp, 1, true) ~= nil,
+	uecho
+)
 
 vim.fn.delete(host_abs)
 
@@ -1160,47 +1429,51 @@ vim.fn.delete(host_abs)
 -- The <leader>cq selection is sent as a fenced block; render_user must show it
 -- with the code gutter (▎) and drop the ``` fence rows.
 claude.state.working = false
-claude.state.host_ctx_enabled = false   -- keep the message verbatim (no @-append)
+claude.state.host_ctx_enabled = false -- keep the message verbatim (no @-append)
 claude._send("check this\n\n```lua\nlocal y = 7\n```")
 vim.wait(30)
 local echo = panel_text()
-H.check("T26 fenced user message renders a code gutter (▎)",
-  echo:find("▎", 1, true) ~= nil, echo)
-H.check("T26 fenced user message drops literal ``` rows",
-  echo:find("```", 1, true) == nil, echo)
-claude.state.host_ctx_enabled = true    -- restore
+H.check("T26 fenced user message renders a code gutter (▎)", echo:find("▎", 1, true) ~= nil, echo)
+H.check("T26 fenced user message drops literal ``` rows", echo:find("```", 1, true) == nil, echo)
+claude.state.host_ctx_enabled = true -- restore
 
 -- ── T27: /effort — apply level respawns with --effort, statusline + slider ─────
 -- apply mechanism mirrors --model: set state.effort + tear down the process so the
 -- next send respawns with --effort <level>.
-H.check("T27 current_effort defaults to medium when unset",
-  (function() claude.state.effort = nil; return claude.current_effort() end)() == "medium")
+H.check("T27 current_effort defaults to medium when unset", (function()
+	claude.state.effort = nil
+	return claude.current_effort()
+end)() == "medium")
 
 -- "/effort high" shorthand applies immediately (no slider) and updates the label.
 claude.pick_effort("high")
 H.check("T27 pick_effort(level) sets state.effort", claude.state.effort == "high")
 H.check("T27 current_effort reflects the pick", claude.current_effort() == "high")
-H.check("T27 applying a level tears down the live process (respawn on next send)",
-  claude.state.job_id == nil)
+H.check("T27 applying a level tears down the live process (respawn on next send)", claude.state.job_id == nil)
 
 -- An invalid level is ignored (opens the slider instead of setting garbage).
 claude.state.effort = "high"
 claude.pick_effort("bogus")
 H.check("T27 invalid level does not overwrite the effort", claude.state.effort == "high")
-require("utils.claude.effort").close()   -- dismiss the slider the invalid arg opened
+require("utils.claude.effort").close() -- dismiss the slider the invalid arg opened
 
 -- Next send carries --effort <level>.
 claude.state.job_id = nil
-claude.state.effort  = "xhigh"
+claude.state.effort = "xhigh"
 user_send("go")
 local ae = last_argv()
-H.check("T27 respawn argv carries --effort xhigh",
-  argv_contains(ae, "--effort") and argv_contains(ae, "xhigh"), table.concat(ae, " "))
+H.check(
+	"T27 respawn argv carries --effort xhigh",
+	argv_contains(ae, "--effort") and argv_contains(ae, "xhigh"),
+	table.concat(ae, " ")
+)
 
 -- The slider modal: open → move → confirm hands back the chosen level.
 local effort = require("utils.claude.effort")
 local picked
-effort.open("medium", function(lvl) picked = lvl end)
+effort.open("medium", function(lvl)
+	picked = lvl
+end)
 H.check("T27 slider opens", effort.active() == true)
 effort.close()
 H.check("T27 slider closes", effort.active() == false)
@@ -1210,7 +1483,11 @@ local cav_dir = vim.fn.tempname()
 vim.fn.mkdir(cav_dir, "p")
 vim.env.CLAUDE_CONFIG_DIR = cav_dir
 local cav_flag = cav_dir .. "/.caveman-active"
-local function write_flag(s) local f = io.open(cav_flag, "w"); f:write(s); f:close() end
+local function write_flag(s)
+	local f = io.open(cav_flag, "w")
+	f:write(s)
+	f:close()
+end
 os.remove(cav_flag)
 H.check("T28 no flag file → inactive", claude.caveman_active() == false)
 write_flag("full")
@@ -1235,50 +1512,77 @@ vim.fn.mkdir(fable_dir .. "/.work", "p")
 local prev_cwd = vim.fn.getcwd()
 local prev_root = claude.state.stored_root
 vim.cmd("cd " .. vim.fn.fnameescape(fable_dir))
-claude.state.stored_root = fable_dir   -- panel anchored here (fable_active reads it)
+claude.state.stored_root = fable_dir -- panel anchored here (fable_active reads it)
 claude.state.permission_mode = "default"
 
 local function chunks_text(c)
-  if type(c) ~= "table" then return tostring(c) end
-  local s = ""; for _, seg in ipairs(c) do s = s .. seg[1] end; return s
+	if type(c) ~= "table" then
+		return tostring(c)
+	end
+	local s = ""
+	for _, seg in ipairs(c) do
+		s = s .. seg[1]
+	end
+	return s
 end
 local function chunk_by_hl(c, hl)
-  if type(c) ~= "table" then return nil end
-  for _, seg in ipairs(c) do if seg[2] == hl then return seg[1] end end
-  return nil
+	if type(c) ~= "table" then
+		return nil
+	end
+	for _, seg in ipairs(c) do
+		if seg[2] == hl then
+			return seg[1]
+		end
+	end
+	return nil
 end
 
 -- No marker → unchanged plain-string title path.
 H.check("T29 no marker → fable_active false", claude._fable_active() == false)
 local t_off = claude._build_bar_title("Reply to Claude")
-H.check("T29 fable off → plain string title with 'Build Mode'",
-  type(t_off) == "string" and t_off:match("Build Mode") ~= nil, vim.inspect(t_off))
+H.check(
+	"T29 fable off → plain string title with 'Build Mode'",
+	type(t_off) == "string" and t_off:match("Build Mode") ~= nil,
+	vim.inspect(t_off)
+)
 
 -- Marker present (empty file) → detected.
-local mk = io.open(fable_dir .. "/.work/.fable-active", "w"); mk:close()
+local mk = io.open(fable_dir .. "/.work/.fable-active", "w")
+mk:close()
 H.check("T29 empty marker file → fable_active true", claude._fable_active() == true)
 
 -- Build + fable → "Fable Mode" REPLACES "Build Mode" (purple), "Build" gone.
 local t_build = claude._build_bar_title("Reply to Claude")
 H.check("T29 Build+fable → chunk list", type(t_build) == "table")
-H.check("T29 Build+fable → purple 'Fable Mode' segment",
-  chunk_by_hl(t_build, "ClaudeBarModeFable") == "Fable Mode ", vim.inspect(t_build))
-H.check("T29 Build+fable → 'Build Mode' replaced (word 'Build' absent)",
-  chunks_text(t_build):match("Build") == nil, chunks_text(t_build))
+H.check(
+	"T29 Build+fable → purple 'Fable Mode' segment",
+	chunk_by_hl(t_build, "ClaudeBarModeFable") == "Fable Mode ",
+	vim.inspect(t_build)
+)
+H.check(
+	"T29 Build+fable → 'Build Mode' replaced (word 'Build' absent)",
+	chunks_text(t_build):match("Build") == nil,
+	chunks_text(t_build)
+)
 
 -- Plan + fable → keep "Plan Mode", append bare "Fable" (no doubled "Mode").
 claude.state.permission_mode = "plan"
 local t_plan = claude._build_bar_title("Reply to Claude")
-H.check("T29 Plan+fable → keeps 'Plan Mode'",
-  chunks_text(t_plan):match("Plan Mode") ~= nil, chunks_text(t_plan))
-H.check("T29 Plan+fable → purple bare 'Fable' (no 'Mode')",
-  chunk_by_hl(t_plan, "ClaudeBarModeFable") == "Fable ", vim.inspect(t_plan))
+H.check("T29 Plan+fable → keeps 'Plan Mode'", chunks_text(t_plan):match("Plan Mode") ~= nil, chunks_text(t_plan))
+H.check(
+	"T29 Plan+fable → purple bare 'Fable' (no 'Mode')",
+	chunk_by_hl(t_plan, "ClaudeBarModeFable") == "Fable ",
+	vim.inspect(t_plan)
+)
 
 -- Marker removed → reverts to the plain "Plan Mode" string.
 os.remove(fable_dir .. "/.work/.fable-active")
 local t_rev = claude._build_bar_title("Reply to Claude")
-H.check("T29 marker removed → plain 'Plan Mode' string (reverts cleanly)",
-  type(t_rev) == "string" and t_rev:match("Plan Mode") ~= nil, vim.inspect(t_rev))
+H.check(
+	"T29 marker removed → plain 'Plan Mode' string (reverts cleanly)",
+	type(t_rev) == "string" and t_rev:match("Plan Mode") ~= nil,
+	vim.inspect(t_rev)
+)
 
 claude.state.permission_mode = "default"
 claude.state.stored_root = prev_root
@@ -1291,23 +1595,100 @@ vim.cmd("cd " .. vim.fn.fnameescape(prev_cwd))
 -- dispatch_override). Use /compact (a BUILTIN_DESC entry, so is_command() is true
 -- even pre-init) — /effort and /advisor are intercepted locally before any send.
 local t30_prev_host_ctx = claude.state.host_ctx_enabled
-claude.state.host_ctx_enabled = false   -- unrelated concern: no file-context note mutating the dispatch
+claude.state.host_ctx_enabled = false -- unrelated concern: no file-context note mutating the dispatch
 claude.state.working = false
 local t30_sends_before = #chansend_calls
 claude._submit("please /compact now, thanks")
-vim.wait(50, function() return #chansend_calls > t30_sends_before end)
-H.check("T30 full prose echoed into the transcript",
-  panel_text():find("please /compact now, thanks", 1, true) ~= nil, panel_text())
-H.check("T30 only the extracted command dispatched to the CLI",
-  last_sent_text() == "/compact now, thanks", tostring(last_sent_text()))
+vim.wait(50, function()
+	return #chansend_calls > t30_sends_before
+end)
+H.check(
+	"T30 full prose echoed into the transcript",
+	panel_text():find("please /compact now, thanks", 1, true) ~= nil,
+	panel_text()
+)
+H.check(
+	"T30 only the extracted command dispatched to the CLI",
+	last_sent_text() == "/compact now, thanks",
+	tostring(last_sent_text())
+)
 
 -- No command anywhere in the text → prose is both echoed and dispatched verbatim.
-claude.state.working = false   -- T30's turn never resolved (no result event fed)
+claude.state.working = false -- T30's turn never resolved (no result event fed)
 local t30b_sends_before = #chansend_calls
 claude._submit("just a normal message, no slash here")
-vim.wait(50, function() return #chansend_calls > t30b_sends_before end)
-H.check("T30b no command → dispatched text equals the full prose",
-  last_sent_text() == "just a normal message, no slash here", tostring(last_sent_text()))
+vim.wait(50, function()
+	return #chansend_calls > t30b_sends_before
+end)
+H.check(
+	"T30b no command → dispatched text equals the full prose",
+	last_sent_text() == "just a normal message, no slash here",
+	tostring(last_sent_text())
+)
 claude.state.host_ctx_enabled = t30_prev_host_ctx
+
+-- ── T31: MultiEdit/NotebookEdit auto-allow refuses to fire when watch() no-ops ──
+-- 2026-07-19 audit finding: MultiEdit/NotebookEdit have NO pre-write gate — the
+-- post-write claude_diff.watch() call is their SOLE review surface. Security fix:
+-- watch() now returns false on any of its silent no-op exits (nil/empty path,
+-- panel inactive, bufadd failure), and the dispatcher must refuse to auto-allow
+-- when that happens — falling back to the generic permission card instead of
+-- writing with ZERO review at any point.
+claude.state.job_id = 99
+claude.state.working = true
+
+-- Happy path: watch() succeeds → auto-allow fires immediately, no card.
+watch_result = true
+local sends_me1 = #chansend_calls
+feed({
+	type = "control_request",
+	request_id = "req-me-1",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "MultiEdit",
+		input = { file_path = "/tmp/multi.lua", edits = {} },
+	},
+})
+local r_me1 = last_control_response()
+H.check(
+	"T31 watch()==true auto-allows MultiEdit with no card",
+	r_me1 and r_me1.response.request_id == "req-me-1" and claude.state.perm == nil,
+	vim.inspect({ resp = r_me1, perm = claude.state.perm })
+)
+H.check(
+	"T31 watch()==true still arms post-write review",
+	watch_calls[#watch_calls] == "/tmp/multi.lua",
+	vim.inspect(watch_calls)
+)
+H.check(
+	"T31 sent exactly one control_response for the happy path",
+	#chansend_calls == sends_me1 + 1,
+	"delta=" .. (#chansend_calls - sends_me1)
+)
+
+-- Failure path: watch() no-ops (false) → must NOT auto-allow; falls back to card.
+watch_result = false
+local sends_me2 = #chansend_calls
+feed({
+	type = "control_request",
+	request_id = "req-me-2",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "NotebookEdit",
+		input = { notebook_path = "/tmp/nb.ipynb", edits = {} },
+	},
+})
+H.check(
+	"T31 watch()==false sends NO control_response (no silent auto-allow)",
+	#chansend_calls == sends_me2,
+	"sends delta=" .. (#chansend_calls - sends_me2)
+)
+H.check(
+	"T31 watch()==false falls back to the permission card",
+	claude.state.perm ~= nil and claude.state.perm.request_id == "req-me-2",
+	vim.inspect(claude.state.perm)
+)
+claude._resolve_permission("deny") -- clear the fallback card
+watch_result = true -- restore default for any later test
 
 H.summary("claude")

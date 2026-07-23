@@ -1864,7 +1864,55 @@ H.check(
 	vim.inspect(t_rev)
 )
 
+-- ── T29b: refresh_bar_title live-updates an ALREADY-OPEN float ─────────────────
+-- Bug: build_bar_title only runs once at float creation. Fable-mode's marker file
+-- is toggled by the fable-mode SKILL mid-conversation (an external actor, not a
+-- lua event this plugin observes) — so a bar left open across a toggle kept
+-- showing the stale title. refresh_bar_title is the fix: called from the bar's
+-- existing TextChangedI-driven cycle, it re-checks the marker and rewrites the
+-- win's title in place, with no window recreation.
 claude.state.permission_mode = "default"
+local probe_win = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), false, {
+	relative = "editor",
+	row = 0,
+	col = 0,
+	width = 20,
+	height = 1,
+	border = "rounded",
+	style = "minimal",
+	title = claude._build_bar_title("Reply to Claude"),
+	title_pos = "left",
+})
+local probe_last = claude._fable_active() -- false: marker still removed from T29 above
+H.check("T29b probe starts with no marker → false", probe_last == false)
+
+-- Marker appears mid-session (bar stays open) → refresh must flip the title live.
+local pmk = io.open(fable_dir .. "/.work/.fable-active", "w")
+pmk:close()
+probe_last = claude._refresh_bar_title(probe_win, "Reply to Claude", probe_last)
+H.check("T29b refresh picks up new marker → returns true", probe_last == true)
+H.check(
+	"T29b refresh rewrote the LIVE win config to show Fable",
+	chunks_text(vim.api.nvim_win_get_config(probe_win).title):match("Fable") ~= nil,
+	vim.inspect(vim.api.nvim_win_get_config(probe_win).title)
+)
+
+-- No-op call (state unchanged) must not touch the config again — cheap per-keystroke check.
+local unchanged = claude._refresh_bar_title(probe_win, "Reply to Claude", probe_last)
+H.check("T29b no state change → returns same last value", unchanged == probe_last)
+
+-- Marker removed mid-session → refresh must flip back to plain string, same window.
+os.remove(fable_dir .. "/.work/.fable-active")
+probe_last = claude._refresh_bar_title(probe_win, "Reply to Claude", probe_last)
+H.check("T29b refresh picks up marker removal → returns false", probe_last == false)
+H.check(
+	"T29b refresh reverted the LIVE win config to plain 'Build Mode' (no Fable)",
+	chunks_text(vim.api.nvim_win_get_config(probe_win).title):match("Build Mode") ~= nil
+		and chunks_text(vim.api.nvim_win_get_config(probe_win).title):match("Fable") == nil,
+	vim.inspect(vim.api.nvim_win_get_config(probe_win).title)
+)
+vim.api.nvim_win_close(probe_win, true)
+
 claude.state.stored_root = prev_root
 vim.cmd("cd " .. vim.fn.fnameescape(prev_cwd))
 

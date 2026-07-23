@@ -1,0 +1,63 @@
+flowchart LR
+    User["Developer in Neovim"]
+    Host["Current buffer and project root"]
+
+    subgraph UI["Neovim UI and orchestration"]
+      Plugin["plugins/claude.lua<br/>setup, highlights, keymaps"]
+      Init["claude/init.lua<br/>public API, panel, chat bar, dependency wiring"]
+      Core["claude/core.lua<br/>shared session and UI state"]
+      Panel["Scratch-buffer transcript<br/>hints, cards, widgets, pet overlay"]
+      Slash["slash, effort, advisor pickers"]
+    end
+
+    subgraph Engine["Persistent Claude process"]
+      Process["claude/process.lua<br/>jobstart, stdin queue, stdout line assembly"]
+      CLI["Claude Code CLI<br/>stream-json plus stdio permission protocol"]
+    end
+
+    subgraph Events["Event interpretation"]
+      Dispatch{"render.dispatch<br/>event type?"}
+      Render["render.lua and markdown.lua<br/>prose, thinking, tools, results"]
+      Widgets["widgets.lua<br/>tasks and subagent views"]
+      Pet["pet.lua plus pet_render.lua<br/>activity state and image overlay"]
+    end
+
+    subgraph Decisions["Human-in-the-loop decisions"]
+      Gate["gate.lua<br/>permission and pre-write cards"]
+      Question["question.lua<br/>AskUserQuestion card"]
+      Diff["claude_diff.lua<br/>watch, poll, vimdiff, accept or reject"]
+    end
+
+    User -->|"toggle, type, select"| Plugin
+    Plugin --> Init
+    Host -->|"cwd and optional @file context"| Init
+    Init <--> Core
+    Init --> Panel
+    Init --> Slash
+
+    Init -->|"send or enqueue"| Process
+    Process -->|"newline-delimited user events"| CLI
+    CLI -->|"stream-json stdout"| Process
+    Process -->|"decoded event"| Dispatch
+
+    Dispatch -->|"assistant, tool result, result"| Render
+    Dispatch -->|"task lifecycle or parent tool id"| Widgets
+    Dispatch -->|"activity signals"| Pet
+    Render --> Panel
+    Widgets --> Panel
+    Pet --> Panel
+
+    Dispatch -->|"can_use_tool"| Gate
+    Dispatch -->|"AskUserQuestion"| Question
+    Gate -->|"control_response"| CLI
+    Question -->|"answers or clarification"| CLI
+
+    Dispatch -->|"edit target watch and post-tool poll"| Diff
+    Gate -->|"reconstructed pre-write proposal"| Diff
+    Diff -->|"on_diff_open and on_diff_close"| Init
+    Init -->|"review card"| Gate
+    User -->|"allow, answer, accept, reject"| Gate
+    User --> Question
+    User --> Diff
+    Diff -->|"accepted hunk"| Render
+    Diff -->|"review resolved; drain queued turn"| Process

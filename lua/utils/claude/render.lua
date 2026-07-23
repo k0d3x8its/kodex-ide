@@ -2216,7 +2216,12 @@ local function dispatch(event)
 				render_thinking(block.thinking or "")
 			elseif btype == "server_tool_use" and (block.name == "advisor") then
 				-- Escalation to the advisor model: "● Advising using <model>" header. The
-				-- advice arrives as a separate advisor_tool_result block (below).
+				-- advice arrives as a separate advisor_tool_result block (below). Without
+				-- this, a consult has no tool_use/typing event in between and the pet
+				-- freezes on whatever it was showing before the escalation.
+				if pet_emit then
+					pet_emit("advising")
+				end
 				render_advisor_header()
 			elseif btype == "advisor_tool_result" then
 				render_advisor_result(block.content)

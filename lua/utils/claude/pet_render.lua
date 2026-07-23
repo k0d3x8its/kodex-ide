@@ -84,10 +84,14 @@ local FRAME_STEP = 1 -- use every Nth cached frame (cache is already thinned to 
 -- index 11 (file 010) so the hold is a calm read, not the pass-left-and-back motion.
 -- sleeping: frames 1-6 are the one-shot collapse (standing → splooted), 7-16 are the
 -- breathing+Zzz loop — loop from 7 so the collapse doesn't replay every cycle.
--- hero: one-shot 4.4s "put on glasses, cool pose" intro that freezes at its last
--- keyframe — loop from 16 (the last frame) so it holds the freeze pose instead of
--- replaying the intro.
-local LOOP_FROM = { ["idle-reading"] = 11, ["sleeping"] = 7, ["hero"] = 16 }
+-- hero: one-shot "put on glasses, cool pose" intro. The raw source GIF's last third
+-- (~frames 29-39 of 40) is a big fist-pump jump, NOT a subtle bob — looping into it
+-- would read as a repeating jump, not idle motion. The pet's cached frame set was
+-- REGENERATED excluding that jump range (sampled 16 frames evenly from raw 0-28
+-- only, same union-crop/point-resize recipe as fetch-clawd-assets.sh), so cached
+-- frames 13-16 land in the calm held-pose region (raw ~21/23/25/27, verified stable
+-- ~150-151px trim height, single-pixel dither only) — loop from 13 to hold that.
+local LOOP_FROM = { ["idle-reading"] = 11, ["sleeping"] = 7, ["hero"] = 13 }
 
 -- States that must finish one full animation cycle before a LOW-priority follow-up
 -- (the idle asset) may replace them. happy fires at turn end and the idle reset
@@ -108,11 +112,25 @@ local DEFAULT_ASSET_SCALE = 0.5
 -- ideally wants 6 rows but that needs >12 cols and would stretch — capped at 5.
 local ASSET_SCALE = {
 	["idle"] = 0.50, -- reference, src bbox 102
+	["advising"] = 0.65, -- 126 (custom asset, wasn't in this table — fell back to
+	-- DEFAULT_ASSET_SCALE=0.5, undersized vs the rest; bbox is clean, no outlier frames).
+	-- The formula value (0.62) round-trips to the SAME quantized row/col box as the
+	-- 0.5 default at this session's traced cell size (10x22px) — floor()+0.5 rounding
+	-- landed just under the row-4 threshold, so it would have been a silent no-op.
+	-- 0.65 verified against the traced cell size to actually cross into a bigger box.
 	["building"] = 0.75, -- 153
 	["debugger"] = 0.70, -- 129
 	["error"] = 0.70, -- 139
 	["happy"] = 0.95, -- 193 (capped, see above)
 	["headphones-groove"] = 0.85, -- 164
+	["hero"] = 0.95, -- 238 (custom asset, also missing → fell back to 0.5, undersized).
+	-- Cached frames were also regenerated from raw 0-28 only (see LOOP_FROM comment),
+	-- dropping the fist-pump tail's bbox contribution (245->238) — still bigger than
+	-- idle because the glasses-reach frames (raw 8-11) extend the shared crop, but
+	-- that's real held-frame content, not croppable without clipping the toss itself.
+	-- Formula wants 1.20; capped at 0.95 like happy — verified against this session's
+	-- traced cell size (10x22px) to land at cols=11 rows=5, well inside the 12x8 box
+	-- (no clamp/distortion).
 	["idle-reading"] = 0.55, -- 109
 	["juggling"] = 0.70, -- 121
 	["notification"] = 0.73, -- 149
@@ -212,11 +230,15 @@ end
 -- a uniform pad would misalign them. pad = max(0, round((30px - gap_screen)/cw)).
 local X_PAD = {
 	["idle"] = 3,
+	["advising"] = 1, -- best-guess default (0.62 scale, mid-tier) — wasn't in this
+	-- table either; re-eyeball against happy like the others once live, same as every
+	-- other entry here was originally tuned.
 	["building"] = 2,
 	["debugger"] = 1,
 	["error"] = 2,
 	["happy"] = 0,
 	["headphones-groove"] = 2,
+	["hero"] = 0, -- best-guess default, same scale tier as happy (both capped 0.95)
 	["idle-reading"] = 3,
 	["juggling"] = 3,
 	["notification"] = 3,

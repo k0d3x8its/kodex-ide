@@ -12,37 +12,46 @@ H.stub_project_root("/tmp")
 -- ── Subprocess + module stubs (mirror claude_stream_spec.lua) ─────────────────
 local captured_stdout_cb = nil
 vim.fn.jobstart = function(_, opts)
-  captured_stdout_cb = opts.on_stdout
-  return 99
+	captured_stdout_cb = opts.on_stdout
+	return 99
 end
-vim.fn.jobstop  = function() end
-vim.fn.chansend = function(_, data) return #data end
+vim.fn.jobstop = function() end
+vim.fn.chansend = function(_, data)
+	return #data
+end
 vim.fn.chanclose = function() end
 
 package.loaded["utils.term_layout"] = { place_vertical = function() end }
 package.loaded["utils.claude_diff"] = {
-  on_panel_open = function() end, on_panel_close = function() end,
-  on_diff_open  = function() end, on_diff_close  = function() end,
-  watch = function() end, poll = function() end,
-  accept_all = function() end, reject_all = function() end,
+	on_panel_open = function() end,
+	on_panel_close = function() end,
+	on_diff_open = function() end,
+	on_diff_close = function() end,
+	watch = function() end,
+	poll = function() end,
+	accept_all = function() end,
+	reject_all = function() end,
 }
 package.loaded["utils.opencode"] = {
-  state = { opencode_active = false }, toggle = function() end,
+	state = { opencode_active = false },
+	toggle = function() end,
 }
 
 local claude = require("utils.claude")
 claude.setup({ width_pct = 0.40 })
-claude.is_available = function() return true end
+claude.is_available = function()
+	return true
+end
 local pet = require("utils.claude.pet")
 
 -- Feed one stream-json event through the captured stdout callback.
 local function feed(ev)
-  captured_stdout_cb(99, { vim.json.encode(ev), "" }, "stdout")
-  vim.wait(20)
+	captured_stdout_cb(99, { vim.json.encode(ev), "" }, "stdout")
+	vim.wait(20)
 end
 -- Feed an assistant message carrying one content block (tool_use / text).
 local function assistant(block)
-  feed({ type = "assistant", message = { content = { block } } })
+	feed({ type = "assistant", message = { content = { block } } })
 end
 
 -- ── Open the panel + spawn (captures on_stdout, same as the stream spec) ──────
@@ -62,18 +71,20 @@ H.check("W0b send → initial typing band", pet.state == "typing", "state=" .. t
 -- ── Turn lifecycle seams (render.lua dispatch) ────────────────────────────────
 
 -- W1 thinking — a thinking content_block_start flips the pet to reasoning.
-feed({ type = "stream_event",
-  event = { type = "content_block_start", index = 0,
-            content_block = { type = "thinking" } } })
+feed({
+	type = "stream_event",
+	event = { type = "content_block_start", index = 0, content_block = { type = "thinking" } },
+})
 H.check("W1 thinking seam → thinking", pet.state == "thinking", "state=" .. tostring(pet.state))
 
 -- W1b stream typing — a text content_block_start (incremental SSE) flips to typing
 -- the moment prose STARTS streaming, not only when the aggregated block lands (W2).
 -- This is the seam the pet needs so it animates typing during the live compose band
 -- the transcript shows `●∙∙ Typing` for, not just for one frame at the end.
-feed({ type = "stream_event",
-  event = { type = "content_block_start", index = 1,
-            content_block = { type = "text" } } })
+feed({
+	type = "stream_event",
+	event = { type = "content_block_start", index = 1, content_block = { type = "text" } },
+})
 H.check("W1b text stream-start → typing", pet.state == "typing", "state=" .. tostring(pet.state))
 
 -- W2 typing — an aggregated assistant text block flips to generating output.
@@ -97,9 +108,21 @@ H.check("W5 Bash rm seam → cleaning", pet.state == "cleaning", "state=" .. tos
 -- (from W5) outranks subagent in the priority list, so a lingering work-state
 -- would mask it (that ordering is intentional and covered by claude_pet_spec).
 pet.reset()
-assistant({ type = "tool_use", id = "a1", name = "Agent",
-            input = { description = "sub", subagent_type = "general-purpose" } })
+assistant({
+	type = "tool_use",
+	id = "a1",
+	name = "Agent",
+	input = { description = "sub", subagent_type = "general-purpose" },
+})
 H.check("W6 Agent spawn seam → subagent", pet.state == "subagent", "state=" .. tostring(pet.state))
+
+-- W6b advising — a server_tool_use "advisor" escalation drives the advising state.
+-- Regression guard: without the pet_emit("advising") call in render.lua's
+-- server_tool_use branch, the pet has no event to react to and freezes on
+-- whatever it was showing before the consult (the bug this seam exists to fix).
+pet.reset()
+assistant({ type = "server_tool_use", id = "adv1", name = "advisor", input = {} })
+H.check("W6b advisor consult seam → advising", pet.state == "advising", "state=" .. tostring(pet.state))
 
 -- W7 result success — the turn's result event flashes happy. Reset first so the
 -- W6 subagent condition (still active — it clears on the task lifecycle, not here)
@@ -131,19 +154,20 @@ H.check("W10 on_diff_open seam → diff_wait", pet.state == "diff_wait", "state=
 -- W11 diff_resolve — resolving a prewrite gate flashes approved/rejected. Only
 -- runs if the public surface exposes on_prewrite_resolve (it is re-exported).
 if type(claude.on_prewrite_resolve) == "function" then
-  claude.state.job_id   = 99
-  claude.state.prewrite = { request_id = "r1", input = {} }
-  claude.on_prewrite_resolve(true)
-  H.check("W11 prewrite accept seam → diff_approved",
-    pet.state == "diff_approved", "state=" .. tostring(pet.state))
+	claude.state.job_id = 99
+	claude.state.prewrite = { request_id = "r1", input = {} }
+	claude.on_prewrite_resolve(true)
+	H.check("W11 prewrite accept seam → diff_approved", pet.state == "diff_approved", "state=" .. tostring(pet.state))
 
-  claude.state.prewrite = { request_id = "r2", input = {} }
-  claude.on_prewrite_resolve(false)
-  H.check("W11 prewrite reject seam → diff_rejected",
-    pet.state == "diff_rejected", "state=" .. tostring(pet.state))
+	claude.state.prewrite = { request_id = "r2", input = {} }
+	claude.on_prewrite_resolve(false)
+	H.check("W11 prewrite reject seam → diff_rejected", pet.state == "diff_rejected", "state=" .. tostring(pet.state))
 else
-  H.check("W11 on_prewrite_resolve exposed (diff_resolve seam)", false,
-    "claude.on_prewrite_resolve not on public surface")
+	H.check(
+		"W11 on_prewrite_resolve exposed (diff_resolve seam)",
+		false,
+		"claude.on_prewrite_resolve not on public surface"
+	)
 end
 
 -- W12 diff_close clears diff_wait (Gate-3 HIGH regression). The winbar
@@ -154,18 +178,20 @@ pet.reset()
 claude.on_diff_open({ path = "/tmp/x.lua", kind = "modify" })
 H.check("W12 diff open → diff_wait", pet.state == "diff_wait", "state=" .. tostring(pet.state))
 claude.on_diff_close()
-H.check("W12 on_diff_close clears diff_wait (not latched)",
-  pet.state ~= "diff_wait", "state=" .. tostring(pet.state))
+H.check("W12 on_diff_close clears diff_wait (not latched)", pet.state ~= "diff_wait", "state=" .. tostring(pet.state))
 
 -- W13 result clears a stale subagent (Gate-3 MED regression). A dropped final
 -- task_notification would leave the pet in `subagent`; the result event must
 -- clear it so a successful turn surfaces happy, not a phantom juggling pet.
 pet.reset()
-assistant({ type = "tool_use", id = "a2", name = "Agent",
-            input = { description = "sub2", subagent_type = "general-purpose" } })
+assistant({
+	type = "tool_use",
+	id = "a2",
+	name = "Agent",
+	input = { description = "sub2", subagent_type = "general-purpose" },
+})
 H.check("W13 subagent active pre-result", pet.state == "subagent", "state=" .. tostring(pet.state))
 feed({ type = "result", subtype = "success", is_error = false })
-H.check("W13 result clears stale subagent → happy",
-  pet.state == "happy", "state=" .. tostring(pet.state))
+H.check("W13 result clears stale subagent → happy", pet.state == "happy", "state=" .. tostring(pet.state))
 
 H.summary("claude_pet_wire")

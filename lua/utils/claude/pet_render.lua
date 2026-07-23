@@ -85,13 +85,22 @@ local FRAME_STEP = 1 -- use every Nth cached frame (cache is already thinned to 
 -- sleeping: frames 1-6 are the one-shot collapse (standing → splooted), 7-16 are the
 -- breathing+Zzz loop — loop from 7 so the collapse doesn't replay every cycle.
 -- hero: one-shot "put on glasses, cool pose" intro. The raw source GIF's last third
--- (~frames 29-39 of 40) is a big fist-pump jump, NOT a subtle bob — looping into it
--- would read as a repeating jump, not idle motion. The pet's cached frame set was
--- REGENERATED excluding that jump range (sampled 16 frames evenly from raw 0-28
--- only, same union-crop/point-resize recipe as fetch-clawd-assets.sh), so cached
--- frames 13-16 land in the calm held-pose region (raw ~21/23/25/27, verified stable
--- ~150-151px trim height, single-pixel dither only) — loop from 13 to hold that.
-local LOOP_FROM = { ["idle-reading"] = 11, ["sleeping"] = 7, ["hero"] = 13 }
+-- (raw 30-39 of 40) is a hands-out-to-sides pose; tried it as the idle hold (an
+-- earlier pass of this same session) but live-testing found it read worse than the
+-- original hands-near-glasses hold — REVERTED back to that. The pet's cached frame
+-- set is REGENERATED from raw 0-28 only (union-crop/point-resize recipe matches
+-- fetch-clawd-assets.sh's extract_frames, but run as a one-off — hero is a custom
+-- asset, NOT in that script's STATES list, so this is not auto-reproduced by a
+-- plain --rebuild; re-run the same recipe by hand, trimmed to raw frames 0-28,
+-- against clawd-hero.gif if the cache is ever wiped). Originally looped 13-16 (the
+-- calm hands-near-glasses region, raw ~21/23/25/27) but live-testing found it read
+-- as a shake, not a still idle. Root cause turned out to be file 012 specifically —
+-- still mid-transition (visibly different head-crop height / glasses angle from
+-- the rest), not general dither across all 4 frames. Tried looping ONLY the last
+-- frame (16) to kill the shake, but that removed idle motion entirely (a frozen
+-- frame). Fix: drop just the outlier — loop 14-16 (files 013-015), which ARE
+-- near-identical to each other — keeps subtle idle motion, no jump.
+local LOOP_FROM = { ["idle-reading"] = 11, ["sleeping"] = 7, ["hero"] = 14 }
 
 -- States that must finish one full animation cycle before a LOW-priority follow-up
 -- (the idle asset) may replace them. happy fires at turn end and the idle reset
@@ -123,14 +132,13 @@ local ASSET_SCALE = {
 	["error"] = 0.70, -- 139
 	["happy"] = 0.95, -- 193 (capped, see above)
 	["headphones-groove"] = 0.85, -- 164
-	["hero"] = 0.95, -- 238 (custom asset, also missing → fell back to 0.5, undersized).
-	-- Cached frames were also regenerated from raw 0-28 only (see LOOP_FROM comment),
-	-- dropping the fist-pump tail's bbox contribution (245->238) — still bigger than
-	-- idle because the glasses-reach frames (raw 8-11) extend the shared crop, but
-	-- that's real held-frame content, not croppable without clipping the toss itself.
-	-- Formula wants 1.20; capped at 0.95 like happy — verified against this session's
-	-- traced cell size (10x22px) to land at cols=11 rows=5, well inside the 12x8 box
-	-- (no clamp/distortion).
+	["hero"] = 0.75, -- 238 (custom asset, raw 0-28 crop). Formula wants 1.20. Sizing
+	-- here only quantizes into a handful of discrete row tiers (see the row-snap in
+	-- frame_placement), not a smooth slider: 0.95 → cols=11 rows=5 (one tier above
+	-- everything else); 0.60 → cols=7 rows=3 (idle's own tier, smaller than most).
+	-- 0.75 lands at cols=9 rows=4 — the SAME tier as building/debugger/error/etc,
+	-- i.e. matches most of the roster. Any value 0.65-0.82 renders identically
+	-- (constant cols/rows within a tier) — 0.75 chosen as the tier's center.
 	["idle-reading"] = 0.55, -- 109
 	["juggling"] = 0.70, -- 121
 	["notification"] = 0.73, -- 149

@@ -46,10 +46,18 @@ local set_waiting_hint
 local pet_emit
 local pet_attach_surface
 local pet_attach_panel
+-- Cross-type drain target: a queued AskUserQuestion event (see show_permission_card's
+-- cross-type guard) is dispatched through question.show_question_card, injected here
+-- to avoid a gate<->question require cycle (question.lua injects show_permission_card
+-- back the same way).
+local show_question_card_hook
 
 -- Forward decl: resolve_permission (defined first) drains the queue by re-invoking
 -- show_permission_card (defined further down). Assigned, not re-declared, below.
 local show_permission_card
+-- Forward decl: same reason — resolve_permission/close_question_card drain
+-- state.diffcard_queue by re-invoking show_diff_card (defined further down).
+local show_diff_card
 
 --- Inject init's spinner/hint/float helpers. Called once from init after they
 --- are defined (prompt_input arrives as a thunk since it is defined further down
@@ -67,6 +75,7 @@ function Gate.wire(hooks)
 	pet_emit = hooks.pet_emit
 	pet_attach_surface = hooks.pet_attach_surface
 	pet_attach_panel = hooks.pet_attach_panel
+	show_question_card_hook = hooks.show_question_card
 end
 
 local function send_permission_response(request_id, decision, o)
@@ -245,6 +254,31 @@ function Gate.on_prewrite_resolve(accepted)
 		state.activity_t0 = vim.loop.now()
 		start_spinner()
 	end
+
+	-- Cross-type: a perm/question card may have queued behind this held prewrite
+	-- request via show_permission_card's/show_question_card's state.prewrite guard —
+	-- the diff CARD itself may already be gone (Esc-dismissed), leaving only the held
+	-- request as the thing actually blocking. Drain here, the moment it clears. Only
+	-- one of perm_queue/qask_queue can be non-empty (show_permission_card/
+	-- show_question_card both queue into their OWN queue, never cross-populate on this
+	-- guard). Carry the diff card's reopen-bar flag across only when actually handing
+	-- off — if nothing queued, on_diff_close (which close_diff() below still triggers)
+	-- consumes it normally. (Gate-3 finding, advisor 2026-07-22 discriminating probe T17f.)
+	if state.perm_queue and #state.perm_queue > 0 then
+		local nxt = table.remove(state.perm_queue, 1)
+		if state.diff_card_reopen_bar then
+			state.diff_card_reopen_bar = false
+			state.decision_reopen_bar = true
+		end
+		show_permission_card(nxt)
+	elseif state.qask_queue and #state.qask_queue > 0 and show_question_card_hook then
+		local nxt = table.remove(state.qask_queue, 1)
+		if state.diff_card_reopen_bar then
+			state.diff_card_reopen_bar = false
+			state.decision_reopen_bar = true
+		end
+		show_question_card_hook(nxt)
+	end
 end
 
 -- ─── Permission card (step 4) ─────────────────────────────────────────────────
@@ -355,6 +389,29 @@ local function resolve_permission(kind)
 		show_permission_card(nxt)
 		return
 	end
+	-- Cross-type: a question card was queued behind this one (show_question_card's
+	-- cross-type guard) instead of drawing over it. Hand off the same way.
+	if state.qask_queue and #state.qask_queue > 0 and show_question_card_hook then
+		local nxt = table.remove(state.qask_queue, 1)
+		show_question_card_hook(nxt)
+		return
+	end
+	-- Cross-type: a diff card was queued behind this one (show_diff_card's cross-type
+	-- guard). Unlike perm<->qask, the diff card doesn't pause/resume the turn clock
+	-- itself and tracks its own reopen flag — resume here and carry the reopen intent
+	-- across before handing off (Gate-3 finding, advisor 2026-07-22: draining via a bare
+	-- early-return like the two blocks above would leave the turn clock stuck paused and
+	-- strand a dismissed chat bar's reopen).
+	if state.diffcard_queue and #state.diffcard_queue > 0 then
+		local nxt = table.remove(state.diffcard_queue, 1)
+		core.resume_turn()
+		if state.decision_reopen_bar then
+			state.decision_reopen_bar = false
+			state.diff_card_reopen_bar = true
+		end
+		show_diff_card(nxt.path, nxt.kind)
+		return
+	end
 
 	-- Clawd: no more queued cards → the modal is truly gone. Clear the building/notify
 	-- state so the work/idle state underneath resurfaces. (A drained card above returned
@@ -383,8 +440,8 @@ local function resolve_permission(kind)
 	-- the input (draft restored) and can keep the conversation going. Scheduled so
 	-- the card's window is fully torn down first. state.perm is already nil here, so
 	-- prompt_input() won't bail on the permission guard.
-	if state.perm_reopen_bar then
-		state.perm_reopen_bar = false
+	if state.decision_reopen_bar then
+		state.decision_reopen_bar = false
 		vim.schedule(function()
 			prompt_input()
 		end)
@@ -425,7 +482,7 @@ local function abort_permission_cards(receipt)
 		if p.win and vim.api.nvim_win_is_valid(p.win) then
 			pcall(vim.api.nvim_win_close, p.win, true) -- WinClosed autocmd drops the pad
 		end
-		state.perm_reopen_bar = false -- no chat bar to hand back to a dead session
+		state.decision_reopen_bar = false -- no chat bar to hand back to a dead session
 		if pet_emit then
 			pet_emit("permission", { active = false })
 		end
@@ -744,12 +801,23 @@ end
 -- the lock. Pauses the spinner (Claude is genuinely blocked on us, so a spinner
 -- would lie); resolve_permission restarts it.
 show_permission_card = function(event)
-	-- One card at a time. If a card is already up (parallel tool_use → concurrent
-	-- can_use_tool requests), QUEUE this event instead of overwriting state.perm and
-	-- opening a second float that orphans the first. resolve_permission drains the
-	-- queue when the current card is answered. The turn is already paused / spinner
-	-- already stopped by the visible card, so we just stash the raw event and return.
-	if state.perm then
+	-- One DECISION card at a time, perm or question. Guarding only on state.perm
+	-- let a question card (state.qask) open on top of a still-live perm card — same
+	-- anchor="SW"/zindex=60 as open_question_float, so it silently draws over the
+	-- perm float instead of colliding/erroring. The perm float never got closed or
+	-- tracked as queued, so it reappeared, unresolved, once the question card closed
+	-- (see docs/post-mortems/concurrent-permission-modal-ghost.md, cross-type follow-up).
+	-- Queue on EITHER type being up; resolve_permission/close_question_card both drain
+	-- both queues so whichever card is blocking hands off correctly. A live diff_card
+	-- shares the same float geometry too — guard against it the same way; close_diff_card
+	-- drains perm_queue on resolve/dismiss. state.prewrite ALSO needs its own check, not
+	-- just diff_card: Esc/q dismisses the diff CARD but leaves the held prewrite request
+	-- (and its vimdiff windows) open — a new perm/qask request arriving in that window
+	-- would open right over the still-unresolved prewrite with no card up to guard
+	-- against it. on_prewrite_resolve drains perm_queue when the held request finally
+	-- clears (Gate-3 finding, advisor 2026-07-22 discriminating probe T17f — the guard
+	-- only covered show_diff_card's forward direction, not this reverse one).
+	if state.perm or state.qask or state.diff_card or state.prewrite then
 		state.perm_queue = state.perm_queue or {}
 		state.perm_queue[#state.perm_queue + 1] = event
 		return
@@ -791,12 +859,14 @@ show_permission_card = function(event)
 	-- same panel column as the card, so leaving it open overlaps the card and steals
 	-- focus/draw order — the card then can't be driven and falls through to a reject.
 	-- Closing via the bar's own close() saves the draft; we reopen it on resolve.
-	-- NB: don't blindly reset perm_reopen_bar here — when this card is drained from
-	-- the queue after a prior card, the bar was already dismissed (chat_win is gone)
-	-- and the pending-reopen intent from the first card must survive to the last one.
-	-- Only set it when there's actually an open bar to dismiss now.
+	-- NB: don't blindly reset decision_reopen_bar here — when this card is drained
+	-- from the queue after a prior card (same-type, or a cross-type hand-off from a
+	-- resolved question card), the bar was already dismissed (chat_win is gone) and
+	-- the pending-reopen intent from the first card must survive to the last one.
+	-- Only set it when there's actually an open bar to dismiss now. Shared flag with
+	-- question.lua's show_question_card — see core.lua's decision_reopen_bar comment.
 	if state.chat_win and vim.api.nvim_win_is_valid(state.chat_win) then
-		state.perm_reopen_bar = true
+		state.decision_reopen_bar = true
 		if state.chat_close then
 			pcall(state.chat_close)
 		end
@@ -873,10 +943,12 @@ end
 -- choice resolves it and when the diff resolves some other way (the winbar
 -- <leader>ca/cx fallback, or the diff window simply being closed) and the
 -- now-stale card needs to go away.
+-- Returns true when a queued perm/question card was handed off (caller should skip
+-- any tail work it would otherwise run — that card owns the lifecycle now).
 local function close_diff_card()
 	local d = state.diff_card
 	if not d then
-		return
+		return false
 	end
 	state.diff_card = nil
 	if d.resize_close then
@@ -888,6 +960,37 @@ local function close_diff_card()
 	if pet_attach_panel then
 		pet_attach_panel()
 	end
+
+	-- Cross-type: a perm/question card was queued behind this diff card
+	-- (show_permission_card's/show_question_card's cross-type guard) instead of
+	-- drawing over it. Drain MUST live here, not just in on_diff_close: Esc/q
+	-- (below) and the WinClosed fallback both tear the card down via this function
+	-- directly, without going through on_diff_close — a queued control_request left
+	-- undrained on either of those paths would strand the CLI waiting forever
+	-- (Gate-3 finding, advisor 2026-07-22). Carry whichever reopen-bar flag was set
+	-- across, since perm/qask and diff cards each track their own — only when actually
+	-- handing off, so an empty-queue dismiss doesn't strand decision_reopen_bar=true
+	-- with no card in flight to consume it (on_diff_close's own tail handles the
+	-- no-handoff case).
+	if state.perm_queue and #state.perm_queue > 0 then
+		local nxt = table.remove(state.perm_queue, 1)
+		if state.diff_card_reopen_bar then
+			state.diff_card_reopen_bar = false
+			state.decision_reopen_bar = true
+		end
+		show_permission_card(nxt)
+		return true
+	end
+	if state.qask_queue and #state.qask_queue > 0 and show_question_card_hook then
+		local nxt = table.remove(state.qask_queue, 1)
+		if state.diff_card_reopen_bar then
+			state.diff_card_reopen_bar = false
+			state.decision_reopen_bar = true
+		end
+		show_question_card_hook(nxt)
+		return true
+	end
+	return false
 end
 Gate.close_diff_card = close_diff_card
 
@@ -1036,13 +1139,27 @@ local function open_diff_card_float(d)
 				clear_bottom_pad()
 			end -- drop the card's reserve on any close path
 			if state.diff_card and state.diff_card.win == win then
-				state.diff_card = nil -- dismissed some other way; not a decision
+				-- Dismissed some other way; not a decision — route through close_diff_card
+				-- (not a direct nil) so a queued perm/qask card still drains (Gate-3 finding,
+				-- advisor 2026-07-22; the window is already gone here, so close_diff_card's
+				-- own win-close pcall is a safe no-op).
+				close_diff_card()
 			end
 		end,
 	})
 end
 
-local function show_diff_card(path, kind)
+show_diff_card = function(path, kind)
+	-- Cross-type: one DECISION card at a time, same as perm/question. A diff card up
+	-- alongside a live perm or question card shares the SW-anchor/zindex=60 float — it
+	-- would silently draw over whichever is up instead of queuing (same class as the
+	-- perm/question cross-type guard above). Queue on EITHER being up; resolve_permission
+	-- / close_question_card drain diffcard_queue the same way they drain each other.
+	if state.perm or state.qask then
+		state.diffcard_queue = state.diffcard_queue or {}
+		state.diffcard_queue[#state.diffcard_queue + 1] = { path = path, kind = kind }
+		return
+	end
 	local d = {
 		display = (kind == "new") and ("New file: " .. vim.fn.fnamemodify(path, ":t"))
 			or ("Modified: " .. vim.fn.fnamemodify(path, ":t")),

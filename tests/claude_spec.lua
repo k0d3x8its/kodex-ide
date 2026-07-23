@@ -751,6 +751,286 @@ H.check(
 claude._resolve_permission("deny")
 H.check("T17c cleanup", claude.state.perm == nil and perm_float_count() == 0)
 
+-- ── T17d: cross-type decision queue — perm card up, question arrives, queues ──
+-- (not draws over it) ─────────────────────────────────────────────────────────
+-- concurrent-permission-modal-ghost post-mortem's cross-type follow-up: perm and
+-- question cards share anchor="SW"/zindex=60, so a question card opening while a
+-- perm card is up drew silently over it instead of colliding — the perm float was
+-- never closed or tracked as queued, so it reappeared, unresolved, once the
+-- question card closed. Fix: show_question_card queues behind an open state.perm
+-- (same as show_permission_card queues behind an open state.qask), and each side's
+-- resolve/close path drains the OTHER type's queue too.
+claude.state.perm = nil
+claude.state.perm_queue = nil
+claude.state.qask = nil
+claude.state.qask_queue = nil
+
+feed({
+	type = "control_request",
+	request_id = "req-cross-perm",
+	request = { subtype = "can_use_tool", tool_name = "Bash", input = { command = "ls /cross" } },
+})
+H.check(
+	"T17d perm card opens first",
+	claude.state.perm ~= nil and claude.state.perm.request_id == "req-cross-perm",
+	vim.inspect(claude.state.perm)
+)
+
+feed({
+	type = "control_request",
+	request_id = "req-cross-qask",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "AskUserQuestion",
+		input = {
+			questions = { { question = "Cross type?", header = "X", options = { { label = "A" }, { label = "B" } } } },
+		},
+	},
+})
+H.check(
+	"T17d question request queues instead of opening over the perm card",
+	claude.state.qask == nil and type(claude.state.qask_queue) == "table" and #claude.state.qask_queue == 1,
+	"qask="
+		.. tostring(claude.state.qask)
+		.. " qaskq="
+		.. tostring(claude.state.qask_queue and #claude.state.qask_queue)
+)
+H.check(
+	"T17d perm card still owns state.perm, unclobbered",
+	claude.state.perm ~= nil and claude.state.perm.request_id == "req-cross-perm",
+	vim.inspect(claude.state.perm)
+)
+H.check(
+	"T17d exactly one permission float open (no cross-type orphan)",
+	perm_float_count() == 1,
+	"floats=" .. perm_float_count()
+)
+
+-- Resolving the perm card must drain the QUEUED question, not just the perm_queue.
+claude._resolve_permission("once")
+H.check(
+	"T17d queued question auto-shows after perm resolves",
+	claude.state.qask ~= nil
+		and claude.state.qask.request_id == "req-cross-qask"
+		and #(claude.state.qask_queue or {}) == 0,
+	vim.inspect(claude.state.qask)
+)
+H.check("T17d perm card fully cleared", claude.state.perm == nil and perm_float_count() == 0)
+
+require("utils.claude.question").cancel_question()
+vim.wait(30)
+H.check("T17d question card cleared after cleanup", claude.state.qask == nil)
+
+-- Reverse direction: question card up, perm request arrives, queues into perm_queue.
+feed({
+	type = "control_request",
+	request_id = "req-cross-qask2",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "AskUserQuestion",
+		input = {
+			questions = { { question = "Reverse?", header = "R", options = { { label = "A" }, { label = "B" } } } },
+		},
+	},
+})
+H.check(
+	"T17d reverse: question card opens first",
+	claude.state.qask ~= nil and claude.state.qask.request_id == "req-cross-qask2",
+	vim.inspect(claude.state.qask)
+)
+
+feed({
+	type = "control_request",
+	request_id = "req-cross-perm2",
+	request = { subtype = "can_use_tool", tool_name = "Bash", input = { command = "ls /cross2" } },
+})
+H.check(
+	"T17d reverse: perm request queues instead of opening over the question card",
+	claude.state.perm == nil and type(claude.state.perm_queue) == "table" and #claude.state.perm_queue == 1,
+	"perm="
+		.. tostring(claude.state.perm)
+		.. " permq="
+		.. tostring(claude.state.perm_queue and #claude.state.perm_queue)
+)
+
+require("utils.claude.question").cancel_question() -- closes+denies req-cross-qask2, should drain perm_queue
+vim.wait(30)
+H.check(
+	"T17d reverse: queued perm auto-shows after question card closes",
+	claude.state.perm ~= nil
+		and claude.state.perm.request_id == "req-cross-perm2"
+		and #(claude.state.perm_queue or {}) == 0,
+	vim.inspect(claude.state.perm)
+)
+claude._resolve_permission("deny")
+H.check(
+	"T17d reverse: fully cleared",
+	claude.state.perm == nil and claude.state.qask == nil and perm_float_count() == 0
+)
+
+-- ── T17e: cross-type decision queue, diff card side — remaining half of the
+-- serializer (perm/qask <-> diff_card) fixed 2026-07-22 ──────────────────────────
+-- state.diff_card shares the same SW-anchor/zindex=60 float as perm/qask (T17d
+-- above) but wasn't part of that guard — a diff card up alongside a perm/qask
+-- request, or vice versa, drew over the other unguarded. show_diff_card now queues
+-- into state.diffcard_queue behind an open perm/qask; show_permission_card/
+-- show_question_card queue behind an open diff_card; close_diff_card and
+-- resolve_permission/close_question_card drain each other's queue on resolve.
+local function diff_float_count()
+	local n = 0
+	for _, w in ipairs(vim.api.nvim_list_wins()) do
+		local ok, cfg = pcall(vim.api.nvim_win_get_config, w)
+		if ok and cfg and cfg.relative ~= "" and cfg.title then
+			for _, seg in ipairs(cfg.title) do
+				if type(seg) == "table" and tostring(seg[1]):match("Review changes") then
+					n = n + 1
+				end
+			end
+		end
+	end
+	return n
+end
+
+claude.state.perm = nil
+claude.state.perm_queue = nil
+claude.state.qask = nil
+claude.state.qask_queue = nil
+claude.state.diff_card = nil
+claude.state.diffcard_queue = nil
+
+feed({
+	type = "control_request",
+	request_id = "req-cross-diff-perm",
+	request = { subtype = "can_use_tool", tool_name = "Bash", input = { command = "ls /cross-diff" } },
+})
+H.check(
+	"T17e perm card opens first",
+	claude.state.perm ~= nil and claude.state.perm.request_id == "req-cross-diff-perm",
+	vim.inspect(claude.state.perm)
+)
+
+claude._show_diff_card("/tmp/t17e-a.txt", "edit")
+H.check(
+	"T17e diff card queues instead of opening over the perm card",
+	claude.state.diff_card == nil and type(claude.state.diffcard_queue) == "table" and #claude.state.diffcard_queue == 1,
+	"diff_card="
+		.. tostring(claude.state.diff_card)
+		.. " diffq="
+		.. tostring(claude.state.diffcard_queue and #claude.state.diffcard_queue)
+)
+H.check(
+	"T17e perm card still owns state.perm, unclobbered",
+	claude.state.perm ~= nil and claude.state.perm.request_id == "req-cross-diff-perm",
+	vim.inspect(claude.state.perm)
+)
+H.check("T17e exactly one permission float open (no cross-type orphan)", perm_float_count() == 1)
+
+-- Resolving the perm card must drain the QUEUED diff card, not just perm_queue.
+claude._resolve_permission("once")
+H.check(
+	"T17e queued diff card auto-shows after perm resolves",
+	claude.state.diff_card ~= nil
+		and claude.state.diff_card.display:match("t17e%-a%.txt")
+		and #(claude.state.diffcard_queue or {}) == 0,
+	vim.inspect(claude.state.diff_card)
+)
+H.check("T17e perm card fully cleared", claude.state.perm == nil and perm_float_count() == 0)
+H.check("T17e exactly one diff float open (no cross-type orphan)", diff_float_count() == 1)
+
+claude._close_diff_card()
+H.check("T17e diff card cleared after cleanup", claude.state.diff_card == nil and diff_float_count() == 0)
+
+-- Reverse direction: diff card up, perm request arrives, queues into perm_queue.
+claude._show_diff_card("/tmp/t17e-b.txt", "new")
+H.check("T17e reverse: diff card opens first", claude.state.diff_card ~= nil and diff_float_count() == 1)
+
+feed({
+	type = "control_request",
+	request_id = "req-cross-diff-perm2",
+	request = { subtype = "can_use_tool", tool_name = "Bash", input = { command = "ls /cross-diff2" } },
+})
+H.check(
+	"T17e reverse: perm request queues instead of opening over the diff card",
+	claude.state.perm == nil and type(claude.state.perm_queue) == "table" and #claude.state.perm_queue == 1,
+	"perm="
+		.. tostring(claude.state.perm)
+		.. " permq="
+		.. tostring(claude.state.perm_queue and #claude.state.perm_queue)
+)
+H.check("T17e reverse: diff card still owns state.diff_card, unclobbered", claude.state.diff_card ~= nil)
+
+-- Dismissing the diff card WITHOUT a decision (Esc/q path — close_diff_card, not
+-- resolve_diff_card) must still drain perm_queue: this is the exact hang the
+-- Gate-3 advisor attack caught (drain living only in on_diff_close missed this path).
+claude._close_diff_card()
+H.check(
+	"T17e reverse: queued perm auto-shows after diff card closes (undecided)",
+	claude.state.perm ~= nil
+		and claude.state.perm.request_id == "req-cross-diff-perm2"
+		and #(claude.state.perm_queue or {}) == 0,
+	vim.inspect(claude.state.perm)
+)
+claude._resolve_permission("deny")
+H.check(
+	"T17e reverse: fully cleared",
+	claude.state.perm == nil and claude.state.diff_card == nil and perm_float_count() == 0 and diff_float_count() == 0
+)
+
+-- ── T17f: held state.prewrite (Esc-dismissed diff card, request still open) must
+-- block a NEW perm/qask card from opening over it, and drain on resolve — FIXED
+-- 2026-07-22 ─────────────────────────────────────────────────────────────────────
+-- show_diff_card's guard only stopped a diff card from opening WHILE perm/qask is up
+-- (forward direction) — it said nothing about state.prewrite once the CARD itself is
+-- dismissed via Esc/q (documented: Esc/q only dismisses the card, not the held
+-- request — winbar <leader>ca/cx remains the fallback). show_permission_card's guard
+-- checked state.diff_card, not state.prewrite, so this reverse path was uncovered by
+-- "show_diff_card is the only entry point" reasoning — a REAL gap, confirmed by first
+-- running this exact scenario before the fix (perm opened over the held request).
+-- Advisor-flagged 2026-07-22: the one term ({prewrite}) the TODO named that the first
+-- pass of the guard didn't actually reach. show_permission_card/show_question_card now
+-- also check state.prewrite; Gate.on_prewrite_resolve drains perm_queue/qask_queue
+-- when the held request finally clears.
+claude.state.perm = nil
+claude.state.qask = nil
+claude.state.diff_card = nil
+claude.state.diffcard_queue = nil
+claude.state.perm_queue = nil
+claude.state.prewrite = { request_id = "req-held-prewrite" }
+
+claude._show_diff_card("/tmp/t17f-prewrite.txt", "edit")
+H.check("T17f prewrite's diff card opens", claude.state.diff_card ~= nil, vim.inspect(claude.state.diff_card))
+claude._close_diff_card() -- Esc/q-equivalent: dismiss the CARD only, prewrite stays held
+H.check(
+	"T17f card gone but prewrite still held after Esc-dismiss",
+	claude.state.diff_card == nil and claude.state.prewrite ~= nil,
+	"diff_card=" .. tostring(claude.state.diff_card) .. " prewrite=" .. tostring(claude.state.prewrite)
+)
+
+feed({
+	type = "control_request",
+	request_id = "req-over-held-prewrite",
+	request = { subtype = "can_use_tool", tool_name = "Bash", input = { command = "ls /over-prewrite" } },
+})
+H.check(
+	"T17f perm request queues instead of opening over the held prewrite",
+	claude.state.perm == nil and type(claude.state.perm_queue) == "table" and #claude.state.perm_queue == 1,
+	"perm="
+		.. tostring(claude.state.perm)
+		.. " permq="
+		.. tostring(claude.state.perm_queue and #claude.state.perm_queue)
+)
+
+claude.on_prewrite_resolve(false) -- the held request finally clears (deny)
+H.check(
+	"T17f queued perm auto-shows once the held prewrite request clears",
+	claude.state.perm ~= nil
+		and claude.state.perm.request_id == "req-over-held-prewrite"
+		and #(claude.state.perm_queue or {}) == 0,
+	vim.inspect(claude.state.perm)
+)
+claude._resolve_permission("deny")
+H.check("T17f fully cleared", claude.state.perm == nil and claude.state.prewrite == nil)
+
 -- ── T18: AskUserQuestion card — vertical selector, answers map round-trip ─────
 -- AskUserQuestion rides the SAME can_use_tool gate but is NOT allow/reject: it
 -- carries up to 4 questions and the pick rides back in updatedInput.answers (keyed

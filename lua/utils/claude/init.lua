@@ -1920,6 +1920,28 @@ local function build_bar_title(base)
 end
 mod._build_bar_title = build_bar_title
 
+-- Bar titles are built once at float-creation time, but fable-mode's marker file
+-- is toggled by the fable-mode SKILL (an external actor mid-conversation), not by
+-- any lua-side event this plugin can observe directly — so an already-open bar
+-- never saw the change. Piggyback on the bar's existing TextChangedI-driven
+-- refresh cycle (apply_layout/fit_height_now already re-run on every keystroke)
+-- to re-check fable_active() and rewrite the title in place when it flips.
+-- Returns the current fable state, threaded through by the caller as `last`.
+local function refresh_bar_title(win, title, last)
+	if not vim.api.nvim_win_is_valid(win) then
+		return last
+	end
+	local now = fable_active()
+	if now == last then
+		return last
+	end
+	local c = vim.api.nvim_win_get_config(win)
+	c.title = build_bar_title(title)
+	vim.api.nvim_win_set_config(win, c)
+	return now
+end
+mod._refresh_bar_title = refresh_bar_title
+
 local function open_chat_float(title, callback, opts)
 	opts = opts or {}
 	-- When persist_draft is set, the bar's unsent text survives a hide/show via
@@ -1943,6 +1965,7 @@ local function open_chat_float(title, callback, opts)
 	-- Bar title: permission mode ("Build"/"Plan") + a neon-purple "Fable" segment
 	-- when fable-mode is active (build_bar_title owns the replace-vs-append logic).
 	local bar_title = build_bar_title(title)
+	local last_fable = fable_active()
 	local meter_ns = vim.api.nvim_create_namespace("claude_bar_meters")
 
 	-- Render the meters as a virtual line attached below the LAST input line.
@@ -2004,6 +2027,7 @@ local function open_chat_float(title, callback, opts)
 		if not vim.api.nvim_win_is_valid(win) then
 			return
 		end
+		last_fable = refresh_bar_title(win, title, last_fable)
 		local mrows = render_meters()
 		local h = cur_rows + mrows
 		bar_h = h
@@ -2295,6 +2319,7 @@ end
 -- to the panel). On submit the caller (ask_selection) opens/answers in the panel.
 local function open_selection_float(title, callback)
 	local bar_title = build_bar_title(title)
+	local last_fable = fable_active()
 
 	-- Fit inside the current (file) window, clamped to a comfortable range.
 	local win_w = vim.api.nvim_win_get_width(0)
@@ -2336,6 +2361,7 @@ local function open_selection_float(title, callback)
 		if not vim.api.nvim_win_is_valid(win) then
 			return
 		end
+		last_fable = refresh_bar_title(win, title, last_fable)
 		local rows = 0
 		for _, l in ipairs(vim.api.nvim_buf_get_lines(ibuf, 0, -1, false)) do
 			rows = rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / float_w))

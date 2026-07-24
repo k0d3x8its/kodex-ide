@@ -10,42 +10,54 @@
 local H = dofile("tests/helpers.lua")
 H.stub_project_root("/tmp")
 
+-- Switcher-bar rows now wrap based on available width (linebreak fix), so the
+-- U6/U12/U12b row-index assertions below are only deterministic at a pinned
+-- width — an unpinned `vim.o.columns` would make them silently width-dependent.
+vim.o.columns = 80
+
 -- ── Subprocess + module stubs (mirror claude_stream_spec.lua) ──────────────────
 
 local captured_stdout_cb = nil
 vim.fn.jobstart = function(_, opts)
-  captured_stdout_cb = opts.on_stdout
-  return 99
+	captured_stdout_cb = opts.on_stdout
+	return 99
 end
-vim.fn.jobstop  = function() end
-vim.fn.chansend = function(_, data) return #data end
+vim.fn.jobstop = function() end
+vim.fn.chansend = function(_, data)
+	return #data
+end
 vim.fn.chanclose = function() end
 
 package.loaded["utils.term_layout"] = { place_vertical = function() end }
 package.loaded["utils.claude_diff"] = {
-  on_panel_open = function() end, on_panel_close = function() end,
-  on_diff_open  = function() end, on_diff_close  = function() end,
-  watch = function() end,
-  poll  = function() end,
+	on_panel_open = function() end,
+	on_panel_close = function() end,
+	on_diff_open = function() end,
+	on_diff_close = function() end,
+	watch = function() end,
+	poll = function() end,
 }
 package.loaded["utils.opencode"] = {
-  state = { opencode_active = false }, toggle = function() end,
+	state = { opencode_active = false },
+	toggle = function() end,
 }
 
 local claude = require("utils.claude")
 claude.setup({ width_pct = 0.40 })
-claude.is_available = function() return true end
+claude.is_available = function()
+	return true
+end
 
 -- Feed one stream-json event through the captured stdout callback (JSON round-trip
 -- through on_stdout → dispatch), mirroring jobstart's { line, "" } delivery.
 local function feed(ev)
-  captured_stdout_cb(99, { vim.json.encode(ev), "" }, "stdout")
-  vim.wait(30)
+	captured_stdout_cb(99, { vim.json.encode(ev), "" }, "stdout")
+	vim.wait(30)
 end
 
 local function panel_text()
-  local buf = claude.state.panel_buf
-  return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+	local buf = claude.state.panel_buf
+	return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
 end
 
 -- ── Open the panel + spawn (capture on_stdout) ─────────────────────────────────
@@ -53,8 +65,7 @@ end
 vim.cmd("cd /tmp")
 claude.toggle()
 vim.wait(30)
-H.check("U0 panel buffer created",
-  claude.state.panel_buf ~= nil and vim.api.nvim_buf_is_valid(claude.state.panel_buf))
+H.check("U0 panel buffer created", claude.state.panel_buf ~= nil and vim.api.nvim_buf_is_valid(claude.state.panel_buf))
 claude._send("kick off a subagent")
 vim.wait(30)
 H.check("U0 stdout callback captured", captured_stdout_cb ~= nil)
@@ -63,147 +74,262 @@ local AGENT_ID = "toolu_agent_A"
 
 -- ── U1: Agent tool_use opens a subagent entry + still renders ● Task in main ────
 
-feed({ type = "assistant", parent_tool_use_id = vim.NIL, message = { content = { {
-  type = "tool_use", id = AGENT_ID, name = "Agent",
-  input = { description = "Fable review of 15.7", subagent_type = "general-purpose" },
-} } } })
+feed({
+	type = "assistant",
+	parent_tool_use_id = vim.NIL,
+	message = {
+		content = {
+			{
+				type = "tool_use",
+				id = AGENT_ID,
+				name = "Agent",
+				input = { description = "Fable review of 15.7", subagent_type = "general-purpose" },
+			},
+		},
+	},
+})
 
 local subs = claude.state.subagents
 H.check("U1 one subagent captured", type(subs) == "table" and #subs == 1)
 H.check("U1 entry keyed on the Agent tool_use id", subs and subs[1].id == AGENT_ID)
-H.check("U1 desc taken from input.description",
-  subs and subs[1].desc == "Fable review of 15.7", subs and subs[1].desc)
-H.check("U1 kind taken from subagent_type",
-  subs and subs[1].kind == "general-purpose", subs and subs[1].kind)
+H.check("U1 desc taken from input.description", subs and subs[1].desc == "Fable review of 15.7", subs and subs[1].desc)
+H.check("U1 kind taken from subagent_type", subs and subs[1].kind == "general-purpose", subs and subs[1].kind)
 H.check("U1 status starts 'running'", subs and subs[1].status == "running")
 H.check("U1 events sink starts empty", subs and type(subs[1].events) == "table" and #subs[1].events == 0)
-H.check("U1 neoclaude subagent header rendered inline in main",
-  panel_text():find("● neoclaude(", 1, true) ~= nil, "main buffer should keep the subagent header")
+H.check(
+	"U1 neoclaude subagent header rendered inline in main",
+	panel_text():find("● neoclaude(", 1, true) ~= nil,
+	"main buffer should keep the subagent header"
+)
 
 -- ── U2: inner events (parent-tagged) accumulate into the sink AND hit main ─────
 
-local function main_lines() return vim.api.nvim_buf_line_count(claude.state.panel_buf) end
+local function main_lines()
+	return vim.api.nvim_buf_line_count(claude.state.panel_buf)
+end
 
 local rows0 = main_lines()
-feed({ type = "assistant", parent_tool_use_id = AGENT_ID, message = { content = { {
-  type = "tool_use", id = "toolu_bash_1", name = "Bash",
-  input = { command = "echo hi" },
-} } } })
+feed({
+	type = "assistant",
+	parent_tool_use_id = AGENT_ID,
+	message = {
+		content = {
+			{
+				type = "tool_use",
+				id = "toolu_bash_1",
+				name = "Bash",
+				input = { command = "echo hi" },
+			},
+		},
+	},
+})
 local rows_after_call = main_lines()
-feed({ type = "user", parent_tool_use_id = AGENT_ID, message = { content = { {
-  type = "tool_result", tool_use_id = "toolu_bash_1", content = "hello-from-subagent",
-} } } })
+feed({
+	type = "user",
+	parent_tool_use_id = AGENT_ID,
+	message = {
+		content = {
+			{
+				type = "tool_result",
+				tool_use_id = "toolu_bash_1",
+				content = "hello-from-subagent",
+			},
+		},
+	},
+})
 local rows_after_result = main_lines()
 
 subs = claude.state.subagents
-H.check("U2 both inner events accumulated into the sink",
-  subs and #subs[1].events == 2, subs and #subs[1].events)
-H.check("U2 sink holds the raw inner tool_use event",
-  subs and subs[1].events[1].message.content[1].name == "Bash")
+H.check("U2 both inner events accumulated into the sink", subs and #subs[1].events == 2, subs and #subs[1].events)
+H.check("U2 sink holds the raw inner tool_use event", subs and subs[1].events[1].message.content[1].name == "Bash")
 -- Inner tool CALLS render as a compact nested one-liner in main (└ connector).
-H.check("U2 inner tool call shows as a compact nested one-liner in main",
-  panel_text():find("  └ Bash(", 1, true) ~= nil, panel_text())
-H.check("U2 inner tool call added exactly one nested row", rows_after_call - rows0 == 1,
-  tostring(rows_after_call - rows0))
+H.check(
+	"U2 inner tool call shows as a compact nested one-liner in main",
+	panel_text():find("  └ Bash(", 1, true) ~= nil,
+	panel_text()
+)
+H.check(
+	"U2 inner tool call added exactly one nested row",
+	rows_after_call - rows0 == 1,
+	tostring(rows_after_call - rows0)
+)
 -- Inner tool RESULT bodies do NOT flood main (they live in the drill-in view only).
 H.check("U2 inner tool_result body adds nothing to main", rows_after_result == rows_after_call)
-H.check("U2 inner tool_result body is NOT dumped into main",
-  panel_text():find("hello-from-subagent", 1, true) == nil, panel_text())
+H.check(
+	"U2 inner tool_result body is NOT dumped into main",
+	panel_text():find("hello-from-subagent", 1, true) == nil,
+	panel_text()
+)
 
 -- A null-parent event must NOT land in any sink.
-feed({ type = "assistant", parent_tool_use_id = vim.NIL, message = { content = { {
-  type = "text", text = "main-session prose",
-} } } })
-H.check("U2 null-parent event does not touch the subagent sink",
-  claude.state.subagents[1] and #claude.state.subagents[1].events == 2)
+feed({
+	type = "assistant",
+	parent_tool_use_id = vim.NIL,
+	message = { content = { {
+		type = "text",
+		text = "main-session prose",
+	} } },
+})
+H.check(
+	"U2 null-parent event does not touch the subagent sink",
+	claude.state.subagents[1] and #claude.state.subagents[1].events == 2
+)
 
 -- ── U3: lifecycle — task_started links task_id, updated→status, notification→usage
 
-feed({ type = "system", subtype = "task_started",
-  task_id = "task_A", tool_use_id = AGENT_ID,
-  description = "Fable review of 15.7", subagent_type = "general-purpose",
-  task_type = "local_agent", prompt = "review the extraction" })
-H.check("U3 task_started links task_id onto the entry",
-  claude.state.subagents[1].task_id == "task_A", claude.state.subagents[1].task_id)
+feed({
+	type = "system",
+	subtype = "task_started",
+	task_id = "task_A",
+	tool_use_id = AGENT_ID,
+	description = "Fable review of 15.7",
+	subagent_type = "general-purpose",
+	task_type = "local_agent",
+	prompt = "review the extraction",
+})
+H.check(
+	"U3 task_started links task_id onto the entry",
+	claude.state.subagents[1].task_id == "task_A",
+	claude.state.subagents[1].task_id
+)
 
-feed({ type = "system", subtype = "task_updated",
-  task_id = "task_A", patch = { status = "completed", end_time = 1783371778940 } })
-H.check("U3 task_updated flips status via patch.status (keyed by task_id)",
-  claude.state.subagents[1].status == "completed", claude.state.subagents[1].status)
+feed({
+	type = "system",
+	subtype = "task_updated",
+	task_id = "task_A",
+	patch = { status = "completed", end_time = 1783371778940 },
+})
+H.check(
+	"U3 task_updated flips status via patch.status (keyed by task_id)",
+	claude.state.subagents[1].status == "completed",
+	claude.state.subagents[1].status
+)
 
-feed({ type = "system", subtype = "task_notification",
-  task_id = "task_A", tool_use_id = AGENT_ID, status = "completed",
-  summary = "The command output was exactly: hello-from-subagent",
-  usage = { total_tokens = 29362, tool_uses = 1, duration_ms = 3721 } })
-H.check("U3 task_notification fills usage.total_tokens",
-  claude.state.subagents[1].usage and claude.state.subagents[1].usage.total_tokens == 29362)
-H.check("U3 task_notification fills the summary",
-  type(claude.state.subagents[1].summary) == "string"
-  and claude.state.subagents[1].summary:find("hello-from-subagent", 1, true) ~= nil)
+feed({
+	type = "system",
+	subtype = "task_notification",
+	task_id = "task_A",
+	tool_use_id = AGENT_ID,
+	status = "completed",
+	summary = "The command output was exactly: hello-from-subagent",
+	usage = { total_tokens = 29362, tool_uses = 1, duration_ms = 3721 },
+})
+H.check(
+	"U3 task_notification fills usage.total_tokens",
+	claude.state.subagents[1].usage and claude.state.subagents[1].usage.total_tokens == 29362
+)
+H.check(
+	"U3 task_notification fills the summary",
+	type(claude.state.subagents[1].summary) == "string"
+		and claude.state.subagents[1].summary:find("hello-from-subagent", 1, true) ~= nil
+)
 
 -- ── U4: a SECOND subagent gets its own entry (insertion-order index) ───────────
 
-feed({ type = "assistant", parent_tool_use_id = vim.NIL, message = { content = { {
-  type = "tool_use", id = "toolu_agent_B", name = "Agent",
-  input = { description = "second agent", subagent_type = "code-reviewer" },
-} } } })
-H.check("U4 second subagent appended at index 2",
-  #claude.state.subagents == 2 and claude.state.subagents[2].id == "toolu_agent_B")
-feed({ type = "assistant", parent_tool_use_id = "toolu_agent_B", message = { content = { {
-  type = "text", text = "child B thinking",
-} } } })
-H.check("U4 inner event routes to the CORRECT subagent (2, not 1)",
-  #claude.state.subagents[2].events == 1 and #claude.state.subagents[1].events == 2)
+feed({
+	type = "assistant",
+	parent_tool_use_id = vim.NIL,
+	message = {
+		content = {
+			{
+				type = "tool_use",
+				id = "toolu_agent_B",
+				name = "Agent",
+				input = { description = "second agent", subagent_type = "code-reviewer" },
+			},
+		},
+	},
+})
+H.check(
+	"U4 second subagent appended at index 2",
+	#claude.state.subagents == 2 and claude.state.subagents[2].id == "toolu_agent_B"
+)
+feed({
+	type = "assistant",
+	parent_tool_use_id = "toolu_agent_B",
+	message = { content = { {
+		type = "text",
+		text = "child B thinking",
+	} } },
+})
+H.check(
+	"U4 inner event routes to the CORRECT subagent (2, not 1)",
+	#claude.state.subagents[2].events == 1 and #claude.state.subagents[1].events == 2
+)
 
 -- ── U4b: an inner assistant message reveals the model → header + switcher update ─
 
-feed({ type = "assistant", parent_tool_use_id = "toolu_agent_B", message = {
-  model = "claude-fable-5",
-  content = { { type = "text", text = "reviewing" } },
-} } )
-H.check("U4b subagent model captured from its inner message",
-  type(claude.state.subagents[2].model) == "string" and claude.state.subagents[2].model ~= "",
-  tostring(claude.state.subagents[2].model))
-H.check("U4b main header rewritten in place to show the model",
-  panel_text():find("● " .. claude.state.subagents[2].model .. "(", 1, true) ~= nil, panel_text())
+feed({
+	type = "assistant",
+	parent_tool_use_id = "toolu_agent_B",
+	message = {
+		model = "claude-fable-5",
+		content = { { type = "text", text = "reviewing" } },
+	},
+})
+H.check(
+	"U4b subagent model captured from its inner message",
+	type(claude.state.subagents[2].model) == "string" and claude.state.subagents[2].model ~= "",
+	tostring(claude.state.subagents[2].model)
+)
+H.check(
+	"U4b main header rewritten in place to show the model",
+	panel_text():find("● " .. claude.state.subagents[2].model .. "(", 1, true) ~= nil,
+	panel_text()
+)
 
 -- ── U6: the switcher bar renders (auto-opened during capture) ──────────────────
 
 local widgets = require("utils.claude.widgets")
 local function bar_lines()
-  local b = claude.state.subagent_buf
-  return (b and vim.api.nvim_buf_is_valid(b))
-    and vim.api.nvim_buf_get_lines(b, 0, -1, false) or {}
+	local b = claude.state.subagent_buf
+	return (b and vim.api.nvim_buf_is_valid(b)) and vim.api.nvim_buf_get_lines(b, 0, -1, false) or {}
 end
 
-H.check("U6 switcher window opened on capture",
-  claude.state.subagent_win ~= nil and vim.api.nvim_win_is_valid(claude.state.subagent_win))
+H.check(
+	"U6 switcher window opened on capture",
+	claude.state.subagent_win ~= nil and vim.api.nvim_win_is_valid(claude.state.subagent_win)
+)
 local bl = bar_lines()
 H.check("U6 row 1 is the 'main' pseudo-entry", bl[1] and bl[1]:find("main", 1, true) ~= nil, bl[1])
 H.check("U6 main is selected by default (● filled, sel=1)", bl[1] and bl[1]:find("●", 1, true) ~= nil, bl[1])
 -- (desc may be truncated to fit a narrow panel — the name column always survives.)
 -- (name may be truncated to fit a narrow panel — the prefix always survives.)
-H.check("U6 subagent row shows the neoclaude name column (no model yet)",
-  bl[2] and bl[2]:find("neoclaud", 1, true) ~= nil, bl[2])
+H.check(
+	"U6 subagent row shows the neoclaude name column (no model yet)",
+	bl[2] and bl[2]:find("neoclaud", 1, true) ~= nil,
+	bl[2]
+)
 H.check("U6 unselected subagent row uses hollow ○", bl[2] and bl[2]:find("○", 1, true) ~= nil, bl[2])
-H.check("U6 completed subagent meta shows token count",
-  bl[2] and bl[2]:find("29.4k", 1, true) ~= nil, bl[2])
-H.check("U6 one main row + two subagent rows", #bl == 3, tostring(#bl))
+H.check("U6 completed subagent meta shows token count", bl[2] and bl[2]:find("29.4k", 1, true) ~= nil, bl[2])
+-- subagents[1]'s long usage-stats meta leaves little first-line room, so its
+-- description wraps onto its own continuation line (linebreak fix) rather
+-- than being cut off — row 3 here, row 4 is subagents[2]'s own row.
+H.check(
+	"U6 subagent 1's description wraps onto a continuation line instead of vanishing",
+	bl[3] and bl[3]:find("Fable review of 15.7", 1, true) ~= nil,
+	bl[3]
+)
+H.check("U6 one main row + two subagent rows (one wrapped onto an extra line)", #bl == 4, tostring(#bl))
 
 -- ── U7: subagent_height reserves space; float_bottom_row lifts above it ─────────
 
 H.check("U7 subagent_height > 0 while the bar is shown", widgets.subagent_height() > 0)
-H.check("U7 float_bottom_row lifted by the full bar height",
-  widgets.float_bottom_row() == vim.o.lines - 2 - widgets.subagent_height() - widgets.todo_height())
+H.check(
+	"U7 float_bottom_row lifted by the full bar height",
+	widgets.float_bottom_row() == vim.o.lines - 2 - widgets.subagent_height() - widgets.todo_height()
+)
 
 -- ── U8: selection glyph tracks state.subagent_sel ──────────────────────────────
 
 claude.state.subagent_sel = 2
 widgets.update_subagent_bar()
 bl = bar_lines()
-H.check("U8 selecting row 2 fills it (●) and hollows main (○)",
-  bl[1] and bl[1]:find("○", 1, true) ~= nil and bl[2] and bl[2]:find("●", 1, true) ~= nil,
-  (bl[1] or "") .. " | " .. (bl[2] or ""))
+H.check(
+	"U8 selecting row 2 fills it (●) and hollows main (○)",
+	bl[1] and bl[1]:find("○", 1, true) ~= nil and bl[2] and bl[2]:find("●", 1, true) ~= nil,
+	(bl[1] or "") .. " | " .. (bl[2] or "")
+)
 claude.state.subagent_sel = 1
 
 -- ── U9: ↑/↓ navigation moves the selection + clamps ────────────────────────────
@@ -217,39 +343,52 @@ H.check("U9 nav up returns to row 2", widgets.subagent_nav(-1) == true and claud
 -- ── U9b: ctrl+b cycles the selection AND opens/closes the view in one step ──────
 
 claude.state.subagent_sel = 1
-H.check("U9b cycle from main selects sub 1 and opens the view",
-  widgets.subagent_cycle() == true and claude.state.subagent_sel == 2
-  and claude.state.subagent_view_win ~= nil
-  and vim.api.nvim_win_is_valid(claude.state.subagent_view_win))
-widgets.subagent_cycle()   -- → sub 2
-widgets.subagent_cycle()   -- → main (wraps, closes the view)
-H.check("U9b cycle wraps back to main and closes the view",
-  claude.state.subagent_sel == 1
-  and (claude.state.subagent_view_win == nil
-       or not vim.api.nvim_win_is_valid(claude.state.subagent_view_win)))
+H.check(
+	"U9b cycle from main selects sub 1 and opens the view",
+	widgets.subagent_cycle() == true
+		and claude.state.subagent_sel == 2
+		and claude.state.subagent_view_win ~= nil
+		and vim.api.nvim_win_is_valid(claude.state.subagent_view_win)
+)
+widgets.subagent_cycle() -- → sub 2
+widgets.subagent_cycle() -- → main (wraps, closes the view)
+H.check(
+	"U9b cycle wraps back to main and closes the view",
+	claude.state.subagent_sel == 1
+		and (claude.state.subagent_view_win == nil or not vim.api.nvim_win_is_valid(claude.state.subagent_view_win))
+)
 
 -- ── U10: Enter opens the drill-in view; main closes it ─────────────────────────
 
-claude.state.subagent_sel = 2   -- subagents[1]
+claude.state.subagent_sel = 2 -- subagents[1]
 widgets.subagent_enter()
-H.check("U10 Enter on a subagent opens the drill-in view",
-  claude.state.subagent_view_win ~= nil and vim.api.nvim_win_is_valid(claude.state.subagent_view_win)
-  and claude.state.subagent_view == 1)
-H.check("U10 a green title tag opens alongside the view",
-  claude.state.subagent_tag_win ~= nil and vim.api.nvim_win_is_valid(claude.state.subagent_tag_win))
-H.check("U10 the tag shows the subagent title (its description)",
-  (vim.api.nvim_buf_get_lines(claude.state.subagent_tag_buf, 0, 1, false)[1] or "")
-    :find("Fable review", 1, true) ~= nil,
-  vim.api.nvim_buf_get_lines(claude.state.subagent_tag_buf, 0, 1, false)[1])
-claude.state.subagent_sel = 1   -- main
+H.check(
+	"U10 Enter on a subagent opens the drill-in view",
+	claude.state.subagent_view_win ~= nil
+		and vim.api.nvim_win_is_valid(claude.state.subagent_view_win)
+		and claude.state.subagent_view == 1
+)
+H.check(
+	"U10 a green title tag opens alongside the view",
+	claude.state.subagent_tag_win ~= nil and vim.api.nvim_win_is_valid(claude.state.subagent_tag_win)
+)
+H.check(
+	"U10 the tag shows the subagent title (its description)",
+	(vim.api.nvim_buf_get_lines(claude.state.subagent_tag_buf, 0, 1, false)[1] or ""):find("Fable review", 1, true)
+		~= nil,
+	vim.api.nvim_buf_get_lines(claude.state.subagent_tag_buf, 0, 1, false)[1]
+)
+claude.state.subagent_sel = 1 -- main
 widgets.subagent_enter()
-H.check("U10 Enter on main closes the drill-in view",
-  claude.state.subagent_view == nil
-  and (claude.state.subagent_view_win == nil
-       or not vim.api.nvim_win_is_valid(claude.state.subagent_view_win)))
-H.check("U10 closing the view also closes the tag",
-  claude.state.subagent_tag_win == nil
-  or not vim.api.nvim_win_is_valid(claude.state.subagent_tag_win))
+H.check(
+	"U10 Enter on main closes the drill-in view",
+	claude.state.subagent_view == nil
+		and (claude.state.subagent_view_win == nil or not vim.api.nvim_win_is_valid(claude.state.subagent_view_win))
+)
+H.check(
+	"U10 closing the view also closes the tag",
+	claude.state.subagent_tag_win == nil or not vim.api.nvim_win_is_valid(claude.state.subagent_tag_win)
+)
 
 -- ── U11: the subagent's LIVE buffer streams its inner activity ─────────────────
 
@@ -262,74 +401,205 @@ local ev_text = table.concat(vim.api.nvim_buf_get_lines(sbuf, 0, -1, false), "\n
 -- main panel's cornered block — "● Running bash" header + a "└ echo hi" corner —
 -- not a truncated "Bash(echo hi)" one-liner. Assert both halves so a regression
 -- back to the basic formatter fails here.
-H.check("U11 live buffer shows the inner Bash tool call (rich header)",
-  ev_text:find("Running bash", 1, true) ~= nil, ev_text)
-H.check("U11 live buffer shows the Bash command on the corner",
-  ev_text:find("echo hi", 1, true) ~= nil, ev_text)
-H.check("U11 live buffer shows the tool result body (kept out of main, shown here)",
-  ev_text:find("hello-from-subagent", 1, true) ~= nil)
+H.check(
+	"U11 live buffer shows the inner Bash tool call (rich header)",
+	ev_text:find("Running bash", 1, true) ~= nil,
+	ev_text
+)
+H.check("U11 live buffer shows the Bash command on the corner", ev_text:find("echo hi", 1, true) ~= nil, ev_text)
+H.check(
+	"U11 live buffer shows the tool result body (kept out of main, shown here)",
+	ev_text:find("hello-from-subagent", 1, true) ~= nil
+)
 -- A further inner event appends live (buffer grows without reopening the view).
 local before = vim.api.nvim_buf_line_count(sbuf)
-widgets.append_subagent_event(claude.state.subagents[1],
-  { type = "assistant", message = { content = { {
-    type = "tool_use", name = "Read", input = { file_path = "/tmp/x.lua" } } } } })
-H.check("U11 live buffer grows as new events stream in",
-  vim.api.nvim_buf_line_count(sbuf) > before)
+widgets.append_subagent_event(claude.state.subagents[1], {
+	type = "assistant",
+	message = { content = { {
+		type = "tool_use",
+		name = "Read",
+		input = { file_path = "/tmp/x.lua" },
+	} } },
+})
+H.check("U11 live buffer grows as new events stream in", vim.api.nvim_buf_line_count(sbuf) > before)
 
 -- ── U11c: the rich formatter streams the FULL thinking body (not a bare stub) ──
 -- The basic formatter showed only "▸ Thinking"; render.subagent_lines expands the
 -- whole thinking body into the drill-in so the reasoning is readable there.
-widgets.append_subagent_event(claude.state.subagents[1],
-  { type = "assistant", message = { content = { {
-    type = "thinking", thinking = "step one figure out the flag\nstep two verify it" } } } })
+widgets.append_subagent_event(claude.state.subagents[1], {
+	type = "assistant",
+	message = {
+		content = { {
+			type = "thinking",
+			thinking = "step one figure out the flag\nstep two verify it",
+		} },
+	},
+})
 local think_text = table.concat(vim.api.nvim_buf_get_lines(sbuf, 0, -1, false), "\n")
 H.check("U11c drill-in shows the thinking header", think_text:find("Thought", 1, true) ~= nil)
-H.check("U11c drill-in shows the full thinking body (both lines)",
-  think_text:find("figure out the flag", 1, true) ~= nil
-  and think_text:find("step two verify it", 1, true) ~= nil, think_text)
+H.check(
+	"U11c drill-in shows the full thinking body (both lines)",
+	think_text:find("figure out the flag", 1, true) ~= nil and think_text:find("step two verify it", 1, true) ~= nil,
+	think_text
+)
 
 -- ── U11b: main nesting is CAPPED so a chatty subagent can't flood the transcript ─
 
 for k = 1, 8 do
-  feed({ type = "assistant", parent_tool_use_id = AGENT_ID, message = { content = { {
-    type = "tool_use", id = "bcap" .. k, name = "Bash", input = { command = "echo " .. k },
-  } } } })
+	feed({
+		type = "assistant",
+		parent_tool_use_id = AGENT_ID,
+		message = {
+			content = {
+				{
+					type = "tool_use",
+					id = "bcap" .. k,
+					name = "Bash",
+					input = { command = "echo " .. k },
+				},
+			},
+		},
+	})
 end
-H.check("U11b main caps the nested block with a ctrl+b pointer",
-  panel_text():find("… (ctrl+b to view)", 1, true) ~= nil, panel_text())
+H.check(
+	"U11b main caps the nested block with a ctrl+b pointer",
+	panel_text():find("… (ctrl+b to view)", 1, true) ~= nil,
+	panel_text()
+)
 
--- ── U12: a long description truncates so the meta stays visible (overflow fix) ──
+-- ── U12: a long description wraps to a continuation line instead of cutting
+--        the label in place; the meta stays on line 1, the still-too-long
+--        wrapped remainder gets an ellipsis backstop (linebreak fix) ────────
 
-claude.state.subagents[2].desc = string.rep("x", 300)   -- subagents[2] is still running
+claude.state.subagents[2].desc = string.rep("x", 300) -- subagents[2] is still running
 widgets.update_subagent_bar()
-local row3 = bar_lines()[3] or ""
-H.check("U12 long desc is truncated with an ellipsis", row3:find("…", 1, true) ~= nil, row3)
-H.check("U12 status meta ('running') stays visible past the long desc",
-  row3:find("running", 1, true) ~= nil, row3)
-H.check("U12 the raw 300-char desc is NOT present in full",
-  row3:find(string.rep("x", 300), 1, true) == nil)
+local bl12 = bar_lines()
+-- subagents[2] is row 4 here (row 3 is subagents[1]'s own wrapped continuation
+-- from U6, unrelated to this desc mutation); its wrapped overflow lands on row 5.
+local row4, row5 = bl12[4] or "", bl12[5] or ""
+H.check("U12 status meta ('running') stays visible on line 1", row4:find("running", 1, true) ~= nil, row4)
+H.check("U12 line 1 does NOT cut the label with an ellipsis", row4:find("…", 1, true) == nil, row4)
+H.check("U12 overflow wraps onto a continuation line", row5 ~= "", row5)
+H.check(
+	"U12 continuation line is still too long to fit whole, so it ellipsizes",
+	row5:find("…", 1, true) ~= nil,
+	row5
+)
+H.check(
+	"U12 the raw 300-char desc is NOT present in full on either line",
+	(row4 .. row5):find(string.rep("x", 300), 1, true) == nil
+)
+
+-- ── U12b: the actual reported string (spaces, not one giant token) breaks at a
+--          word boundary and the full text survives across the two lines ──────
+
+local REPORTED_DESC = "Test subagent spawning in Claude Code"
+claude.state.subagents[2].model = "Haiku 4.5"
+claude.state.subagents[2].desc = REPORTED_DESC
+widgets.update_subagent_bar()
+local bl12b = bar_lines()
+local r1, r2 = bl12b[4] or "", bl12b[5] or ""
+local r2_trimmed = r2:gsub("^%s+", "")
+H.check("U12b exactly 2 lines for this row (no runaway wrap)", bl12b[6] == nil, vim.inspect(bl12b))
+H.check("U12b line 1 has no ellipsis (real word-boundary wrap, not a truncation)", r1:find("…", 1, true) == nil, r1)
+H.check(
+	"U12b line 1 breaks after the whole word 'Test' (frontier match, not a fragment)",
+	r1:match("%f[%a]Test%f[%A]") ~= nil,
+	r1
+)
+H.check("U12b continuation line has no ellipsis (the remainder fit whole)", r2:find("…", 1, true) == nil, r2)
+-- The exact-match (not just "contains") is the proof a mid-word hard-break did
+-- NOT fire for this input: a hard break would leave the continuation starting
+-- mid-token (e.g. "ubagent…"), not the clean remaining words.
+H.check(
+	"U12b continuation line is exactly the remaining words, unmangled",
+	r2_trimmed == "subagent spawning in Claude Code",
+	r2_trimmed
+)
 
 -- ── U13: auto-dismiss arms only when EVERY subagent is finished ─────────────────
 
-H.check("U13 not all-done while subagents[2] is still running",
-  widgets.subagents_all_done() == false)
+H.check("U13 not all-done while subagents[2] is still running", widgets.subagents_all_done() == false)
 -- A background agent's parent-turn result is only a launch ack — it must NOT mark
 -- the subagent done (else the switcher vanishes while it still runs). Feed one and
 -- assert status stays running.
-feed({ type = "user", parent_tool_use_id = vim.NIL, message = { content = { {
-  type = "tool_result", tool_use_id = "toolu_agent_B",
-  content = "Async agent launched successfully.",
-} } } })
-H.check("U13 launch-ack tool_result does NOT complete a running subagent",
-  claude.state.subagents[2].status ~= "completed", claude.state.subagents[2].status)
+feed({
+	type = "user",
+	parent_tool_use_id = vim.NIL,
+	message = {
+		content = {
+			{
+				type = "tool_result",
+				tool_use_id = "toolu_agent_B",
+				content = "Async agent launched successfully.",
+			},
+		},
+	},
+})
+H.check(
+	"U13 launch-ack tool_result does NOT complete a running subagent",
+	claude.state.subagents[2].status ~= "completed",
+	claude.state.subagents[2].status
+)
 -- The real terminal signal (system/task_notification, keyed by the Agent id) closes it.
-feed({ type = "system", subtype = "task_notification",
-  task_id = "task_B", tool_use_id = "toolu_agent_B", status = "completed",
-  usage = { total_tokens = 1200, tool_uses = 1, duration_ms = 5000 } })
-H.check("U13 task_notification completes the background subagent",
-  claude.state.subagents[2].status == "completed", claude.state.subagents[2].status)
+feed({
+	type = "system",
+	subtype = "task_notification",
+	task_id = "task_B",
+	tool_use_id = "toolu_agent_B",
+	status = "completed",
+	usage = { total_tokens = 1200, tool_uses = 1, duration_ms = 5000 },
+})
+H.check(
+	"U13 task_notification completes the background subagent",
+	claude.state.subagents[2].status == "completed",
+	claude.state.subagents[2].status
+)
 H.check("U13 all-done once every subagent is terminal", widgets.subagents_all_done() == true)
 H.check("U13 all-done arms the deferred auto-dismiss", claude.state.subagent_dismiss_pending == true)
+
+-- ── U14: Enter-swallow fix for an interrupt-killed subagent (bug #3, 2026-07-24) ─
+-- mod.interrupt() marks an in-flight subagent "interrupted" (never gets a
+-- terminating task_notification, so "running" would stick forever otherwise).
+-- subagent_enter() must let <CR> fall through to the chat bar once nothing is
+-- left running AND no drill-in view is open — but must NOT change the existing
+-- swallow behavior while something is still live, or for a normally-completed
+-- session (out of this bug's scope, unchanged deliberately).
+
+claude.state.subagent_view_win = nil -- ensure no view is left open from U10/U9b
+
+claude.state.subagents = { { status = "running", id = "toolu_x", desc = "still going" } }
+claude.state.subagent_sel = 1
+H.check("U14a live subagent on main row still swallows <CR> (unchanged)", widgets.subagent_enter() == true)
+
+claude.state.subagents = { { status = "interrupted", id = "toolu_x", desc = "aborted" } }
+claude.state.subagent_sel = 1
+H.check("U14b interrupted-only, no view open: <CR> falls through to chat (the fix)", widgets.subagent_enter() == false)
+
+claude.state.subagent_sel = 2 -- drill into the interrupted entry, leaves a view open
+widgets.subagent_enter()
+H.check(
+	"U14c drill-in view opens on an interrupted entry same as any other",
+	claude.state.subagent_view_win ~= nil and vim.api.nvim_win_is_valid(claude.state.subagent_view_win)
+)
+claude.state.subagent_sel = 1
+H.check(
+	"U14d interrupted BUT a drill-in view is open: <CR> closes it, does not fall through",
+	widgets.subagent_enter() == true
+)
+H.check(
+	"U14d the view is actually closed (advisor-caught overlap risk)",
+	claude.state.subagent_view_win == nil or not vim.api.nvim_win_is_valid(claude.state.subagent_view_win)
+)
+
+claude.state.subagents = { { status = "completed", id = "toolu_x", desc = "done normally" } }
+claude.state.subagent_sel = 1
+H.check(
+	"U14e a normally-completed-only session keeps swallowing <CR> (scope: unchanged)",
+	widgets.subagent_enter() == true
+)
+claude.state.subagent_sel = 1
+widgets.subagent_enter() -- close whatever U14e's call opened, keep state clean for U5
 
 -- ── U5: mod.reset() drops all subagent sessions + closes the bar ───────────────
 
@@ -337,9 +607,10 @@ claude.reset()
 vim.wait(30)
 H.check("U5 reset clears state.subagents", claude.state.subagents == nil)
 H.check("U5 reset restores subagent_sel to 1", claude.state.subagent_sel == 1)
-H.check("U5 reset closes the switcher window",
-  claude.state.subagent_win == nil
-  or not vim.api.nvim_win_is_valid(claude.state.subagent_win))
+H.check(
+	"U5 reset closes the switcher window",
+	claude.state.subagent_win == nil or not vim.api.nvim_win_is_valid(claude.state.subagent_win)
+)
 H.check("U5 subagent_height back to 0 after reset", widgets.subagent_height() == 0)
 
 H.summary("claude_subagent")

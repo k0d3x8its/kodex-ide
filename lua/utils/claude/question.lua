@@ -548,98 +548,21 @@ end
 Question.set_question_custom = set_question_custom
 
 -- Shared focused text-prompt float, used by BOTH the "Type something" custom-answer
--- affordance and the "n to add notes" field. A dedicated FOCUSED float in the panel
--- column (NOT vim.ui.input): dressing routes vim.ui.input to a cursor-relative float
--- that opens BEHIND the question card (the card holds focus + a higher draw position),
--- so the user's typing lands in an invisible window. This float anchors SW at the
--- panel column with a zindex ABOVE the card (70 > 60), focused + in insert mode, so
--- what's typed is always visible. <CR> commits (fires on_commit with the typed text,
--- "" when blank), <Esc> cancels (fires on_commit(nil) — distinct from a blank commit
--- so callers can keep an existing value on cancel). `initial` pre-fills the input so
--- an existing value is edited/repopulated rather than retyped. on_commit always
--- refocuses the card; it owns the repaint (callers control empty/cancel behaviour).
+-- affordance and the "n to add notes" field. Thin wrapper over
+-- widgets.open_prompt_float (extracted there for the permission card's Tab-to-
+-- annotate feature): supplies this card's guard (only makes sense while state.qask
+-- is up) and refocus target (state.qask.win) as closures instead of the hardcoded
+-- coupling the shared helper used to have. on_commit always refocuses the card; it
+-- owns the repaint (callers control empty/cancel behaviour).
 local function open_prompt_float(title, initial, on_commit)
-	if not state.qask then
-		return
-	end
-	-- Shared geometry: anchors to the panel's real screen column (same fix
-	-- open_question_float already got — this path was still using columns-panel_w,
-	-- which drifts when the panel isn't flush-right).
-	local float_col, float_w = panel_float_geom()
-
-	-- A prompt buffer (not a plain scratch) so it carries the same green "❯" arrow as
-	-- the chat bar: prompt_setprompt draws the arrow, matchadd colours it terminal-
-	-- green (ClaudeArrow), and <CR> fires prompt_setcallback with the typed text.
-	local buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[buf].bufhidden = "wipe"
-	vim.bo[buf].swapfile = false
-	vim.bo[buf].buftype = "prompt"
-
-	local win = vim.api.nvim_open_win(buf, true, {
-		relative = "editor",
-		anchor = "SW",
-		row = widgets.float_bottom_row(),
-		col = float_col,
-		width = float_w,
-		height = 1,
-		border = "rounded",
-		style = "minimal",
-		title = title,
-		title_pos = "left",
-		zindex = 70,
+	widgets.open_prompt_float(title, initial, on_commit, {
+		guard = function()
+			return state.qask ~= nil
+		end,
+		refocus = function()
+			return state.qask and state.qask.win
+		end,
 	})
-	vim.wo[win].winhighlight = "FloatBorder:ClaudeBarBorder,FloatTitle:ClaudeBarBorder,NormalFloat:ClaudeBarBg"
-	vim.wo[win].wrap = false
-
-	-- Green "❯ " prompt arrow, matching the chat bar (window-local match, set while
-	-- this float is the current window).
-	vim.fn.prompt_setprompt(buf, "❯ ")
-	vim.fn.matchadd("ClaudeArrow", "^❯")
-	-- Show the cursor while typing (the panel hides it globally via guicursor).
-	vim.o.guicursor = state.real_guicursor or "a:block,a:blinkon0"
-
-	-- Close the input, refocus the card, then hand the typed text to on_commit.
-	-- Guarded so the prompt callback + an <Esc>/WinLeave can't both fire it.
-	local done = false
-	local function finish(text)
-		if done then
-			return
-		end
-		done = true
-		vim.o.guicursor = "a:ver1-ClaudeCursorHidden" -- re-hide; focus returns to panel
-		if vim.api.nvim_win_is_valid(win) then
-			pcall(vim.api.nvim_win_close, win, true)
-		end
-		if not state.qask then
-			return
-		end -- card gone while typing
-		if state.qask.win and vim.api.nvim_win_is_valid(state.qask.win) then
-			pcall(vim.api.nvim_set_current_win, state.qask.win)
-		end
-		-- Closing the prompt float leaves the editor in insert mode; the card's
-		-- keymaps are normal-mode, so without this the arrows are dead until the user
-		-- drops out of insert manually.
-		vim.cmd("stopinsert")
-		on_commit(text)
-	end
-
-	vim.fn.prompt_setcallback(buf, function(text)
-		finish(text)
-	end)
-	local opts = { buffer = buf, nowait = true, silent = true }
-	vim.keymap.set("i", "<Esc>", function()
-		finish(nil)
-	end, opts)
-	vim.keymap.set("n", "<Esc>", function()
-		finish(nil)
-	end, opts)
-	vim.cmd("startinsert!")
-	-- Pre-fill with the existing value so it can be edited/repopulated. Typed AFTER
-	-- startinsert! (in insert mode) so it lands in the prompt line past the "❯ " arrow;
-	-- "n" = no remap, plain literal text (the note never contains termcodes).
-	if initial and initial ~= "" then
-		vim.api.nvim_feedkeys(initial, "n", false)
-	end
 end
 
 -- "Type something" affordance: record the typed text as the custom answer (commit +

@@ -627,6 +627,61 @@ local function fmt_dur(ms)
 	return s .. "s"
 end
 
+-- Live geometry instrumentation for the subagent drill-in/switcher-bar z-order bug
+-- (CLAUDE-PANEL-TODOS.md #7 — two static zindex/geometry reads have already been
+-- contradicted by live evidence: the math says no overlap, it visibly happens).
+-- Mirrors init.lua's KODEX_CLAUDE_FOCUSLOG pattern. When $KODEX_CLAUDE_SUBAGENTLOG
+-- points at a path, every switcher-bar render and drill-in geometry event appends one
+-- line with the REAL on-screen row/height of both floats (read back via
+-- nvim_win_get_config, not the just-computed values — so a stale-vs-actual mismatch
+-- would show up here) plus pad_rows/subagent_h, so a live repro can be diffed against
+-- what each side's geometry actually was at that instant. Off by default (nil env =
+-- zero overhead). Recipe:
+--   KODEX_CLAUDE_SUBAGENTLOG=/tmp/claude-subagent.log nvim
+-- then reproduce the overlap and read the log.
+-- MUST stay above every caller in this file (update_subagent_bar/fit_subagent_view/
+-- open_subagent_view) — a `local function` is only visible to code lexically AFTER
+-- its declaration; placing this block further down silently turned every call from
+-- an earlier function into a call to an undeclared GLOBAL, which threw
+-- "attempt to call global 'subagentlog' (a nil value)" — caught live via the user's
+-- running --listen socket, 2026-07-24 (see .work/GATES.md, bug #7 investigation).
+local subagentlog_path = vim.env.KODEX_CLAUDE_SUBAGENTLOG
+local function subagentlog(tag)
+	if not subagentlog_path then
+		return
+	end
+	local ph = state.panel_win
+		and vim.api.nvim_win_is_valid(state.panel_win)
+		and vim.api.nvim_win_get_height(state.panel_win)
+	local bar_row, bar_h
+	if state.subagent_win and vim.api.nvim_win_is_valid(state.subagent_win) then
+		local c = vim.api.nvim_win_get_config(state.subagent_win)
+		bar_row, bar_h = c.row, c.height
+	end
+	local view_row, view_h
+	if state.subagent_view_win and vim.api.nvim_win_is_valid(state.subagent_view_win) then
+		local c = vim.api.nvim_win_get_config(state.subagent_view_win)
+		view_row, view_h = c.row, c.height
+	end
+	local line = string.format(
+		"%d %-20s ph=%-4s pad_rows=%-4s subagent_h=%-4s bar(row=%s h=%s) view(row=%s h=%s)",
+		vim.loop.now(),
+		tag,
+		tostring(ph),
+		tostring(state.pad_rows),
+		tostring(state.subagent_h),
+		tostring(bar_row),
+		tostring(bar_h),
+		tostring(view_row),
+		tostring(view_h)
+	)
+	local fh = io.open(subagentlog_path, "a")
+	if fh then
+		fh:write(line, "\n")
+		fh:close()
+	end
+end
+
 -- Truncate a string to at most `cols` display columns (multibyte-safe), adding a
 -- single "…" when it overflows. Used so a long subagent description can't push the
 -- status/token meta off the right edge of the card (the live "@@@" overflow bug).
@@ -843,6 +898,7 @@ function Widgets.update_subagent_bar()
 	if state.subagent_h ~= prev_h then
 		Widgets.reflow_bottom_floats()
 	end
+	subagentlog("update_subagent_bar")
 end
 
 -- Terminal (non-running) subagent statuses. task_updated/task_notification set
@@ -1192,6 +1248,7 @@ function Widgets.fit_subagent_view()
 	if sub then
 		open_subagent_tag(sub, prow + total_h - 1, col, w)
 	end
+	subagentlog("fit_subagent_view")
 end
 
 -- Open (or swap) the drill-in view: a green-bordered float over the panel transcript
@@ -1238,6 +1295,7 @@ function Widgets.open_subagent_view(i)
 			"Normal:ClaudeNormal,NormalNC:ClaudeNormal,FloatBorder:ClaudeSubagentBorder"
 		vim.api.nvim_set_current_win(state.subagent_view_win) -- enter → q/Esc + cursor-hide
 	end
+	subagentlog("open_subagent_view")
 	-- q/<Esc> close the view (set per shown buffer, idempotent).
 	for _, k in ipairs({ "q", "<Esc>" }) do
 		vim.keymap.set("n", k, function()

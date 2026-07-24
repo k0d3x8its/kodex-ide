@@ -26,6 +26,11 @@ local Gate = {}
 
 local require_prefix = "utils.claude."
 local core = require(require_prefix .. "core")
+-- widgets/process are leaf-ish modules (widgets requires only core; process requires
+-- only core+widgets — neither requires gate or question), so requiring them directly
+-- here is cycle-free, unlike the gate<->question hook-injection pattern above.
+local widgets = require(require_prefix .. "widgets")
+local process = require(require_prefix .. "process")
 
 local state = core.state
 local buf_append = core.buf_append
@@ -343,13 +348,34 @@ Gate.move_perm_choice = move_perm_choice
 -- resume the spinner if the turn is still in flight (an allow lets Claude
 -- continue; a deny only denies this tool — the turn may proceed; the eventual
 -- `result` event flips working off + clears the hint).
-local function resolve_permission(kind)
+--
+-- `note` (optional): free text attached via Tab-to-annotate (prompt_perm_note). The
+-- deny path has a documented wire channel for it (message field, same one
+-- AskUserQuestion's "Chat about this" already uses — see send_permission_response).
+-- The allow path has NO documented annotation field on can_use_tool's response (only
+-- updatedInput/updatedPermissions) — the fallback is `process.send_followup(note)`,
+-- which pushes one `{type:"user"}` stream-json line into the still-live turn (same
+-- wire mechanic as the proven `process.steer` primitive, FINDINGS § Q-STEER) and
+-- echoes it in the transcript. Deliberately NOT `process.steer` itself: steer also
+-- drains state.queue, which would silently inject an unrelated message the user had
+-- queued for AFTER the turn (e.g. typed + Enter while Claude was working) into the
+-- turn early, as a side effect of annotating a permission decision — send_followup
+-- sends only the note, queue untouched. That echo is deliberately the ONLY place an
+-- allow-note is shown: appending it to the receipt line too would double-render it,
+-- and its presence/absence is already the attempted-delivery signal (send_followup
+-- no-ops silently if the turn already ended — the one case where that can happen
+-- this soon is send_permission_response's own dead-channel branch below, which
+-- already warns the user).
+local function resolve_permission(kind, note)
 	local p = state.perm
 	if not p then
 		return
 	end
+	if note == "" then
+		note = nil
+	end
 	if kind == "deny" then
-		send_permission_response(p.request_id, "deny", { message = "User rejected" })
+		send_permission_response(p.request_id, "deny", { message = note or "User rejected" })
 	elseif kind == "always" then
 		send_permission_response(p.request_id, "allow", { input = p.input, permissions = p.suggestions })
 	else
@@ -370,12 +396,28 @@ local function resolve_permission(kind)
 	end
 
 	-- One-line receipt in the transcript so the scrollback shows what was decided.
+	-- Deny's note rides here too (its only echo channel); allow's note is echoed
+	-- separately by steer() below, not duplicated here.
 	local mark = (kind == "deny") and "✗" or "✓"
 	local verb = ({ once = "Allowed once", always = "Allowed always", deny = "Rejected" })[kind] or "Allowed"
+	local receipt = mark .. " " .. p.display .. " — " .. verb
+	if kind == "deny" and note then
+		receipt = receipt .. '  "' .. note .. '"'
+	end
 	if state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf) then
 		local recl = vim.api.nvim_buf_line_count(state.panel_buf)
-		buf_append({ mark .. " " .. p.display .. " — " .. verb })
+		buf_append({ receipt })
 		hl_lines(recl, recl, kind == "deny" and "ClaudeDim" or "ClaudeQuestion")
+	end
+
+	-- Allow-path note fallback (see the function doc above for why this can't ride
+	-- in the control_response itself, and why send_followup not steer). MUST sit
+	-- here — after the receipt (so the "↳ steered" echo reads below the "✓ Allowed"
+	-- line, not above it) and before the three queue-drain early-returns just below
+	-- (so a note isn't silently dropped when a second card was queued behind this
+	-- one).
+	if kind ~= "deny" and note then
+		process.send_followup(note)
 	end
 
 	-- Concurrent requests: Claude can emit parallel tool_use blocks in one turn, so
@@ -612,6 +654,58 @@ local function attach_panel_float_resize(win, group_name, on_resize)
 end
 Gate.attach_panel_float_resize = attach_panel_float_resize
 
+-- Tab-to-annotate: opens the shared prompt float (widgets.open_prompt_float) titled
+-- with the currently-highlighted choice, then resolves that SAME choice carrying
+-- whatever was typed. <Esc> in the prompt (on_commit(nil)) cancels — no decision is
+-- made and the card just gets focus back, mirroring question.lua's "n to add notes"
+-- Esc semantics (a dismiss never forces a choice). A blank <CR> (on_commit("")) still
+-- resolves the highlighted option, just with no note — Tab-then-immediately-confirm
+-- is a valid way to back out of annotating without backing out of the decision.
+local function prompt_perm_note()
+	local p = state.perm
+	if not p then
+		return
+	end
+	local opt = p.options[p.choice]
+	-- Local row inside p.win for the overlay to pin at: p.hint_row is a fixed
+	-- BUFFER line number, but the card can be scrolled (j/k, long commands) —
+	-- convert to a row relative to whatever's currently at the top of the visible
+	-- window so the overlay lands ON the hint line, not wherever it would've been
+	-- had the card never scrolled.
+	local topline = vim.api.nvim_win_call(p.win, function()
+		return vim.fn.line("w0")
+	end)
+	-- -1 extra: a `relative="win"` float's `row` positions its BORDER's row, not its
+	-- content's — content starts one row below `row` (same border-row fact this
+	-- session's own pet_render.lua comment already established: "a bordered float's
+	-- win_get_position() row IS its border row"). Without the -1, content landed one
+	-- row BELOW "Tab to amend" (live-tested — user wanted it to replace that row,
+	-- not sit under it), because border-at-hint_row means content-at-hint_row+1.
+	local local_row = p.hint_row - (topline - 1) - 1
+	-- No pet on_open/reattach here (unlike the old stack-above design): the overlay
+	-- now lives INSIDE the card's own footprint (pinned at its hint row), not as a
+	-- separate float beside it. Clawd is already attached to p.win from
+	-- show_permission_card and that stays correct for the overlay's whole lifetime
+	-- — moving him onto the tiny overlay window itself would perch him over the
+	-- MIDDLE of the card (pet_render's surface mode sits above the anchor window's
+	-- own top border), not his usual top-right spot. Advisor-flagged before this
+	-- shipped (round-4 review) rather than caught live.
+	widgets.open_prompt_float(" ✎ Note for " .. opt.label .. " ", nil, function(text)
+		if text == nil then
+			return
+		end
+		resolve_permission(opt.kind, text)
+	end, {
+		guard = function()
+			return state.perm ~= nil
+		end,
+		refocus = function()
+			return state.perm and state.perm.win
+		end,
+		at = { win = p.win, row = local_row }, -- overlay pinned AT the "Tab to amend" line
+	})
+end
+
 -- Build + open the focused, bordered permission float and bind its keymaps. The
 -- buffer is dedicated and wiped on close, so the keymaps need no teardown.
 local function open_permission_float(p)
@@ -642,8 +736,18 @@ local function open_permission_float(p)
 	lines[#lines + 1] = "" -- spacer
 	lines[#lines + 1] = "" -- button-row placeholder
 	p.row = #lines - 1 -- 0-indexed button row
-	lines[#lines + 1] = "  ←/→ select · ⏎ confirm · esc reject · j/k scroll"
+	lines[#lines + 1] = "  ←/→ select h/l · ⏎ confirm · esc reject · ↑/↓ scroll j/k"
 	body_hl[#body_hl + 1] = { #lines - 1, "ClaudeDim" }
+	lines[#lines + 1] = "" -- spacer (symmetric with the one below "Tab to amend")
+	-- Own line, not squeezed onto the row above (that wrapped/overlapped "j/k" at
+	-- normal panel widths). This exact row is what prompt_perm_note's overlay pins
+	-- itself to and visually replaces when Tab is pressed — captured AFTER the
+	-- append, not before, so it points at this line and not the button row above it.
+	lines[#lines + 1] = "  Tab to amend"
+	p.hint_row = #lines - 1
+	-- Light orange (not the dim gray every other hint line uses) so this one option
+	-- pops as discoverable rather than reading as just another muted keybind hint.
+	body_hl[#body_hl + 1] = { #lines - 1, "ClaudeBurnWarn" }
 	lines[#lines + 1] = "" -- spacer
 	-- The actual command/parameters, rendered as a code block (▎ gutter + cyan) so
 	-- the user sees what will run, not just a paraphrase of it. Rendered LAST so it
@@ -759,6 +863,7 @@ local function open_permission_float(p)
 	map("<Down>", function()
 		vim.cmd("normal! j")
 	end)
+	map("<Tab>", prompt_perm_note)
 	map("<CR>", function()
 		local q = state.perm
 		if q then

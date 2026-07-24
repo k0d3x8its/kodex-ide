@@ -69,15 +69,17 @@ M.state = {
 	-- resurrects the panel (a phantom 2nd panel column, live-observed 2026-07-03).
 	orig_win_created = nil, -- win id we created via `topleft vsplit` (panel-only), else nil
 	orig_prev_buf = nil, -- buffer a REUSED editor window showed before the diff
-	-- Anchor for the accept-time transcript hunk (render.render_edit_block): an
-	-- extmark on the tool header's own trailing blank line, captured the instant
-	-- watch() runs (which is always right after render_tool appends that header —
-	-- see the EDIT_NAMES branch in render.lua's dispatch). accept_all() can fire
-	-- much later, after arbitrary other content (e.g. an advisor escalation)
-	-- streamed past that point; without this the hunk lands wherever the buffer
-	-- TAIL happens to be instead of under its own header (live bug 2026-07-16).
-	anchor_mark = nil,
-	anchor_buf = nil,
+	-- Anchors for the accept-time transcript hunk (render.render_edit_block): one
+	-- extmark per path, on that path's tool header's own trailing blank line,
+	-- captured the instant watch(path) runs (which is always right after
+	-- render_tool appends that header — see the EDIT_NAMES branch in render.lua's
+	-- dispatch). accept_all() can fire much later, after arbitrary other content
+	-- (e.g. an advisor escalation, or a SECOND file's watch()) streamed past that
+	-- point; without a per-path key the hunk lands under whichever file's header
+	-- was watched LAST, not its own (live bug 2026-07-16 single-edit case fixed by
+	-- one shared slot; multi-edit-turn case fixed by keying per path).
+	-- abs path → { mark = extmark id, buf = panel bufnr }
+	anchors = {},
 	-- Window ids of the CURRENT review, captured at mount. A WinClosed on either
 	-- that did NOT go through accept/reject (user `:q` on the diff, a layout change)
 	-- means the review was abandoned — recover_abandoned then unlocks the input bar
@@ -110,12 +112,14 @@ local function log(msg)
 	end
 end
 
--- Mark "right here" in the panel transcript as where a hunk for the CURRENT
--- review belongs. Called at the top of watch() — the only two call sites
--- (render.lua's ordinary post-write path and the gated-fallback path) both run
--- immediately after the tool's own header block was appended, so the buffer
--- tail at this instant IS that header's trailing blank line.
-local function mark_anchor()
+-- Mark "right here" in the panel transcript as where a hunk for `path` belongs.
+-- Called at the top of watch(path) — the only two call sites (render.lua's
+-- ordinary post-write path and the gated-fallback path) both run immediately
+-- after the tool's own header block was appended, so the buffer tail at this
+-- instant IS that header's trailing blank line. Keyed by path (not a single
+-- shared slot) so a second file's watch() during the same turn can't overwrite
+-- the first file's anchor before it's accepted.
+local function mark_anchor(path)
 	local buf = claude.state.panel_buf
 	if not (buf and vim.api.nvim_buf_is_valid(buf)) then
 		return
@@ -124,8 +128,10 @@ local function mark_anchor()
 	if n < 1 then
 		return
 	end
-	M.state.anchor_mark = vim.api.nvim_buf_set_extmark(buf, anchor_ns, n - 1, 0, {})
-	M.state.anchor_buf = buf
+	M.state.anchors[path] = {
+		mark = vim.api.nvim_buf_set_extmark(buf, anchor_ns, n - 1, 0, {}),
+		buf = buf,
+	}
 end
 
 -- Fetched live, never cached: claude.reset() replaces the diff_queue table
@@ -175,11 +181,17 @@ function M.watch(path)
 	if not claude.state.claude_active then
 		return false
 	end
-	mark_anchor()
+	-- TODO: `abs` is an abbreviation of "absolute path" — not domain-standard per
+	-- CODE-STANDARD.md naming rules. Rename to `abs_path` (here + every other use
+	-- in this file) for clarity; deferred as its own pass, out of scope for the
+	-- anchor-keying fix this variable currently supports.
 	-- Absolute + slash-normalised so bufadd matches the name checktime/FCS report
 	-- (a relative path would create a SECOND buffer for the same file → no FCS on
-	-- the one we loaded).
+	-- the one we loaded). Computed before mark_anchor() so the anchor is keyed by
+	-- the SAME value accept_all() later looks up via s.current (both open_diff and
+	-- open_prewrite set s.current to this abs form — see mark_anchor's doc comment).
 	local abs = vim.fn.fnamemodify(path, ":p")
+	mark_anchor(abs)
 	-- A file that does NOT exist yet can't use the FileChangedShell mechanism:
 	-- bufload'ing a nonexistent path flags the buffer BF_NEW, and when Claude then
 	-- creates it on disk `checktime` raises a blocking W13 confirm dialog and SKIPS
@@ -275,6 +287,9 @@ local function close_diff()
 	end
 	if s.current then
 		M.state.new_files[s.current] = nil
+		-- Only THIS path's anchor — a second file's anchor (watch()'d during the
+		-- same turn, still pending its own review) must survive this close.
+		s.anchors[s.current] = nil
 	end
 	s.current, s.scratch, s.orig_buf = nil, nil, nil
 	s.orig_win_created, s.orig_prev_buf = nil, nil
@@ -282,7 +297,6 @@ local function close_diff()
 	s.orig_prev_readonly = nil
 	s.kind = "edit"
 	s.prewrite = false
-	s.anchor_mark, s.anchor_buf = nil, nil
 	-- Notify the Claude panel that the diff is resolved so it can unlock the
 	-- input bar (MG 7.2 — mirrors the on_diff_open call in open_diff below).
 	claude.on_diff_close()
@@ -307,12 +321,15 @@ function M.accept_all()
 	-- rendered its content inline as a numbered body at tool_use time
 	-- (render.render_write_body), so the accept-time red/green hunk would double it up.
 	local is_new = s.kind == "new"
-	-- Resolve the anchor NOW, before close_diff() below can reset it — the
-	-- extmark tracks the header's blank line through anything that streamed
-	-- in while this review sat open (see mark_anchor()).
+	-- Resolve THIS path's anchor NOW, before close_diff() below can clear it — the
+	-- extmark tracks the header's blank line through anything that streamed in
+	-- while this review sat open, including a SECOND file's watch() (see
+	-- mark_anchor()'s doc comment) — keyed by s.current so that second file's
+	-- anchor entry is untouched.
 	local anchor_row
-	if s.anchor_mark and s.anchor_buf and vim.api.nvim_buf_is_valid(s.anchor_buf) then
-		local ok, pos = pcall(vim.api.nvim_buf_get_extmark_by_id, s.anchor_buf, anchor_ns, s.anchor_mark, {})
+	local anchor = s.current and s.anchors[s.current]
+	if anchor and anchor.buf and vim.api.nvim_buf_is_valid(anchor.buf) then
+		local ok, pos = pcall(vim.api.nvim_buf_get_extmark_by_id, anchor.buf, anchor_ns, anchor.mark, {})
 		if ok and pos and pos[1] then
 			anchor_row = pos[1]
 		end

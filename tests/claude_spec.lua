@@ -642,6 +642,101 @@ H.check(
 	vim.inspect(r5)
 )
 
+-- ── T17c: Tab-to-annotate — note attached to a permission decision ────────────
+-- Deny: the note rides in the SAME control_response's `message` field (the
+-- documented wire channel AskUserQuestion's "Chat about this" already proves out).
+-- Allow: can_use_tool's allow response has no annotation field (only
+-- updatedInput/updatedPermissions), so the fallback is process.steer(note) — a
+-- SECOND chansend, right after the control_response, carrying the note as a
+-- stream-json {type:"user"} message into the still-live turn.
+claude.state.working = true
+claude.state.job_id = 99
+
+feed({
+	type = "control_request",
+	request_id = "req-note-deny",
+	request = { subtype = "can_use_tool", tool_name = "Bash", input = { command = "rm x" } },
+})
+claude._resolve_permission("deny", "too destructive")
+local rn1 = last_control_response()
+H.check(
+	"T17c deny+note rides the message field",
+	rn1 and rn1.response.response.behavior == "deny" and rn1.response.response.message == "too destructive",
+	vim.inspect(rn1)
+)
+
+feed({
+	type = "control_request",
+	request_id = "req-note-allow",
+	request = { subtype = "can_use_tool", tool_name = "Bash", input = { command = "ls" } },
+})
+local sends_before_note = #chansend_calls
+claude._resolve_permission("once", "double-checked, safe")
+H.check(
+	"T17c allow+note sends TWO payloads (control_response, then the steered note)",
+	#chansend_calls == sends_before_note + 2,
+	"delta=" .. (#chansend_calls - sends_before_note)
+)
+local allow_resp = vim.json.decode(chansend_calls[sends_before_note + 1].data)
+H.check(
+	"T17c allow+note: first payload is the plain allow (no annotation field on the wire)",
+	allow_resp.type == "control_response"
+		and allow_resp.response.request_id == "req-note-allow"
+		and allow_resp.response.response.behavior == "allow",
+	vim.inspect(allow_resp)
+)
+local followup_msg = vim.json.decode(chansend_calls[sends_before_note + 2].data)
+H.check(
+	"T17c allow+note: second payload is the follow-up user message",
+	followup_msg.type == "user" and followup_msg.message.content[1].text == "double-checked, safe",
+	vim.inspect(followup_msg)
+)
+
+-- A blank note ("" — Tab then immediately <CR> in the prompt) behaves like no note:
+-- the decision still resolves, but no spurious follow-up chansend follows it.
+feed({
+	type = "control_request",
+	request_id = "req-note-blank",
+	request = { subtype = "can_use_tool", tool_name = "Bash", input = { command = "pwd" } },
+})
+local sends_before_blank = #chansend_calls
+claude._resolve_permission("once", "")
+H.check(
+	"T17c blank note behaves like no note (single chansend, no follow-up)",
+	#chansend_calls == sends_before_blank + 1,
+	"delta=" .. (#chansend_calls - sends_before_blank)
+)
+
+-- process.send_followup (not process.steer) is the primitive in play, deliberately:
+-- steer() drains state.queue as a side effect, which would inject an unrelated
+-- queued message (typed while Claude was working, meant to send AFTER the turn)
+-- into the turn early — a note attached to THIS decision must not do that.
+claude.state.queue = { "unrelated queued msg" }
+feed({
+	type = "control_request",
+	request_id = "req-note-queue",
+	request = { subtype = "can_use_tool", tool_name = "Bash", input = { command = "echo hi" } },
+})
+local sends_before_q = #chansend_calls
+claude._resolve_permission("once", "the note")
+H.check(
+	"T17c allow+note does NOT drain state.queue (still 2 payloads, not 3)",
+	#chansend_calls == sends_before_q + 2,
+	"delta=" .. (#chansend_calls - sends_before_q)
+)
+H.check(
+	"T17c allow+note leaves the unrelated queued message untouched",
+	#claude.state.queue == 1 and claude.state.queue[1] == "unrelated queued msg",
+	vim.inspect(claude.state.queue)
+)
+local followup_q = vim.json.decode(chansend_calls[sends_before_q + 2].data)
+H.check(
+	"T17c allow+note follow-up carries ONLY the note, not the queued message",
+	followup_q.message.content[1].text == "the note",
+	vim.inspect(followup_q)
+)
+claude.state.queue = {}
+
 -- ── T17b: concurrent permission requests QUEUE (parallel tool_use) ────────────
 -- Claude can emit multiple tool_use blocks in one assistant turn; the canUseTool
 -- gate then fires a can_use_tool control_request PER tool, concurrently. The card

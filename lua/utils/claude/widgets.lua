@@ -644,13 +644,49 @@ local function trunc_display(s, cols)
 	return out .. "…"
 end
 
+-- Split `s` at the last word boundary that still fits `w` display columns,
+-- falling back to a hard character break when a single token is wider than
+-- `w` on its own. Returns (first_chunk, remainder-or-nil). Used to wrap a
+-- switcher-row label onto one continuation line instead of cutting it with
+-- "…" mid-word (CLAUDE-PANEL-TODOS.md linebreak bug).
+local function split_at_width(s, w)
+	if vim.fn.strdisplaywidth(s) <= w then
+		return s, nil
+	end
+	local best_space = nil
+	for pos in s:gmatch("() ") do
+		if vim.fn.strdisplaywidth(s:sub(1, pos - 1)) <= w then
+			best_space = pos
+		else
+			break
+		end
+	end
+	if best_space then
+		-- The model/desc separator is TWO spaces ("neoclaude" .. "  " .. desc):
+		-- trim so neither a trailing space on line 1 nor a leading one on the
+		-- continuation shifts that row's indent by a column.
+		local head = s:sub(1, best_space - 1):gsub("%s+$", "")
+		local rest = s:sub(best_space + 1):gsub("^%s+", "")
+		return head, (rest ~= "" and rest or nil)
+	end
+	local head = vim.fn.strcharpart(s, 0, w)
+	while vim.fn.strdisplaywidth(head) > w and #head > 0 do
+		head = vim.fn.strcharpart(head, 0, vim.fn.strchars(head) - 1)
+	end
+	local rest = s:sub(#head + 1)
+	return head, (rest ~= "" and rest or nil)
+end
+
 -- Build the switcher rows + per-row highlight spans. Row 1 is the "main"
 -- pseudo-entry (selecting it returns to the main transcript); rows 2..N+1 are the
 -- captured subagents in order. The selected row (state.subagent_sel, 1-based)
 -- gets a green filled ● (ClaudeAdvisor); the rest a dim hollow ○ (ClaudeDim) —
 -- reference-faithful. Byte spans are ASCII-safe up to the glyph; the ● / ○ / ↓
 -- are multibyte, so meta spans are measured off the built string, not char counts.
--- The label is truncated so the (dim) meta always stays visible within the card.
+-- A label that overflows the card wraps onto ONE indented continuation line
+-- (the (dim) meta always stays on line 1); if the continuation is STILL too
+-- long it gets the old ellipsis truncation as a backstop against an unbounded
+-- bar height.
 function Widgets.render_subagent_lines()
 	local subs = state.subagents or {}
 	local sel = state.subagent_sel or 1
@@ -663,11 +699,16 @@ function Widgets.render_subagent_lines()
 	local function add_row(idx, label, meta)
 		local glyph = (idx == sel) and "●" or "○"
 		local ghl = (idx == sel) and "ClaudeAdvisor" or "ClaudeDim"
-		-- Reserve room for the glyph + spaces + meta segment, then fit the label.
+		local prefix = " " .. glyph .. " "
+		local prefix_w = vim.fn.strdisplaywidth(prefix)
+		-- Reserve room for the glyph + spaces + meta segment, then fit the label;
+		-- overflow wraps onto a continuation line instead of truncating in place.
 		local seg = (meta and meta ~= "") and ("   " .. meta) or ""
-		local fixed = vim.fn.strdisplaywidth(" " .. glyph .. " " .. seg)
-		label = trunc_display(label, budget - fixed)
-		local text = " " .. glyph .. " " .. label
+		local seg_w = vim.fn.strdisplaywidth(seg)
+		local first_budget = math.max(budget - prefix_w - seg_w, 4)
+		local first_line_label, rest = split_at_width(label, first_budget)
+
+		local text = prefix .. first_line_label
 		local spans = { { 1, 1 + #glyph, ghl } } -- colour just the selection glyph
 		if seg ~= "" then
 			spans[#spans + 1] = { #text, #text + #seg, "ClaudeDim" }
@@ -675,6 +716,12 @@ function Widgets.render_subagent_lines()
 		end
 		lines[#lines + 1] = text
 		hls[#hls + 1] = spans
+
+		if rest then
+			local cont_budget = math.max(budget - prefix_w, 4)
+			lines[#lines + 1] = string.rep(" ", prefix_w) .. trunc_display(rest, cont_budget)
+			hls[#hls + 1] = {}
+		end
 	end
 
 	add_row(1, "main", nil)
@@ -722,6 +769,16 @@ function Widgets.update_subagent_bar()
 	if not (state.panel_win and vim.api.nvim_win_is_valid(state.panel_win)) then
 		return
 	end
+
+	-- A row's height is no longer fixed at 1 line per subagent — a status/meta
+	-- change (e.g. "running" → "✓ 3s · ↓ 29.4k tokens") can push a label into
+	-- wrap, growing the bar without the subagent COUNT changing. Callers that
+	-- only expected a count-driven height change (task_updated/task_notification
+	-- meta refreshes, mod.interrupt()) don't reflow after calling this — so
+	-- reflow here, once, whenever the actual footprint changes, instead of
+	-- auditing every call site. Cheap and idempotent (mirrors the VimResized
+	-- autocmd below, which already reflows on every resize unconditionally).
+	local prev_h = state.subagent_h
 
 	local lines, hls = Widgets.render_subagent_lines()
 	local buf = state.subagent_buf
@@ -781,6 +838,10 @@ function Widgets.update_subagent_bar()
 		state.subagent_resize_teardown = function()
 			pcall(vim.api.nvim_del_augroup_by_name, "ClaudeSubagentResize")
 		end
+	end
+
+	if state.subagent_h ~= prev_h then
+		Widgets.reflow_bottom_floats()
 	end
 end
 
@@ -857,6 +918,25 @@ function Widgets.subagent_enter()
 		return false
 	end
 	if (state.subagent_sel or 1) <= 1 then
+		-- Main row selected: normally just closes an (already-closed) drill-in view,
+		-- a harmless no-op that still swallows the keypress. If a subagent was killed
+		-- by an interrupt and nothing is running anymore, that no-op is actively
+		-- unhelpful — there's no live subagent activity to shield the chat bar from,
+		-- so let <CR> fall through to open_input() instead. A purely-completed
+		-- session (no interrupts) keeps the existing drill-in-via-Enter behavior;
+		-- this only fires once an abort has actually happened.
+		local has_interrupted, any_running = false, false
+		for _, s in ipairs(subs) do
+			if s.status == "interrupted" then
+				has_interrupted = true
+			elseif s.status == "running" then
+				any_running = true
+			end
+		end
+		local view_open = state.subagent_view_win and vim.api.nvim_win_is_valid(state.subagent_view_win)
+		if has_interrupted and not any_running and not view_open then
+			return false
+		end
 		Widgets.close_subagent_view()
 	else
 		Widgets.open_subagent_view((state.subagent_sel or 1) - 1)

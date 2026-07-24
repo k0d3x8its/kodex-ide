@@ -942,4 +942,147 @@ claude.state.claude_active = true
 H.check("T26 watch() returns true for a real existing file (bufload succeeds)", D.watch(existing) == true)
 vim.fn.delete(existing)
 
+-- ── T27: multi-edit-turn anchor keyed PER PATH (L67, 2026-07-24) ─────────────
+-- T23 above drives render_edit_hunk directly with a hand-picked anchor_row —
+-- it never exercises watch()'s mark_anchor or accept_all()'s anchor lookup, so
+-- it could not have caught this bug. Real scenario: a turn edits TWO files —
+-- watch(file1) fires, then watch(file3) fires (both BEFORE either diff is
+-- reviewed, per the tool_use-time dispatch watch() is called from). With a
+-- single shared anchor slot, watch(file3) clobbers file1's anchor, so
+-- accepting file1 later renders its hunk under file3's header (or worse, at
+-- the tail). Keying anchors per path (s.anchors[abs]) fixes it — this proves
+-- the REAL watch()→accept_all() path, not just the render function in isolation.
+-- Uses file3 (not file2/beta.txt) as the second file: T12 above deliberately
+-- force-deletes orig_buf mid-review on file2 to test crash-survival, which
+-- leaks its "[Claude proposed] beta.txt" scratch buffer — a real accept on
+-- file2 later would collide on that stale buffer name (E95), unrelated to
+-- the anchor fix under test here.
+D.state.current = nil
+claude.state.claude_active = true
+-- No prior test combines a VALID panel_buf with a real accept_all()/close_diff()
+-- pass (T23 sets panel_buf but calls render_edit_block directly, never
+-- close_diff), so this is the first path to reach init.lua's clear_hint() with
+-- panel_buf valid — hint_ns is normally created by the real panel-toggle setup,
+-- which this headless spec never runs. Seed it so on_diff_close()'s hint clear
+-- doesn't crash on a nil namespace.
+claude.state.hint_ns = vim.api.nvim_create_namespace("t27_test_hint")
+local t27_panel = vim.api.nvim_create_buf(false, true)
+claude.state.panel_buf = t27_panel
+vim.bo[t27_panel].modifiable = true
+vim.api.nvim_buf_set_lines(t27_panel, 0, -1, false, { "● Edit(alpha.txt)", "" })
+D.watch(file1) -- marks anchor for file1 at row 1 (the blank line just written)
+vim.api.nvim_buf_set_lines(t27_panel, -1, -1, false, { "● Edit(gamma.txt)", "" })
+D.watch(file3) -- marks anchor for file3 at the NEW tail — must NOT clobber file1's
+vim.bo[t27_panel].modifiable = false
+
+local abs1 = vim.fn.fnamemodify(file1, ":p")
+local abs2 = vim.fn.fnamemodify(file3, ":p")
+H.check(
+	"T27 both files got their OWN anchor entry",
+	D.state.anchors[abs1] ~= nil and D.state.anchors[abs2] ~= nil,
+	vim.inspect({ a1 = D.state.anchors[abs1], a2 = D.state.anchors[abs2] })
+)
+H.check(
+	"T27 the two anchors are DISTINCT marks (not one clobbered slot)",
+	D.state.anchors[abs1] ~= nil
+		and D.state.anchors[abs2] ~= nil
+		and (D.state.anchors[abs1].mark ~= D.state.anchors[abs2].mark or D.state.anchors[abs1].buf ~= t27_panel),
+	vim.inspect(D.state.anchors)
+)
+
+-- Drive the REAL accept path for file1 while file3's watch() has already fired.
+H.ext_write(file1, { "t27_m1", "t27_mX", "t27_m3" })
+D.checktime_all()
+vim.wait(300, function()
+	return D.state.current == abs1
+end)
+H.check("T27 file1 diff opened (current == abs1)", D.state.current == abs1, tostring(D.state.current))
+D.accept_all()
+vim.wait(300, function()
+	return D.state.current == nil or D.state.current == abs2
+end)
+
+local out1 = vim.api.nvim_buf_get_lines(t27_panel, 0, -1, false)
+local gamma_idx
+for i, l in ipairs(out1) do
+	if l:match("● Edit%(gamma%.txt%)") then
+		gamma_idx = i - 1
+		break
+	end
+end
+local hunk_before1, hunk_after1 = 0, 0
+if gamma_idx then
+	for i, l in ipairs(out1) do
+		if l:match("^%s*%d+ [%+%-] ") then
+			if (i - 1) < gamma_idx then
+				hunk_before1 = hunk_before1 + 1
+			else
+				hunk_after1 = hunk_after1 + 1
+			end
+		end
+	end
+end
+H.check(
+	"T27 file1's hunk lands BEFORE file3's header (own anchor used, not file3's / not tail)",
+	gamma_idx ~= nil and hunk_before1 > 0 and hunk_after1 == 0,
+	"gamma_idx="
+		.. tostring(gamma_idx)
+		.. " before="
+		.. hunk_before1
+		.. " after="
+		.. hunk_after1
+		.. " out="
+		.. vim.inspect(out1)
+)
+H.check(
+	"T27 close_diff cleared ONLY file1's anchor entry",
+	D.state.anchors[abs1] == nil and D.state.anchors[abs2] ~= nil,
+	vim.inspect(D.state.anchors)
+)
+
+-- Drain file3 too: its disk change (and the checktime that queues it) only
+-- happens NOW — nothing pushed file3 into the review queue before this, so
+-- waiting on current==abs2 any earlier would hang forever.
+H.ext_write(file3, { "t27_n1", "t27_nX", "t27_n3" })
+D.checktime_all()
+vim.wait(300, function()
+	return D.state.current == abs2
+end)
+H.check("T27 file3 diff opened next (current == abs2)", D.state.current == abs2, tostring(D.state.current))
+D.accept_all()
+vim.wait(300, function()
+	return D.state.current == nil
+end)
+
+local out2 = vim.api.nvim_buf_get_lines(t27_panel, 0, -1, false)
+local gamma_hdr_idx
+for i, l in ipairs(out2) do
+	if l:match("● Edit%(gamma%.txt%)") then
+		gamma_hdr_idx = i - 1
+		break
+	end
+end
+local hunk_after2 = 0
+if gamma_hdr_idx then
+	for i, l in ipairs(out2) do
+		if l:match("^%s*%d+ [%+%-] ") then
+			if (i - 1) > gamma_hdr_idx then
+				hunk_after2 = hunk_after2 + 1
+			end
+		end
+	end
+end
+H.check(
+	"T27 file3's hunk lands AFTER its own header (shifted anchor followed correctly, no tail fallback)",
+	gamma_hdr_idx ~= nil and hunk_after2 > 0,
+	"gamma_hdr_idx=" .. tostring(gamma_hdr_idx) .. " after=" .. hunk_after2 .. " out=" .. vim.inspect(out2)
+)
+H.check(
+	"T27 both anchor entries cleaned up after both reviews resolved",
+	D.state.anchors[abs1] == nil and D.state.anchors[abs2] == nil,
+	vim.inspect(D.state.anchors)
+)
+
+claude.state.panel_buf = nil
+
 H.summary("claude_diff")

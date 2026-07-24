@@ -2494,6 +2494,22 @@ function mod.interrupt()
 	-- type-ahead queue line to the (now static) last content line.
 	pet_emit("interrupt")
 	render_queue()
+	-- A subagent killed mid-flight never gets a task_notification (the CLI has
+	-- nothing left to report), so its "running" status would otherwise stick
+	-- forever and the switcher bar would lie. Mark it honestly; subagent_enter()
+	-- (widgets.lua) uses this to stop swallowing <CR> once nothing is left running.
+	if state.subagents then
+		local changed = false
+		for _, sub in ipairs(state.subagents) do
+			if sub.status == "running" then
+				sub.status = "interrupted"
+				changed = true
+			end
+		end
+		if changed then
+			widgets.update_subagent_bar()
+		end
+	end
 end
 
 -- ─── Over-scroll clamp ────────────────────────────────────────────────────────

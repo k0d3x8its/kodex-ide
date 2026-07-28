@@ -18,6 +18,7 @@ return {
 		"css",
 		"solidity",
 		"yaml",
+		"swift",
 	},
 
 	config = function()
@@ -37,6 +38,7 @@ return {
 			solidity = { "solhint" },
 			markdown = { "markdownlint" },
 			yaml = { "yamllint" },
+			swift = { "swiftlint" },
 		}
 
 		vim.g.ale_fix_on_save = 1
@@ -55,6 +57,9 @@ return {
 			json = { "prettier" },
 			markdown = { "prettier" },
 			yaml = { "prettier" },
+			swift = { "appleswiftformat" }, -- official swift-format; matches SWIFT.md's
+			-- stated priority (swift-format first, third-party `swiftformat` fixer
+			-- second if a project's own convention prefers it)
 		}
 
 		vim.g.ale_lint_on_text_changed = "always"

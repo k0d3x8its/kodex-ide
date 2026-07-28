@@ -1,0 +1,134 @@
+{
+  "version": 1.1,
+  "tags": [],
+  "globalAttributes": [
+    {
+      "name": "hx-get",
+      "description": "Issues a GET request to the given URL and swaps the response into the DOM."
+    },
+    {
+      "name": "hx-post",
+      "description": "Issues a POST request to the given URL and swaps the response into the DOM."
+    },
+    {
+      "name": "hx-put",
+      "description": "Issues a PUT request to the given URL."
+    },
+    {
+      "name": "hx-patch",
+      "description": "Issues a PATCH request to the given URL."
+    },
+    {
+      "name": "hx-delete",
+      "description": "Issues a DELETE request to the given URL."
+    },
+    {
+      "name": "hx-trigger",
+      "description": "Specifies the event that triggers the request (default varies by element)."
+    },
+    {
+      "name": "hx-target",
+      "description": "Selects the element the response is swapped into (default: the triggering element)."
+    },
+    {
+      "name": "hx-swap",
+      "description": "Controls how the response is swapped in relative to the target (innerHTML, outerHTML, beforeend, afterbegin, ...)."
+    },
+    {
+      "name": "hx-swap-oob",
+      "description": "Marks content in the response as an out-of-band swap into a different part of the page."
+    },
+    {
+      "name": "hx-select",
+      "description": "Selects a subset of the response HTML to swap in, by CSS selector."
+    },
+    {
+      "name": "hx-select-oob",
+      "description": "Selects content from the response to swap in out-of-band, by CSS selector."
+    },
+    {
+      "name": "hx-vals",
+      "description": "Adds extra values (JSON) to the request parameters."
+    },
+    {
+      "name": "hx-headers",
+      "description": "Adds extra headers (JSON) to the request."
+    },
+    {
+      "name": "hx-confirm",
+      "description": "Shows a confirm() dialog before issuing the request."
+    },
+    {
+      "name": "hx-indicator",
+      "description": "Selects the element to apply the htmx-request class to while the request is in flight."
+    },
+    {
+      "name": "hx-push-url",
+      "description": "Pushes a URL into the browser history."
+    },
+    {
+      "name": "hx-replace-url",
+      "description": "Replaces the current URL in the browser history."
+    },
+    {
+      "name": "hx-boost",
+      "description": "Progressively enhances anchors/forms to issue an ajax request instead of a full page load."
+    },
+    {
+      "name": "hx-history-elt",
+      "description": "Specifies the element used for history snapshots (default: body)."
+    },
+    {
+      "name": "hx-include",
+      "description": "Includes additional elements' values in the request, by CSS selector."
+    },
+    {
+      "name": "hx-params",
+      "description": "Filters which parameters are submitted with the request."
+    },
+    {
+      "name": "hx-disable",
+      "description": "Disables htmx processing for this element and its children."
+    },
+    {
+      "name": "hx-disabled-elt",
+      "description": "Selects an element to add the disabled attribute to while a request is in flight."
+    },
+    {
+      "name": "hx-encoding",
+      "description": "Sets the encoding type for the request (e.g. multipart/form-data)."
+    },
+    {
+      "name": "hx-ext",
+      "description": "Enables an htmx extension for this element and its children."
+    },
+    {
+      "name": "hx-preserve",
+      "description": "Preserves this element across a swap (by id), instead of replacing it."
+    },
+    {
+      "name": "hx-prompt",
+      "description": "Shows a prompt() dialog before issuing the request; the value is sent as a header."
+    },
+    {
+      "name": "hx-request",
+      "description": "Configures request options (e.g. timeout, credentials) as JSON."
+    },
+    {
+      "name": "hx-sync",
+      "description": "Synchronizes requests between elements (e.g. abort/replace/queue)."
+    },
+    {
+      "name": "hx-validate",
+      "description": "Forces HTML5 validation before a non-form element's request is issued."
+    },
+    {
+      "name": "hx-ws",
+      "description": "Establishes a WebSocket connection (htmx ws extension)."
+    },
+    {
+      "name": "hx-sse",
+      "description": "Establishes a Server-Sent Events connection (htmx sse extension)."
+    }
+  ]
+}

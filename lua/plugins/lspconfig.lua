@@ -32,6 +32,7 @@ return {
 			css = true,
 			json = true,
 			markdown = true,
+			swift = true,
 		}
 
 		-- on_attach function for keymaps and formatting
@@ -88,7 +89,6 @@ return {
 
 		-- list all servers you installed via Mason (basic setup only)
 		local servers = {
-			"html",
 			"cssls",
 			"ts_ls",
 			"solidity_ls",
@@ -97,6 +97,7 @@ return {
 			"arduino_language_server",
 			"bashls",
 			"jsonls",
+			"sourcekit_lsp",
 		}
 
 		for _, server in ipairs(servers) do
@@ -158,5 +159,25 @@ return {
 			},
 		})
 		vim.lsp.enable("yamlls")
+
+		-- HTML language server, extended with htmx's hx-* attributes via
+		-- customData — no dedicated htmx LSP exists; this is the standard
+		-- approach (same mechanism the official vscode-htmx extension uses).
+		vim.lsp.config("html", {
+			capabilities = capabilities,
+			on_attach = on_attach,
+			settings = {
+				html = {
+					customData = {
+						vim.fs.joinpath(vim.fn.stdpath("config"), "lua/data/htmx-custom-data.json"),
+					},
+				},
+			},
+		})
+		vim.lsp.enable("html")
+
+		-- sourcekit_lsp ships bundled with the Swift toolchain, not via Mason —
+		-- installing the toolchain (swift.org or Xcode) is a host-level
+		-- prerequisite, not something this config can provision.
 	end,
 }

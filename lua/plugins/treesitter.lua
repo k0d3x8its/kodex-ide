@@ -25,6 +25,7 @@ return {
 				"bash",
 				"yaml",
 				"regex",
+				"swift",
 			},
 			highlight = { enable = true },
 			indent = { enable = true },

@@ -32,6 +32,8 @@ return {
 				"arduino_language_server",
 				"yamlls",
 				"clangd",
+				-- sourcekit_lsp deliberately excluded: it ships with the Swift
+				-- toolchain (swift.org/Xcode install), not available via Mason.
 			},
 			automatic_installation = true,
 			automatic_enable = false,

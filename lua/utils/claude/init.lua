@@ -660,6 +660,13 @@ local function activity_word()
 	return "Typing"
 end
 
+-- Forward-declared: defined below (after spinner_label/waiting_label/gated exist)
+-- but called from remove_typing_ph/update_typing_ph, both defined earlier in the
+-- file. Those two raw-edit the buffer tail with nvim_buf_set_lines directly (not
+-- buf_append), so they must re-anchor the hint themselves rather than relying on
+-- buf_append's wired call or dispatch's tail-block call to catch it after the fact.
+local reanchor_hint
+
 -- The animated line text: pulsing dot + phase word (no seconds — the eol
 -- randomizer below carries the climbing timer, so a second one here is redundant).
 -- The dot frame advances on wall-clock time (~350ms) so the pulse is calm and
@@ -709,6 +716,11 @@ local function remove_typing_ph()
 	vim.bo[buf].modifiable = true
 	vim.api.nvim_buf_set_lines(buf, n - 2, n, false, {})
 	vim.bo[buf].modifiable = false
+	-- Raw delete, not buf_append — nothing else re-anchors the hint after this, so it
+	-- must do it itself or its mark drifts past the new (shorter) buffer tail.
+	if reanchor_hint then
+		reanchor_hint()
+	end
 end
 mod._remove_typing_ph = remove_typing_ph
 mod._activity_word = activity_word
@@ -761,6 +773,11 @@ local function update_typing_ph()
 	vim.api.nvim_buf_set_lines(buf, n - 2, n - 1, false, { typing_ph_line() })
 	vim.bo[buf].modifiable = false
 	hl_lines(n - 2, n - 2, "ClaudeDim")
+	-- Same-count in-place replace, so the mark shouldn't drift — reanchor anyway,
+	-- cheap and keeps this function correct even if that assumption ever breaks.
+	if reanchor_hint then
+		reanchor_hint()
+	end
 end
 
 -- Driven by start_spinner + the 110ms tick: show/animate the placeholder in the
@@ -1009,6 +1026,32 @@ local function start_spinner()
 		render_queue()
 	end, { ["repeat"] = -1 })
 end
+
+-- Re-anchor the working/waiting hint to the buffer's current last line. Assigns
+-- the forward-declared upvalue (see its declaration above typing_ph_line) so
+-- remove_typing_ph/update_typing_ph (raw nvim_buf_set_lines edits, called directly)
+-- and buf_append (wired via Core.wire_reanchor_hint, the choke point every other
+-- appender routes through — including render.lua's dispatch-driven renders) can
+-- all call it. No separate dispatch-level call: every raw mid-buffer edit dispatch
+-- triggers is followed by a buf_append before dispatch returns, so buf_append's
+-- wired call already catches those.
+reanchor_hint = function()
+	if not state.working then
+		return
+	end
+	if gated() then
+		set_hint(waiting_label(), "ClaudeInput")
+	else
+		set_hint(spinner_label(), "ClaudeInput")
+	end
+end
+mod._reanchor_hint = reanchor_hint
+
+-- Wired here (not alongside wire_set_bottom_pad near the top of the file) because
+-- reanchor_hint's assignment above must run first — core.wire_reanchor_hint needs
+-- the actual function, not the nil the forward-declared local still holds earlier
+-- in the file.
+core.wire_reanchor_hint(reanchor_hint)
 
 -- ─── Render functions → claude/render.lua (Goal 15.7) ───────────────────────
 -- render_prose / render_user / render_thinking / render_tool + the tool_result

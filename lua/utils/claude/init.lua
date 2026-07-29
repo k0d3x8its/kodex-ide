@@ -2175,14 +2175,16 @@ local function open_chat_float(title, callback, opts)
 	-- running turn instead of queueing it (see submit()'s want_steer). Tag the
 	-- submission, then fire the prompt buffer's own <CR> so the normal callback →
 	-- submit() path runs. (ctrl+Enter / ctrl+shift+Enter were swallowed by Ghostty's own
-	-- bindings.) If the "/" menu is open, <CR> belongs to accept_selected — pass it
-	-- through untagged, it only fills the command text and never submits. Otherwise,
-	-- with no turn running there's nothing to steer into, so no-op: feeding <CR> here
-	-- would fall through to a normal submit and fire whatever's half-typed in the bar
-	-- (e.g. a slash command still being written) — user-reported 2026-07-28.
+	-- bindings.) If the "/" menu is open, call slash.accept() directly instead of
+	-- feeding <CR> — nvim_feedkeys' noremap mode ("n") bypasses buffer-local <CR>
+	-- mappings (accept_selected is one), so a fed <CR> falls through to the prompt
+	-- buffer's own <CR> and SUBMITS the half-typed command instead of completing it
+	-- (user-reported 2026-07-28: "/cave"+Tab sent "/cave" as a message). Otherwise,
+	-- with no turn running there's nothing to steer into, so no-op: feeding <CR>
+	-- here would likewise fall through to a normal submit.
 	local function steer_from_bar()
 		if slash.active() then
-			vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "n", false)
+			slash.accept()
 			return
 		end
 		if not state.working then

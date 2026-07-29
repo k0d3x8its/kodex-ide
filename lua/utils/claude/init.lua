@@ -121,6 +121,7 @@ end
 -- the most recent ids come first so a longer id never shadows a shorter prefix.
 local MODEL_NAMES = {
 	{ "claude-fable-5", "Fable 5" },
+	{ "claude-opus-5", "Opus 5" },
 	{ "claude-opus-4-8", "Opus 4.8" },
 	{ "claude-opus-4-7", "Opus 4.7" },
 	{ "claude-opus-4-6", "Opus 4.6" },
@@ -135,7 +136,7 @@ local MODEL_NAMES = {
 	-- Bare aliases (from the <leader>cm picker, before system/init confirms the
 	-- exact id) → the friendly name of the latest model in each family. Listed
 	-- LAST so a full date-suffixed id always matches its specific entry first.
-	{ "opus", "Opus 4.8" },
+	{ "opus", "Opus 5" },
 	{ "sonnet", "Sonnet 5" },
 	{ "haiku", "Haiku 4.5" },
 }
@@ -3127,7 +3128,8 @@ end
 -- versions use the dated full id since the CLI has no bare alias for them.
 local MODEL_CHOICES = {
 	{ label = "Fable 5", value = "claude-fable-5" },
-	{ label = "Opus 4.8", value = "opus" },
+	{ label = "Opus 5", value = "opus" },
+	{ label = "Opus 4.8", value = "claude-opus-4-8" },
 	{ label = "Opus 4.7", value = "claude-opus-4-7" },
 	{ label = "Opus 4.6", value = "claude-opus-4-6" },
 	{ label = "Sonnet 5", value = "sonnet" },

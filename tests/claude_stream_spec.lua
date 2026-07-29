@@ -2370,4 +2370,57 @@ claude.state.job_id = nil
 claude.state.queue = {}
 vim.fn.chansend = prior_chansend_s38
 
+-- ── S39: the working/waiting hint re-anchors to the buffer bottom on every
+-- tail-moving edit, same as render_queue/set_bottom_pad ───────────────────────
+-- Bug (.work/CLAUDE-PANEL-TODOS.md, "Esc to interrupt" sinks): the spinner hint
+-- only moved on the 110ms timer tick. Any other path that edits the buffer tail
+-- between ticks left the hint's extmark behind (or, per the live-reported second
+-- round, drifting PAST the new last line after remove_typing_ph's raw delete —
+-- either way it reads as sunk). Fix is two-part: buf_append (core.lua, the choke
+-- point every appender routes through) re-anchors on every call via
+-- Core.wire_reanchor_hint; remove_typing_ph/update_typing_ph (init.lua) bypass
+-- buf_append with a raw nvim_buf_set_lines edit, so each calls the same
+-- reanchor_hint directly. S39 covers the buf_append path (an aggregated-text
+-- event); S39b covers the raw-edit path directly (advisor-flagged gap — S39
+-- alone couldn't see it, since aggregated_text never exercises remove_typing_ph
+-- without a following buf_append).
+local function hint_extmark_row()
+	local marks = vim.api.nvim_buf_get_extmarks(claude.state.panel_buf, claude.state.hint_ns, 0, -1, {})
+	return marks[1] and marks[1][2] or nil
+end
+
+claude._send("s39 trigger")
+vim.wait(30)
+H.check("S39 setup: turn is working (spinner armed)", claude.state.working == true)
+
+-- One event that appends a REAL line to the buffer (aggregated assistant text),
+-- fired well inside the 110ms spinner-tick window.
+aggregated_text("s39 forces a new last line")
+
+local s39_last_row = line_count() - 1
+H.check(
+	"S39 hint re-anchors to the new last line immediately after a dispatched event",
+	hint_extmark_row() == s39_last_row,
+	"hint_row=" .. tostring(hint_extmark_row()) .. " last_row=" .. s39_last_row
+)
+
+-- S39b: drive the raw-edit path directly. remove_typing_ph deletes the trailing
+-- typing-placeholder lines with nvim_buf_set_lines, with no buf_append call to
+-- follow it up — this is the exact path the live repro hit ("Claude started
+-- typing" then sank) that S39 above cannot exercise. aggregated_text's render
+-- already removed the placeholder S0 saw; wait a full spinner tick (110ms) so
+-- the still-working turn's timer re-adds it via tick_typing_ph/add_typing_ph.
+vim.wait(150)
+H.check("S39b setup: typing placeholder present before the raw delete", claude.state.typing_ph == true)
+claude._remove_typing_ph()
+local s39b_last_row = line_count() - 1
+H.check(
+	"S39b hint re-anchors immediately after remove_typing_ph's raw delete (no buf_append follows it)",
+	hint_extmark_row() == s39b_last_row,
+	"hint_row=" .. tostring(hint_extmark_row()) .. " last_row=" .. s39b_last_row
+)
+
+claude.interrupt()
+vim.wait(30)
+
 H.summary("claude_stream")

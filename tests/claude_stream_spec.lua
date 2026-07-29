@@ -1144,7 +1144,7 @@ feed({
 })
 H.check(
 	"S23 advisor header labels the tracked advisor model",
-	panel_text():find("● Advising using Opus 4.8", 1, true) ~= nil,
+	panel_text():find("● Advising using Opus 5", 1, true) ~= nil,
 	panel_text()
 )
 -- The header marks the consult in-flight, so the compute-phase word reads

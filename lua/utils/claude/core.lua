@@ -301,6 +301,14 @@ local opts = Core.opts
 -- via Core.wire_set_bottom_pad; buf_append calls it through this forward local.
 local set_bottom_pad
 
+-- reanchor_hint is defined in init.lua (spinner/hint coupling) and wired in via
+-- Core.wire_reanchor_hint; buf_append calls it through this forward local so the
+-- working/waiting hint tracks every appended line, not just ones that pass
+-- through render.lua's dispatch. The two raw nvim_buf_set_lines edits that bypass
+-- buf_append entirely (remove_typing_ph/update_typing_ph, in init.lua) call
+-- reanchor_hint directly themselves instead.
+local reanchor_hint
+
 -- Panel width in columns, recomputed on every open so the panel tracks
 -- terminal resizes rather than freezing at the width set at creation.
 local function panel_width()
@@ -378,6 +386,15 @@ local function buf_append(lines)
 			end)
 		end
 	end
+	-- Every streaming append moves the buffer tail out from under the working/
+	-- waiting hint's extmark (same class of bug set_bottom_pad above already
+	-- guards against for the chat-bar pad). buf_append is the single choke point
+	-- every appender routes through, so re-anchoring here catches paths dispatch's
+	-- own tail-block call can't see (e.g. the typing-phase animation, which fires
+	-- off the spinner timer, not dispatch).
+	if reanchor_hint then
+		reanchor_hint()
+	end
 end
 
 -- ─── Highlight helpers ────────────────────────────────────────────────────────
@@ -435,6 +452,11 @@ Core.free_below = free_below
 --- Wire init.lua's set_bottom_pad into buf_append's auto-follow pad path.
 function Core.wire_set_bottom_pad(bottom_pad_setter)
 	set_bottom_pad = bottom_pad_setter
+end
+
+--- Wire init.lua's reanchor_hint into buf_append's per-append re-anchor path.
+function Core.wire_reanchor_hint(hint_reanchorer)
+	reanchor_hint = hint_reanchorer
 end
 
 --- Hide the cursor over a just-opened modal float. The panel's WinEnter backstop

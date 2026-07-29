@@ -3464,6 +3464,20 @@ function mod.on_diff_close()
 		vim.schedule(function()
 			mod.prompt_input()
 		end)
+	elseif state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+		-- No card owned the reopen-bar lifecycle for this resolve (diff resolved via
+		-- the winbar/<leader>ca/cx fallback or a reused editor window) — close_diff()
+		-- in claude_diff.lua never restores focus itself, so the current window is
+		-- whatever editor window the diff was mounted in. Mirrors question.lua's
+		-- fallback (:353-360) and gate.lua's (:490-496): fall back to the panel
+		-- rather than stranding focus in the editor. Live-reported 2026-07-28:
+		-- create-then-edit on the same file left focus in the reused orig window
+		-- until a manual window cycle.
+		vim.schedule(function()
+			if vim.api.nvim_win_is_valid(state.panel_win) then
+				pcall(vim.api.nvim_set_current_win, state.panel_win)
+			end
+		end)
 	end
 end
 

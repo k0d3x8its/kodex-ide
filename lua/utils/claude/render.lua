@@ -1483,7 +1483,13 @@ local function render_advisor_result(content)
 	-- Without this branch the redacted case fell into `text == nil` below and rendered
 	-- the same "Advisor unavailable" error as a genuine failure (live 2026-07-30).
 	if type(content) == "table" and content.type == "advisor_redacted_result" then
-		render_tool_result("Advisor consulted (response redacted)", false, nil)
+		-- opts.summary is what drives build_collapsed's entry.summary branch (the
+		-- green ✔ + ctrl+o-expand row) — omitting it fell through to the plain-body
+		-- branch (dim text, no checkmark), unlike the plaintext success case below.
+		render_tool_result("Advisor consulted (response redacted)", false, nil, {
+			summary = "Advisor consulted (response redacted)",
+			always_toggle = true,
+		})
 		return
 	end
 	local text = (type(content) == "table") and content.text or content

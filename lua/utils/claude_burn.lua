@@ -156,20 +156,22 @@ local GLYPH = {
 	ctx = "\239\139\155", -- U+F2DB nf-fa-microchip (context window ≈ memory)
 }
 
--- A window's live resetsAt (from note_live) more than a minute off the file's
--- resets_at for the same window means the window has rolled over since the file
--- was last written — the file's used_percentage is from the PREVIOUS window and
--- no longer describes current usage. No live signal yet this session (nil) means
--- nothing contradicts the file, so it's trusted as-is.
-local function is_stale(kind, file_resets_at)
-	local live_resets_at = live[kind]
-	if type(live_resets_at) ~= "number" then
-		return false
-	end
+-- A file resets_at already in the past means the window it describes has
+-- rolled over — the file's used_percentage is from the PREVIOUS window and no
+-- longer describes current usage. Wall-clock, not a live-vs-file comparison:
+-- live[kind] only updates when THIS session's subprocess gets a fresh
+-- rate_limit_event (i.e. after a message has been sent since rollover), so
+-- right after a rollover `live` can still hold the pre-rollover resetsAt while
+-- the file has ALREADY been refreshed by another session — a live/file
+-- mismatch there means live is the stale one, not the file (live 2026-07-30:
+-- this produced a false "?" on an already-fresh file). Comparing file_resets_at
+-- against os.time() instead is direction-agnostic and catches both the
+-- original bug (file stuck ~24h old, window long since rolled) and this one.
+local function is_stale(file_resets_at)
 	if type(file_resets_at) ~= "number" then
 		return true
 	end
-	return math.abs(live_resets_at - file_resets_at) > 60
+	return file_resets_at <= os.time()
 end
 
 -- Append one meter to `out` as a list of { text, highlight } tuples — the form
@@ -178,8 +180,11 @@ end
 -- context meter (a session fill level, not a resetting rate window). `show_bar`
 -- false → just "<glyph> <label> NN%". `stale` → the file's pct predates the
 -- current window (see is_stale); render "?" instead of a number that would read
--- as current but isn't, and prefer `live_resets_at` for the countdown since it's
--- always current even when the file's percentage isn't.
+-- as current but isn't. The countdown prefers the file's `resets_at` (it's
+-- wall-clock-verified fresh whenever `stale` is false) and falls back to
+-- `live_resets_at` only when stale or the file has none — `live` can itself
+-- lag the file right after a rollover (see is_stale's comment), so it is NOT
+-- unconditionally preferred.
 local function add_meter(out, glyph, label, pct, resets_at, show_bar, stale, live_resets_at)
 	-- vim.json.decode maps JSON null → vim.NIL (userdata, truthy), not Lua nil, so a
 	-- bare `== nil` check leaks it through to severity()/math.floor and crashes on a
@@ -196,7 +201,12 @@ local function add_meter(out, glyph, label, pct, resets_at, show_bar, stale, liv
 		out[#out + 1] = { track .. "▏ ", "ClaudeBurnTrack" }
 	end
 	out[#out + 1] = { stale and "?" or (tostring(math.floor(pct + 0.5)) .. "%"), sev }
-	local reset_source = (type(live_resets_at) == "number") and live_resets_at or resets_at
+	local reset_source
+	if not stale and type(resets_at) == "number" then
+		reset_source = resets_at
+	else
+		reset_source = (type(live_resets_at) == "number") and live_resets_at or resets_at
+	end
 	if type(reset_source) == "number" then
 		out[#out + 1] = { " ↻" .. countdown(reset_source), "ClaudeBurnReset" }
 	end
@@ -220,7 +230,7 @@ local function build(rl, cw, show_bar, show_reset)
 			rl.five_hour.used_percentage,
 			show_reset and rl.five_hour.resets_at or nil,
 			show_bar,
-			is_stale("five_hour", rl.five_hour.resets_at),
+			is_stale(rl.five_hour.resets_at),
 			live.five_hour
 		)
 	end
@@ -233,7 +243,7 @@ local function build(rl, cw, show_bar, show_reset)
 			rl.seven_day.used_percentage,
 			show_reset and rl.seven_day.resets_at or nil,
 			show_bar,
-			is_stale("seven_day", rl.seven_day.resets_at),
+			is_stale(rl.seven_day.resets_at),
 			live.seven_day
 		)
 	end

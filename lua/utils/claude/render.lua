@@ -1476,6 +1476,16 @@ local function render_advisor_result(content)
 	-- Advice arrived: the consult is over, so the compute word reverts to "Typing" as
 	-- the executor resumes composing (paired with render_advisor_header's set).
 	state.advisor_pending = false
+	-- Two success shapes seen in captured stream logs (2026-07):
+	--   { type = "advisor_result", text = "<markdown>" }             -- plaintext advice
+	--   { type = "advisor_redacted_result", encrypted_content = "" } -- server redacted
+	-- the plaintext (a safety filter on the advice itself, not a failure to consult).
+	-- Without this branch the redacted case fell into `text == nil` below and rendered
+	-- the same "Advisor unavailable" error as a genuine failure (live 2026-07-30).
+	if type(content) == "table" and content.type == "advisor_redacted_result" then
+		render_tool_result("Advisor consulted (response redacted)", false, nil)
+		return
+	end
 	local text = (type(content) == "table") and content.text or content
 	if type(text) ~= "string" or text == "" then
 		render_tool_result("Advisor unavailable", true, nil)
@@ -2053,6 +2063,13 @@ local function dispatch(event)
 	elseif ev_type == "rate_limit_event" then
 		-- Per-turn rate-limit telemetry; renders a block only on an actual limit (F5).
 		render_rate_limit(event.rate_limit_info or {})
+		-- Same telemetry also feeds the winbar burn bar's staleness check: the panel's
+		-- own --print subprocess never fires the StatusLine hook (claude_burn.lua's
+		-- state file is written by OTHER interactive CC sessions), so its used_percentage
+		-- can be a day stale while resets_at has already rolled over. This event's
+		-- resetsAt is live and account-authoritative — comparing it against the file's
+		-- resets_at for the same window is how the burn bar detects that staleness.
+		require("utils.claude_burn").note_live(event.rate_limit_info or {})
 	elseif ev_type == "system" and event.subtype == "thinking_tokens" then
 		-- Live estimated-token count while the model thinks; the spinner appends it to
 		-- the "Thinking… Xs" label (e.g. "· 111 tok"). Type-guarded like session_cost.

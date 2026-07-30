@@ -959,7 +959,14 @@ local function attach_pet(win)
 			-- Permission/question modals stay below the carrier — Clawd sits on them.
 			-- (The decision-surface gated() still drives the turn timer freeze /
 			-- "Waiting…" spinner independently — that is untouched.)
-			pet_render.setup({})
+			-- Lift Clawd above the bottom-pinned floats (subagent switcher, Task-plan
+			-- card) when he is panel-anchored; otherwise he pins to the raw panel
+			-- bottom and lands on the switcher, erasing its text.
+			pet_render.setup({
+				bottom_reserve = function()
+					return (widgets.subagent_height() or 0) + (widgets.todo_height() or 0)
+				end,
+			})
 			pet_render_primed = true
 		end
 		pet_render.attach_to_panel(win)
@@ -1349,14 +1356,11 @@ widgets.wire({
 	set_bottom_pad = set_bottom_pad,
 	panel_float_geom = panel_float_geom,
 	harden_float_scroll = harden_float_scroll,
-	-- Subagent drill-in view: hide Clawd for its duration (the tall sprite collides with
-	-- the view's text/tag at every anchor), restore him to the panel corner on close.
-	pet_hide = function()
-		pcall(pet_render.teardown)
-	end,
-	pet_show = function()
-		pcall(pet_render.attach_to_panel, state.panel_win)
-		pcall(pet_render.render_state, pet.state)
+	-- Columns Clawd occupies, so the drill-in title tag can stop short of him instead
+	-- of being erased by his winblend carrier (see pet_render.reserved_cols).
+	pet_reserved_cols = function()
+		local ok, cols = pcall(pet_render.reserved_cols)
+		return (ok and type(cols) == "number") and cols or 0
 	end,
 })
 

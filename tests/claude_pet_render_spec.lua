@@ -11,24 +11,34 @@
 
 local H = dofile("tests/helpers.lua")
 
-local pr  = require("utils.claude.pet_render")
+local pr = require("utils.claude.pet_render")
 local pet = require("utils.claude.pet")
 
 -- The 14 canonical pet states (docs/clawd-overlay-spec.md § States → assets). This
 -- is the renderer's contract with the pure machine: every state pet.resolve() can
 -- return must map to an asset.
 local STATES = {
-  "error", "diff_wait", "diff_rejected", "diff_approved", "debugging", "cleaning",
-  "reading", "subagent", "thinking", "typing", "happy", "headphones_groove",
-  "idle", "sleep",
+	"error",
+	"diff_wait",
+	"diff_rejected",
+	"diff_approved",
+	"debugging",
+	"cleaning",
+	"reading",
+	"subagent",
+	"thinking",
+	"typing",
+	"happy",
+	"headphones_groove",
+	"idle",
+	"sleep",
 }
 
 -- ── Map completeness (PR-MAP) ────────────────────────────────────────────────
 local map = pr._STATE_ASSET
 H.check("PR-MAP0 map exposed", type(map) == "table")
 for _, st in ipairs(STATES) do
-  H.check("PR-MAP " .. st .. " → nonempty asset",
-    type(map[st]) == "string" and #map[st] > 0)
+	H.check("PR-MAP " .. st .. " → nonempty asset", type(map[st]) == "string" and #map[st] > 0)
 end
 
 -- ── Disabled-path safety (PR-SAFE) ───────────────────────────────────────────
@@ -37,17 +47,14 @@ end
 local sok, enabled = pcall(pr.setup, {})
 H.check("PR-SAFE0 setup does not throw headless", sok)
 H.check("PR-SAFE1 setup returns false with no UI", enabled == false)
-H.check("PR-SAFE2 pet.render left as the pure stub (no renderer wired)",
-  pet.render(nil, nil) == nil)
+H.check("PR-SAFE2 pet.render left as the pure stub (no renderer wired)", pet.render(nil, nil) == nil)
 
 for _, st in ipairs(STATES) do
-  H.check("PR-SAFE render_state(" .. st .. ") no-op",
-    pcall(pr.render_state, st, "sleep"))
+	H.check("PR-SAFE render_state(" .. st .. ") no-op", pcall(pr.render_state, st, "sleep"))
 end
 H.check("PR-SAFE3 attach_to_panel no-op", pcall(pr.attach_to_panel, nil))
 H.check("PR-SAFE4 attach_to_chat no-op", pcall(pr.attach_to_chat, nil))
 H.check("PR-SAFE5 teardown no-op", pcall(pr.teardown))
-
 
 -- Pure placement contract for surfaces, statusline, and idle normalization.
 -- win_get_position row = the BORDER row of a bordered float. Raw frames: the pet
@@ -67,6 +74,15 @@ H.check("PR-GEOM0b padded surface overlaps the border row", sgo.row == 42)
 H.check("PR-GEOM0c padded float bottom row is the border row", sgo.row + 9 - 1 == 50)
 local pg = pr._placed_geom("panel", 2, 80, 40, 50, 12, 8)
 H.check("PR-GEOM2 panel sits above statusline", pg.row == 44)
+-- Bottom-pinned floats (subagent switcher / Task-plan card) own the last `reserve`
+-- rows of the panel. Without lifting past them Clawd pins to the raw panel bottom and
+-- lands ON the switcher, erasing its text (winblend carrier deletes overlapped glyphs,
+-- it does not cover them). Surface mode must NOT lift — there the anchor is already
+-- the float he should stand on.
+local pgr = pr._placed_geom("panel", 2, 80, 40, 50, 12, 8, 0, false, 4)
+H.check("PR-GEOM2b panel lifts above the bottom-float reserve", pgr.row == 40)
+local sgr = pr._placed_geom("surface", 50, 80, 40, 3, 12, 8, 0, false, 4)
+H.check("PR-GEOM2c surface placement ignores the reserve", sgr.row == 42)
 local ix, iy, iw, ih = pr._frame_placement("idle", 96, 64, 8, 16)
 H.check("PR-SCALE0 idle is half-width", iw == 6)
 H.check("PR-SCALE1 idle is half-height", ih == 2)

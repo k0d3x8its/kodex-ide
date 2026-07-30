@@ -8,7 +8,7 @@
 -- init for now — they depend on the tool_result render foundation and will move
 -- together with it into the render module (Goal 15.7).
 --
--- Dependencies: core.state, and three init-owned float/pad helpers injected via
+-- Dependencies: core.state, and the init-owned float/pad helpers injected via
 -- Widgets.wire{} (they couple to init's chat-bar/float machinery; injection avoids
 -- a require cycle and lets 15.5/15.7 re-home them with a one-line change here).
 
@@ -23,16 +23,14 @@ local state = core.state
 local set_bottom_pad
 local panel_float_geom
 local harden_float_scroll
-local pet_hide -- tear Clawd down while the subagent view is open
-local pet_show -- restore Clawd to his panel-corner home
+local pet_reserved_cols -- columns Clawd occupies; the drill-in tag must not share them
 
 --- Inject init's float/pad helpers. Called once from init after they are defined.
 function Widgets.wire(hooks)
 	set_bottom_pad = hooks.set_bottom_pad
 	panel_float_geom = hooks.panel_float_geom
 	harden_float_scroll = hooks.harden_float_scroll
-	pet_hide = hooks.pet_hide
-	pet_show = hooks.pet_show
+	pet_reserved_cols = hooks.pet_reserved_cols
 end
 
 -- Cap on how many display rows the overlay grows to (opts.at mode) before it stops
@@ -371,12 +369,24 @@ function Widgets.subagent_height()
 	return (state.subagents and #state.subagents > 0) and (state.subagent_h or 0) or 0
 end
 
+-- Absolute SW `row` that sits a float flush against the panel's bottom edge, taken
+-- from the PANEL WINDOW's own geometry. The old `vim.o.lines - 2` assumed exactly one
+-- statusline plus one cmdline row, so at cmdheight=0 every bottom float drifted a row
+-- (see subagent_bar_position). Falls back to the old expression only when the panel
+-- is gone, where there is no better answer.
+local function panel_bottom_row()
+	if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+		return vim.api.nvim_win_get_position(state.panel_win)[1] + vim.api.nvim_win_get_height(state.panel_win)
+	end
+	return vim.o.lines - 2
+end
+
 -- SW `row` for a bottom float (chat bar / permission / question / diff): the
 -- panel bottom, lifted above the Task-plan card AND the subagent switcher when
 -- either is visible. Single source so every float + the resize handler stack
 -- consistently. Bottom-to-top: subagent switcher, Task-plan card, then floats.
 function Widgets.float_bottom_row()
-	return vim.o.lines - 2 - Widgets.subagent_height() - Widgets.todo_height()
+	return panel_bottom_row() - Widgets.subagent_height() - Widgets.todo_height()
 end
 
 -- Close the task-list widget float (kept buffer is reused on next open).
@@ -393,6 +403,27 @@ function Widgets.close_todo_widget()
 	state.todo_done_pending = false
 end
 
+-- Position fields for the subagent switcher bar, anchored to the PANEL WINDOW rather
+-- than an absolute `vim.o.lines - 2` row. That expression assumes exactly one
+-- statusline plus one cmdline row: at cmdheight=0 the bar rendered one row too high
+-- and its top border -- which carries the " ◇ Subagents " title -- was painted over by
+-- the drill-in view's bottom border; at cmdheight=2 it left a blank gap row instead.
+-- Letting nvim resolve the anchor against the panel is correct for every
+-- cmdheight/laststatus/tabline combination (36/36 on the rendered-frame sweep).
+--
+-- NOTE: no `make test` spec can catch a regression here -- it is a paint fact, and the
+-- geometry APIs report pre-clamp values (see global KNOWLEDGE.md). The proof lives in
+-- tests/screen/; the spec assertion only guards the config SHAPE.
+local function subagent_bar_position()
+	return {
+		relative = "win",
+		win = state.panel_win,
+		anchor = "SW",
+		row = vim.api.nvim_win_get_height(state.panel_win),
+		col = 0,
+	}
+end
+
 -- Lift every currently-open bottom float above the task widget and re-reserve
 -- transcript space. Called when the widget appears / changes height while floats
 -- are already open (their open-time row is otherwise stale).
@@ -400,14 +431,20 @@ function Widgets.reflow_bottom_floats()
 	-- Re-place the bottom-pinned cards first so their offsets are current: the
 	-- subagent switcher pins to the very bottom, the Task-plan card lifts above it.
 	-- (Both otherwise keep their open-time row, stale once the other appears.)
-	if state.subagent_win and vim.api.nvim_win_is_valid(state.subagent_win) then
+	if
+		state.subagent_win
+		and vim.api.nvim_win_is_valid(state.subagent_win)
+		and state.panel_win
+		and vim.api.nvim_win_is_valid(state.panel_win)
+	then
 		local c = vim.api.nvim_win_get_config(state.subagent_win)
-		c.row = vim.o.lines - 2
+		local position = subagent_bar_position()
+		c.relative, c.win, c.row, c.col = position.relative, position.win, position.row, position.col
 		pcall(vim.api.nvim_win_set_config, state.subagent_win, c)
 	end
 	if state.todo_win and vim.api.nvim_win_is_valid(state.todo_win) then
 		local c = vim.api.nvim_win_get_config(state.todo_win)
-		c.row = vim.o.lines - 2 - Widgets.subagent_height()
+		c.row = panel_bottom_row() - Widgets.subagent_height()
 		pcall(vim.api.nvim_win_set_config, state.todo_win, c)
 	end
 	local row = Widgets.float_bottom_row()
@@ -560,7 +597,7 @@ function Widgets.update_todo_widget()
 		relative = "editor",
 		anchor = "SW",
 		-- Lift above the subagent switcher (bottommost card) when it is visible.
-		row = vim.o.lines - 2 - Widgets.subagent_height(),
+		row = panel_bottom_row() - Widgets.subagent_height(),
 		col = col,
 		width = math.max(w - 2, 1),
 		height = #lines,
@@ -855,12 +892,14 @@ function Widgets.update_subagent_bar()
 	-- reserve the full bordered height and everything stacks above the top border.
 	state.subagent_h = #lines + 2
 
-	local col, w = panel_float_geom()
+	local _, w = panel_float_geom()
+	local position = subagent_bar_position()
 	local cfg = {
-		relative = "editor",
-		anchor = "SW",
-		row = vim.o.lines - 2,
-		col = col,
+		relative = position.relative,
+		win = position.win,
+		anchor = position.anchor,
+		row = position.row,
+		col = position.col,
 		width = math.max(w - 2, 1),
 		height = #lines,
 		style = "minimal",
@@ -1158,10 +1197,6 @@ function Widgets.close_subagent_view()
 	state.subagent_view_win = nil
 	state.subagent_view = nil
 	state.subagent_view_h = nil
-	-- View gone → Clawd returns to his panel-corner home.
-	if pet_show then
-		pet_show()
-	end
 end
 
 -- Pin the green title tag to the BOTTOM-right corner of the drill-in view (just
@@ -1170,7 +1205,14 @@ end
 local function open_subagent_tag(sub, view_row, view_col, view_w)
 	-- The tag shows the subagent TITLE (its description), matching the CC-TUI.
 	local title = sub.desc or sub.kind or "subagent"
-	local label = " " .. trunc_display(title, math.max(view_w - 4, 8)) .. " "
+	-- Stop short of Clawd rather than running under him. He stands on this same
+	-- bottom-border row, and his carrier is winblend=100 — nvim blends it against the
+	-- BASE window, not this float, so any cell they share has its glyphs ERASED, not
+	-- covered (live-reported as "the sprite's grey background hides the title"; it is
+	-- erasure, so no highlight change can fix it). Reserving his columns keeps the
+	-- whole title readable with him sitting immediately to its right.
+	local reserved_cols = (pet_reserved_cols and pet_reserved_cols()) or 0
+	local label = " " .. trunc_display(title, math.max(view_w - 4 - reserved_cols, 8)) .. " "
 	local buf = state.subagent_tag_buf
 	if not (buf and vim.api.nvim_buf_is_valid(buf)) then
 		buf = vim.api.nvim_create_buf(false, true)
@@ -1179,12 +1221,12 @@ local function open_subagent_tag(sub, view_row, view_col, view_w)
 	vim.bo[buf].modifiable = true
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, { label })
 	vim.bo[buf].modifiable = false
-	local tw = math.min(vim.fn.strdisplaywidth(label), math.max(view_w - 2, 4))
+	local tw = math.min(vim.fn.strdisplaywidth(label), math.max(view_w - 2 - reserved_cols, 4))
 	local cfg = {
 		relative = "editor",
 		anchor = "NE",
 		row = view_row,
-		col = view_col + view_w,
+		col = view_col + view_w - reserved_cols,
 		width = tw,
 		height = 1,
 		style = "minimal",
@@ -1308,15 +1350,12 @@ function Widgets.open_subagent_view(i)
 	end, { buffer = buf, noremap = true, silent = true, desc = "Claude: cycle subagent views" })
 	open_subagent_tag(sub, prow + total_h - 1, col, w) -- bottom-right border corner
 	state.subagent_view = i
-	-- Hide Clawd while the view is open. The ~8-row sprite collides with EITHER the
-	-- view's top transcript text (top anchor) or its bottom-right title tag (any bottom
-	-- anchor) no matter where it lands, and this whole floating view is transitional —
-	-- the multi-session redesign replaces it with real interactive tabs, where the pet
-	-- gets proper per-window placement + focus-driven activity state. Hiding is the
-	-- zero-collision interim; pet_show restores him on view close.
-	if pet_hide then
-		pet_hide()
-	end
+	-- Clawd deliberately STAYS visible over the drill-in view (user call, 2026-07-29).
+	-- The old pet_hide()/pet_show() pair is gone: it never worked — teardown() leaves
+	-- `ready` true, so the next pet.emit from the still-running subagent rebuilt him
+	-- anyway, and rebuilding wiped current_asset/hold_cycle/pending_state, which is why
+	-- the subagent activity animation stopped showing on drill-in. Collision with the
+	-- title tag is handled by open_subagent_tag reserving his columns instead.
 	-- Land at the bottom (latest activity), like a live transcript.
 	pcall(vim.api.nvim_win_set_cursor, state.subagent_view_win, { vim.api.nvim_buf_line_count(buf), 0 })
 end

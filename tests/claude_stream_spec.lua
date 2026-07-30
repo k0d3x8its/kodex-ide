@@ -1251,6 +1251,59 @@ H.check(
 	panel_text()
 )
 
+-- ── S23b: server-redacted advisor result (advisor_redacted_result) ─────────────
+-- A second success shape distinct from advisor_result: the server redacts the
+-- reply (encrypted_content, no .text) — a successful consult, not a failure, so
+-- it must NOT fall into the "Advisor unavailable" error branch (live 2026-07-30
+-- bug: it did, before this shape got its own branch). Rendered as a standalone
+-- checkmark line rather than through the summary-collapse branch (build_collapsed)
+-- because there is no fuller body to expand to — assert the false "ctrl+o to
+-- expand" affordance from the plaintext case above is absent here.
+claude.state.think_start = nil
+claude.state.tool_run = nil
+claude.state.advisor_model = "opus"
+local s23b_start = line_count()
+feed({
+	type = "assistant",
+	message = { content = { {
+		type = "server_tool_use",
+		id = "srvtoolu_3",
+		name = "advisor",
+		input = {},
+	} } },
+})
+feed({
+	type = "assistant",
+	message = {
+		content = {
+			{
+				type = "advisor_tool_result",
+				tool_use_id = "srvtoolu_3",
+				content = { type = "advisor_redacted_result", encrypted_content = "" },
+			},
+		},
+	},
+})
+-- Scope to lines added by THIS block — the buffer is shared with earlier S23
+-- cases, which already put "Advisor unavailable" and "ctrl+o to expand" text
+-- higher up, so a whole-panel_text() search would false-pass/fail on those.
+local s23b_new = table.concat(vim.api.nvim_buf_get_lines(claude.state.panel_buf, s23b_start, -1, false), "\n")
+H.check(
+	"S23b redacted result does NOT show 'Advisor unavailable'",
+	s23b_new:find("Advisor unavailable", 1, true) == nil,
+	s23b_new
+)
+H.check(
+	"S23b redacted result shows the checkmark + redacted line",
+	s23b_new:find("✔ Advisor consulted %(response redacted%)", 1, false) ~= nil,
+	s23b_new
+)
+H.check(
+	"S23b redacted result has no expand affordance (nothing to expand to)",
+	s23b_new:find("ctrl+o to expand", 1, true) == nil,
+	s23b_new
+)
+
 -- ── S24: live thinking-token count collapses to K past 1,100 ───────────────────
 -- Below the 1,100 threshold the raw integer shows; at/above it collapses to a
 -- one-decimal "K" form (uppercase K, by request). Boundary + representative cases.

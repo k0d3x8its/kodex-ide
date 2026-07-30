@@ -160,6 +160,13 @@ local cfg = {
 }
 local image -- the image.nvim module, once loaded
 local ready = false -- setup succeeded (image.nvim + a UI present)
+
+-- Rows at the panel bottom already claimed by pinned floats (subagent switcher,
+-- Task-plan card). Injected by setup() so this module keeps no dependency on
+-- core.state. See placed_geom's `reserve`.
+local bottom_reserve = function()
+	return 0
+end
 local cache_root -- stdpath("cache")/kodex_clawd/<skin>
 
 local pet_win, pet_buf
@@ -257,7 +264,12 @@ local X_PAD = {
 	["typing"] = 3,
 }
 
-local function placed_geom(mode, wrow, wcol, ww, wh, pw, ph, pad, overlap)
+-- `reserve` (panel mode only): rows at the panel bottom already owned by pinned floats
+-- — the subagent switcher and the Task-plan card. Without it Clawd pins to the raw
+-- panel bottom and lands ON the switcher, erasing its text (his carrier is winblend, so
+-- overlapped glyphs are deleted, not covered). Surface mode doesn't need it: there the
+-- anchor IS the float he should sit on.
+local function placed_geom(mode, wrow, wcol, ww, wh, pw, ph, pad, overlap, reserve)
 	local col = wcol + ww - pw - (pad or 0)
 	local row
 	if mode == "surface" then
@@ -273,7 +285,7 @@ local function placed_geom(mode, wrow, wcol, ww, wh, pw, ph, pad, overlap)
 		row = wrow - ph + (overlap and 1 or 0)
 	else
 		-- The statusline begins immediately after the normal panel content.
-		row = wrow + wh - ph
+		row = wrow + wh - ph - (reserve or 0)
 	end
 	return { row = math.max(row, 0), col = math.max(col, 0), width = pw, height = ph }
 end
@@ -299,7 +311,8 @@ local function anchor_geom()
 		pw,
 		ph,
 		current_asset and X_PAD[current_asset] or 0,
-		active_place and active_place.pad or false
+		active_place and active_place.pad or false,
+		anchor.mode == "panel" and bottom_reserve() or 0
 	)
 end
 
@@ -984,6 +997,26 @@ end
 -- Tear everything down: stop timers, delete the kitty image, drop the frame cache
 -- (its Image objects are bound to the window we're closing), close the float.
 -- Called on panel close / session reset so no artifact survives.
+--- Columns to keep clear of Clawd (0 when he can't render at all).
+--- Anything drawing on a row he overlaps MUST avoid these: the carrier is
+--- winblend=100, and nvim's compositor blends it against the BASE window rather than
+--- the float underneath, so overlapped glyphs are ERASED, not merely covered. Colour
+--- changes cannot fix that — only not sharing the cells can. Used by the subagent
+--- drill-in title tag, which sits on the same bottom-border row he stands on.
+---
+--- Deliberately the CONFIGURED ceiling, not the live window width. Callers reserve
+--- once and are never re-run when the sprite swaps to a wider asset or when the pet's
+--- scheduled attach lands after them (open_subagent_tag fires only from
+--- open_subagent_view/fit_subagent_view). A live width would read 0 before the attach
+--- and go stale on every asset change — a reservation that silently collapses is worse
+--- than one that over-reserves by a couple of columns.
+function M.reserved_cols()
+	if not (ready and cfg.enabled) then
+		return 0
+	end
+	return cfg.width
+end
+
 function M.teardown()
 	swap_timer = stop_timer(swap_timer)
 	idle_timer = stop_timer(idle_timer)
@@ -1023,6 +1056,9 @@ function M.setup(opts)
 	cfg.height = opts.height or cfg.height
 	if opts.enabled ~= nil then
 		cfg.enabled = opts.enabled
+	end
+	if type(opts.bottom_reserve) == "function" then
+		bottom_reserve = opts.bottom_reserve
 	end
 	cache_root = vim.fn.stdpath("cache") .. "/kodex_clawd/" .. cfg.skin
 

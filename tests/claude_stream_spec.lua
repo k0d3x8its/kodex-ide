@@ -1655,14 +1655,22 @@ if panel and vim.api.nvim_win_is_valid(panel) then
 		tostring(vim.api.nvim_get_current_win())
 	)
 	claude.state.diff_card = nil
-	-- The subagent drill-in view routes through active_modal_win too, so the cursor
-	-- backstop hides its cursor and a panel click can't strand it (user-reported
-	-- stray cursor 2026-07-14).
+	-- The subagent drill-in view is in active_modal_win (so the cursor backstop hides
+	-- its cursor — user-reported stray cursor 2026-07-14) but NOT in the focus-trap
+	-- set. It owes no decision, and trapping it made <A-w>/<C-w>w cycle onto the panel
+	-- and bounce straight back, so the editor was unreachable (live 2026-07-29).
 	claude.state.subagent_view_win = mwin
 	H.check(
 		"S29 active_modal_win sees the subagent drill-in view",
 		claude._active_modal_win() == mwin,
 		tostring(claude._active_modal_win())
+	)
+	vim.api.nvim_set_current_win(panel)
+	vim.wait(50)
+	H.check(
+		"S29b drill-in view does NOT trap the panel (window cycling stays possible)",
+		vim.api.nvim_get_current_win() == panel,
+		tostring(vim.api.nvim_get_current_win())
 	)
 	claude.state.subagent_view_win = nil
 	-- Once the modal is gone the panel is no longer trapped.

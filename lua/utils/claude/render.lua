@@ -1455,6 +1455,10 @@ end
 -- The canned one-line collapsed summary, verbatim from the CC TUI's advisor block.
 -- Unverified against a real (non-mock) consult — update if the live wording differs.
 local ADVISOR_SUMMARY = "Advisor has reviewed the conversation and will apply the feedback"
+-- Shown for a server-redacted consult (advisor_redacted_result) — no fuller body
+-- exists to expand to, so this renders as a standalone checkmark line rather than
+-- through render_tool_result's summary branch (see render_advisor_result below).
+local ADVISOR_REDACTED_SUMMARY = "Advisor consulted (response redacted)"
 local function render_advisor_header()
 	-- Mark the advisor call in-flight so the compute-phase word reads "Consulting"
 	-- (not "Typing") until the advice arrives. Cleared in render_advisor_result and,
@@ -1483,13 +1487,32 @@ local function render_advisor_result(content)
 	-- Without this branch the redacted case fell into `text == nil` below and rendered
 	-- the same "Advisor unavailable" error as a genuine failure (live 2026-07-30).
 	if type(content) == "table" and content.type == "advisor_redacted_result" then
-		-- opts.summary is what drives build_collapsed's entry.summary branch (the
-		-- green ✔ + ctrl+o-expand row) — omitting it fell through to the plain-body
-		-- branch (dim text, no checkmark), unlike the plaintext success case below.
-		render_tool_result("Advisor consulted (response redacted)", false, nil, {
-			summary = "Advisor consulted (response redacted)",
-			always_toggle = true,
-		})
+		-- Rendered directly rather than via render_tool_result's summary branch:
+		-- that branch (build_collapsed, entry.summary case) unconditionally appends
+		-- "(ctrl+o to expand)" to advertise a fuller body — there is none here (the
+		-- server redacted it), so routing through it would promise an expand that
+		-- reveals the identical one-line sentence. This mirrors the checkmark
+		-- styling (green ✔ via ClaudeAdvisor) without the false affordance.
+		local buf = state.panel_buf
+		if buf and vim.api.nvim_buf_is_valid(buf) then
+			local last = vim.api.nvim_buf_line_count(buf)
+			if last > 0 and vim.api.nvim_buf_get_lines(buf, last - 1, last, false)[1] == "" then
+				vim.bo[buf].modifiable = true
+				vim.api.nvim_buf_set_lines(buf, last - 1, last, false, {})
+				vim.bo[buf].modifiable = false
+			end
+			local check_width = #"✔"
+			local first = vim.api.nvim_buf_line_count(buf)
+			buf_append({ RES_CORNER .. "✔ " .. ADVISOR_REDACTED_SUMMARY })
+			apply_line_hls(buf, first, {
+				{
+					{ 0, #RES_CORNER, "ClaudeDim" },
+					{ #RES_CORNER, #RES_CORNER + check_width, "ClaudeAdvisor" },
+					{ #RES_CORNER + check_width, -1, "ClaudeDim" },
+				},
+			})
+			buf_append({ "" })
+		end
 		return
 	end
 	local text = (type(content) == "table") and content.text or content

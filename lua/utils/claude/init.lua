@@ -876,7 +876,10 @@ mod._gated = gated
 -- question, diff) keep their win in state; the effort/advisor pickers expose it via
 -- a win() accessor. Priority order is topmost-first, but only one is ever open at a
 -- time (the perm queue serializes), so the first valid hit is correct.
-local function active_modal_win()
+-- Decision surfaces the focus trap must keep key control of: the permission/question/
+-- diff cards plus the effort/advisor pickers. Each of these still OWES an answer, so
+-- stranding one leaves the user unable to resolve it.
+local function trapped_modal_win()
 	-- `or false` placeholders: a bare { state.perm, state.qask, state.diff_card }
 	-- leaves a HOLE at any nil slot and ipairs STOPS there — with no perm card up,
 	-- the question/diff cards were never reached, so the focus-trap and cursor
@@ -887,14 +890,26 @@ local function active_modal_win()
 			return m.win
 		end
 	end
-	local w = effort.win() or advisor.win()
-	if w and vim.api.nvim_win_is_valid(w) then
-		return w
+	local picker_win = effort.win() or advisor.win()
+	if picker_win and vim.api.nvim_win_is_valid(picker_win) then
+		return picker_win
 	end
-	-- The subagent drill-in view is a focusable read-only float too: routing it
-	-- through here hides its cursor (the backstop keys on active_modal_win) — a stray
-	-- block cursor in the transcript was user-reported 2026-07-14 — and keeps a panel
-	-- click from stranding it. q/<Esc> still close it.
+	return nil
+end
+
+-- Windows the CURSOR BACKSTOP hides the cursor in: every trapped modal above, PLUS the
+-- subagent drill-in view. The view is a focusable read-only float, so it does need the
+-- hidden cursor (a stray block cursor in its transcript was user-reported 2026-07-14)
+-- — but it must NOT be focus-trapped, which is why this is a separate set. The view
+-- owes no answer, and trapping it meant <A-w>/<C-w>w cycled onto the panel and got
+-- bounced straight back, ping-ponging view→panel→view so the editor was unreachable
+-- (live-reported 2026-07-29: "not able to cycle through the windows anymore").
+-- q/<Esc> close it and <C-b> cycles subagents as before.
+local function active_modal_win()
+	local trapped = trapped_modal_win()
+	if trapped then
+		return trapped
+	end
 	if state.subagent_view_win and vim.api.nvim_win_is_valid(state.subagent_view_win) then
 		return state.subagent_view_win
 	end
@@ -2846,7 +2861,10 @@ local function open_panel_window(buf)
 			if not state.claude_active then
 				return
 			end
-			local mwin = active_modal_win()
+			-- trapped_modal_win, NOT active_modal_win: the subagent drill-in view is in
+			-- the latter (for cursor hiding) but must stay leavable, else cycling onto
+			-- the panel bounces straight back to it.
+			local mwin = trapped_modal_win()
 			if not mwin then
 				focuslog("enter:no-modal")
 				return

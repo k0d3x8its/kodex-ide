@@ -315,10 +315,39 @@ H.check("U6 one main row + two subagent rows (one wrapped onto an extra line)", 
 -- ── U7: subagent_height reserves space; float_bottom_row lifts above it ─────────
 
 H.check("U7 subagent_height > 0 while the bar is shown", widgets.subagent_height() > 0)
+-- Base is the PANEL WINDOW's bottom edge, not `vim.o.lines - 2` — that expression
+-- assumed one statusline + one cmdline row and drifted every bottom float by a row at
+-- cmdheight=0, leaving a visible gap between the permission modal and the switcher.
 H.check(
-	"U7 float_bottom_row lifted by the full bar height",
-	widgets.float_bottom_row() == vim.o.lines - 2 - widgets.subagent_height() - widgets.todo_height()
+	"U7 float_bottom_row lifted by the full bar height, off the panel's bottom edge",
+	widgets.float_bottom_row()
+		== vim.api.nvim_win_get_position(claude.state.panel_win)[1]
+			+ vim.api.nvim_win_get_height(claude.state.panel_win)
+			- widgets.subagent_height()
+			- widgets.todo_height()
 )
+
+-- ── U7b: the bar is anchored to the PANEL WINDOW, not an absolute screen row ───
+-- Shape guard only, NOT coverage: this cannot catch the bug it protects against.
+-- The bar used `row = vim.o.lines - 2`, which assumes exactly one statusline plus one
+-- cmdline row; at cmdheight=0 it rendered one row high and the drill-in view's bottom
+-- border painted over the bar's titled top border. That is a PAINT fact -- and the
+-- geometry APIs report pre-clamp values, so no headless assertion can observe it.
+-- Proof lives in tests/screen/. This fires only if someone reverts the anchor to an
+-- absolute row.
+do
+	local bar_config = vim.api.nvim_win_get_config(claude.state.subagent_win)
+	H.check(
+		"U7b bar is positioned relative to the panel window",
+		bar_config.relative == "win",
+		"relative=" .. tostring(bar_config.relative)
+	)
+	H.check(
+		"U7b bar's anchor window is the panel",
+		bar_config.win == claude.state.panel_win,
+		"win=" .. tostring(bar_config.win) .. " panel_win=" .. tostring(claude.state.panel_win)
+	)
+end
 
 -- ── U8: selection glyph tracks state.subagent_sel ──────────────────────────────
 

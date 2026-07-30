@@ -39,9 +39,11 @@ H.check("all-null state does not crash", ok, not ok and res)
 H.check("all-null state yields no meters", ok and res == nil, res)
 
 -- 2. Mixed: one real meter, the rest null. The real one renders; null ones are
---    silently skipped (not crashed on).
+--    silently skipped (not crashed on). resets_at is a real future timestamp
+--    (not null) so this case isn't ALSO exercising staleness (see cases 3/4) —
+--    an unknown/null resets_at can't be verified fresh and is its own case.
 write_state(
-	[[{"rate_limits":{"five_hour":{"used_percentage":92,"resets_at":null},"seven_day":null},"context_window":{"used_percentage":null}}]]
+	[[{"rate_limits":{"five_hour":{"used_percentage":92,"resets_at":9999999999},"seven_day":null},"context_window":{"used_percentage":null}}]]
 )
 local ok2, res2 = pcall(burn.chunks, 80)
 H.check("mixed state does not crash", ok2, not ok2 and res2)
@@ -57,14 +59,17 @@ if ok2 and type(res2) == "table" then
 end
 H.check("92% meter tagged Crit", has_crit, res2)
 
--- 3. Live rate_limit_event telemetry (note_live) disagrees with the file's
---    resets_at for the same window → the window rolled over since the file was
---    last written, so the file's used_percentage is stale. Renders "?" tagged
---    ClaudeBurnStale instead of the misleadingly-precise "92%"/Crit.
+-- 3. The file's resets_at is already in the past (wall-clock, not a live-vs-
+--    file comparison — see claude_burn.lua's is_stale comment for why: a live
+--    resetsAt lagging the file right after a rollover would otherwise read as
+--    "file is stale" when the file is actually the fresh one, live 2026-07-30
+--    false-"?" bug). A past resets_at means the window it describes has
+--    rolled over, so the file's used_percentage is stale. Renders "?" tagged
+--    ClaudeBurnStale instead of the misleadingly-precise "92%"/Crit. note_live
+--    is deliberately NOT called here — staleness no longer depends on it.
 write_state(
 	[[{"rate_limits":{"five_hour":{"used_percentage":92,"resets_at":1000},"seven_day":null},"context_window":{"used_percentage":null}}]]
 )
-burn.note_live({ rateLimitType = "five_hour", resetsAt = 5000 })
 local ok3, res3 = pcall(burn.chunks, 80)
 H.check("stale window does not crash", ok3, not ok3 and res3)
 local has_stale, has_crit3, has_question = false, false, false
@@ -84,10 +89,14 @@ end
 H.check("stale window tagged ClaudeBurnStale, not Crit", has_stale and not has_crit3, res3)
 H.check("stale window renders '?' not the stale percentage", has_question, res3)
 
--- 4. Live resetsAt agrees with the file's (same window, well within tolerance) →
---    not stale, the real percentage still renders.
+-- 4. The file's resets_at is in the future (window still active) → not stale,
+--    the real percentage still renders, REGARDLESS of what a stale live cache
+--    says — this is the exact false-"?" regression case: live still holds an
+--    old (already-past) resetsAt from before a rollover this session hasn't
+--    sent a message since, while the file has already been refreshed for the
+--    new window. The file's own future resets_at must win.
 write_state(
-	[[{"rate_limits":{"five_hour":{"used_percentage":92,"resets_at":1000},"seven_day":null},"context_window":{"used_percentage":null}}]]
+	[[{"rate_limits":{"five_hour":{"used_percentage":92,"resets_at":9999999999},"seven_day":null},"context_window":{"used_percentage":null}}]]
 )
 burn.note_live({ rateLimitType = "five_hour", resetsAt = 1000 })
 local ok4, res4 = pcall(burn.chunks, 80)
@@ -99,7 +108,7 @@ if ok4 and type(res4) == "table" then
 		end
 	end
 end
-H.check("agreeing live resetsAt keeps the real percentage (Crit)", has_crit4, res4)
+H.check("future file resets_at keeps the real percentage even with a stale live cache", has_crit4, res4)
 
 vim.fn.delete(STATE)
 H.summary("claude_burn")

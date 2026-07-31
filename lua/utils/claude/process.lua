@@ -422,7 +422,9 @@ local function dispatch_send(text)
 	state.pause_t0 = nil -- not currently paused on a decision modal
 	state.activity_t0 = vim.loop.now() -- baseline for the first thinking block's timer
 	state.think_dur = nil -- no stale duration from a prior turn
-	state.think_tokens = 0
+	state.think_tokens = 0 -- live in-flight estimate for the current message
+	state.think_base = 0 -- prior thinking block(s)' total within the current message
+	state.turn_output_tokens = 0 -- committed total across every message_delta this turn
 	state.tool_run = nil
 	-- One flavour word per REQUEST, fixed for the whole turn (like the official
 	-- TUI) — picked here, NOT rotated mid-turn while thinking/working. Store the

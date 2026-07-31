@@ -173,14 +173,14 @@ H.check(
 
 -- ── S4: the randomizer bracket carries NO phase word (timing + tokens only) ────
 -- The phase moved OUT of the bracket onto the activity line / cornered block. The
--- bracket keeps the climbing timer and, during thinking, the token count — but
--- never the words "thinking" / "typing" / a tool label. The activity WORD tracks
--- the phase (Thinking during a think block, else Typing).
+-- bracket keeps the climbing timer and the turn's running output-token count —
+-- but never the words "thinking" / "typing" / a tool label. The activity WORD
+-- tracks the phase (Thinking during a think block, else Typing).
 
 claude.state.think_start = vim.loop.now()
-claude.state.think_tokens = 111
+claude.state.turn_output_tokens = 111
 local lbl = claude._spinner_label() or ""
-H.check("S4 bracket shows the token count during thinking", lbl:find("111", 1, true) ~= nil, lbl)
+H.check("S4 bracket shows the turn's running token count", lbl:find("111", 1, true) ~= nil, lbl)
 H.check(
 	"S4 bracket carries no phase word",
 	not lbl:find("thinking", 1, true) and not lbl:find("Typing", 1, true) and not lbl:find("typing", 1, true),
@@ -188,7 +188,7 @@ H.check(
 )
 H.check("S4 activity word reflects the thinking phase", claude._activity_word() == "Thinking", claude._activity_word())
 claude.state.think_start = nil
-claude.state.think_tokens = 0
+claude.state.turn_output_tokens = 0
 local pet = require("utils.claude.pet")
 pet.cond.work = nil
 H.check(
@@ -1304,24 +1304,118 @@ H.check(
 	s23b_new
 )
 
--- ── S24: live thinking-token count collapses to K past 1,100 ───────────────────
+-- ── S24: live turn-output-token count collapses to K past 1,100 ────────────────
 -- Below the 1,100 threshold the raw integer shows; at/above it collapses to a
 -- one-decimal "K" form (uppercase K, by request). Boundary + representative cases.
 H.check(
 	"S24 sub-threshold token count stays a raw integer",
-	claude._fmt_think_tokens(632) == "632",
-	claude._fmt_think_tokens(632)
+	claude._fmt_turn_tokens(632) == "632",
+	claude._fmt_turn_tokens(632)
 )
-H.check("S24 just below 1,100 stays raw", claude._fmt_think_tokens(1099) == "1099", claude._fmt_think_tokens(1099))
-H.check("S24 exactly 1,100 collapses to 1.1K", claude._fmt_think_tokens(1100) == "1.1K", claude._fmt_think_tokens(1100))
-H.check("S24 2504 → 2.5K", claude._fmt_think_tokens(2504) == "2.5K", claude._fmt_think_tokens(2504))
+H.check("S24 just below 1,100 stays raw", claude._fmt_turn_tokens(1099) == "1099", claude._fmt_turn_tokens(1099))
+H.check("S24 exactly 1,100 collapses to 1.1K", claude._fmt_turn_tokens(1100) == "1.1K", claude._fmt_turn_tokens(1100))
+H.check("S24 2504 → 2.5K", claude._fmt_turn_tokens(2504) == "2.5K", claude._fmt_turn_tokens(2504))
 -- And the spinner bracket actually uses it (not the raw %d anymore).
 claude.state.think_start = vim.loop.now()
-claude.state.think_tokens = 2504
+claude.state.turn_output_tokens = 2504
 local klbl = claude._spinner_label() or ""
 H.check("S24 spinner bracket shows the K-form token count", klbl:find("2.5K tokens", 1, true) ~= nil, klbl)
 claude.state.think_start = nil
+claude.state.turn_output_tokens = 0
+
+-- ── S24b: turn_output_tokens SUMS across message_delta events, not overwrites ───
+-- A turn spans several assistant messages (text → tool_use → tool_result → text);
+-- message_delta fires once per message with THAT message's own output_tokens, not
+-- a running turn total. If the dispatch replaced instead of accumulated, the count
+-- would jump back down at every message boundary (live 2026-07-30 bug this
+-- replaces: the old thinking-only counter froze during tool-run phases entirely).
+claude.state.turn_output_tokens = 0
+feed({ type = "stream_event", event = { type = "message_delta", usage = { output_tokens = 19 } } })
+H.check(
+	"S24b first message_delta sets the running total",
+	claude.state.turn_output_tokens == 19,
+	tostring(claude.state.turn_output_tokens)
+)
+feed({ type = "stream_event", event = { type = "message_delta", usage = { output_tokens = 116 } } })
+H.check(
+	"S24b second message_delta ADDS to the running total, doesn't replace it",
+	claude.state.turn_output_tokens == 135,
+	tostring(claude.state.turn_output_tokens)
+)
+claude.state.turn_output_tokens = 0
+
+-- ── S24c: live in-flight thinking estimate fills the gap message_delta leaves ───
+-- message_delta only fires once a message ENDS, so during a long thinking-heavy
+-- message the committed turn_output_tokens alone would freeze (live 2026-07-30
+-- gap the pure-committed design left). The system "thinking_tokens" event feeds
+-- a live estimate that the bracket adds to the committed total; message_delta
+-- then zeroes it (the committed usage.output_tokens already includes thinking
+-- tokens, so leaving the estimate would double-count).
+claude.state.turn_output_tokens = 100
+feed({ type = "system", subtype = "thinking_tokens", estimated_tokens = 50 })
+local live_lbl = claude._spinner_label() or ""
+H.check("S24c bracket sums committed total + live in-flight estimate", live_lbl:find("150", 1, true) ~= nil, live_lbl)
+feed({ type = "stream_event", event = { type = "message_delta", usage = { output_tokens = 200 } } })
+H.check(
+	"S24c message_delta zeroes the live estimate (no double-count)",
+	claude.state.think_tokens == 0,
+	tostring(claude.state.think_tokens)
+)
+H.check(
+	"S24c committed total is the OLD total plus this message's own tokens, not plus the live estimate too",
+	claude.state.turn_output_tokens == 300,
+	tostring(claude.state.turn_output_tokens)
+)
+claude.state.turn_output_tokens = 0
 claude.state.think_tokens = 0
+
+-- ── S24d: subagent inner stream events don't inflate the parent's token count ───
+-- Subagent events flow through the same top-level dispatch, tagged with a
+-- non-nil parent_tool_use_id. Accumulating those into the panel's OWN spinner
+-- count would silently attribute a subagent's tokens to the parent turn.
+claude.state.turn_output_tokens = 50
+feed({
+	type = "stream_event",
+	event = { type = "message_delta", usage = { output_tokens = 999 } },
+	parent_tool_use_id = "toolu_subagent1",
+})
+H.check(
+	"S24d subagent message_delta does NOT add to the parent's running total",
+	claude.state.turn_output_tokens == 50,
+	tostring(claude.state.turn_output_tokens)
+)
+claude.state.turn_output_tokens = 0
+claude.state.think_base = 0
+
+-- ── S24e: a second thinking block in the SAME message doesn't dip back near 0 ──
+-- estimated_tokens is per-BLOCK. A message can carry 2+ thinking blocks split by
+-- a tool_use with no message_delta between them (confirmed in a captured stream
+-- log: an advisor tool_use split one message's thinking in two). Without
+-- carrying the first block's total forward as think_base, the second block's
+-- content_block_start would reset the display back toward its own small
+-- estimate — a visible backward jump (live 2026-07-30, the exact bug the
+-- accumulation work was meant to fix, reproduced one level down).
+claude.state.think_tokens = 0
+claude.state.think_base = 0
+feed({
+	type = "stream_event",
+	event = { type = "content_block_start", index = 0, content_block = { type = "thinking" } },
+})
+feed({ type = "system", subtype = "thinking_tokens", estimated_tokens = 219 })
+feed({ type = "stream_event", event = { type = "content_block_stop", index = 0 } })
+feed({
+	type = "stream_event",
+	event = { type = "content_block_start", index = 1, content_block = { type = "thinking" } },
+})
+feed({ type = "system", subtype = "thinking_tokens", estimated_tokens = 50 })
+H.check(
+	"S24e second thinking block's estimate ADDS to the first block's carried-forward total",
+	claude.state.think_tokens == 269,
+	tostring(claude.state.think_tokens)
+)
+claude.state.think_tokens = 0
+claude.state.think_base = 0
+claude.state.think_start = nil
 
 -- ── S25: Artifact tool_use header + published-URL result ───────────────────────
 -- A publish renders "● Artifact(<target>)" then a "└ published · <url>" line from

@@ -2100,10 +2100,23 @@ local function dispatch(event)
 		-- resets_at for the same window is how the burn bar detects that staleness.
 		require("utils.claude_burn").note_live(event.rate_limit_info or {})
 	elseif ev_type == "system" and event.subtype == "thinking_tokens" then
-		-- Live estimated-token count while the model thinks; the spinner appends it to
-		-- the "Thinking… Xs" label (e.g. "· 111 tok"). Type-guarded like session_cost.
+		-- Live in-flight estimate for the CURRENT (not yet committed) message's
+		-- thinking block. message_delta below only fires once the message ENDS, so
+		-- without this the spinner's token count would freeze for the whole
+		-- duration of a thinking-heavy message (live 2026-07-30: this is the gap
+		-- the turn_output_tokens-only design left — see spinner_label's display,
+		-- which sums this with turn_output_tokens). estimated_tokens is per-BLOCK,
+		-- not per-message — a message can carry 2+ thinking blocks separated by a
+		-- tool_use with no message_delta between them (confirmed in a captured
+		-- stream log: an advisor tool_use split one message's thinking into two
+		-- blocks). think_base carries forward the prior block(s)' total within
+		-- this message so the displayed count doesn't visibly dip back to a small
+		-- number when the second block starts. No parent_tool_use_id ever appears
+		-- on this event type in any captured log (subagents report progress via
+		-- the separate task_* events, not this stream), so unlike message_delta
+		-- below this branch needs no top-level gate.
 		if type(event.estimated_tokens) == "number" then
-			state.think_tokens = event.estimated_tokens
+			state.think_tokens = (state.think_base or 0) + event.estimated_tokens
 		end
 	elseif ev_type == "system" and event.subtype == "task_started" then
 		-- Goal 17.1: subagent spawned. This event LINKS the two id spaces — task_id
@@ -2151,18 +2164,23 @@ local function dispatch(event)
 			emit_subagent_state() -- Clawd: clear juggling on the final subagent close
 		end
 	elseif ev_type == "stream_event" then
-		-- Incremental SSE (from --include-partial-messages). We drive only the
-		-- thinking block's lifecycle (live "Thinking… Xs" counter + true start→stop
-		-- duration). Text/tool deltas are NOT rendered here — painting raw text
-		-- token-by-token felt "off", so the styled prose still lands once from the
-		-- aggregated `assistant` event below. The compose-gap feel is handled by the
-		-- spinner's default "typing" phase (see spinner_label), not by these deltas.
+		-- Incremental SSE (from --include-partial-messages). We drive the thinking
+		-- block's lifecycle (live "Thinking… Xs" counter + true start→stop duration)
+		-- and the spinner's turn-wide output-token counter (message_delta below).
+		-- Text/tool deltas are NOT rendered here — painting raw text token-by-token
+		-- felt "off", so the styled prose still lands once from the aggregated
+		-- `assistant` event below. The compose-gap feel is handled by the spinner's
+		-- default "typing" phase (see spinner_label), not by these deltas.
 		local se = event.event or {}
 		local st = se.type or ""
 		if st == "content_block_start" and (se.content_block or {}).type == "thinking" then
 			state.think_start = vim.loop.now()
 			state.think_idx = se.index -- which block index is the thinking one
-			state.think_tokens = 0 -- reset the per-block live token count
+			-- Carry forward whatever's accumulated so far in THIS message (a prior
+			-- thinking block's final estimate, e.g. one split off by a tool_use with
+			-- no message_delta between) so the next "thinking_tokens" event adds on
+			-- top instead of visibly dipping back toward 0.
+			state.think_base = state.think_tokens or 0
 			if pet_emit then
 				pet_emit("thinking")
 			end -- Clawd: reasoning phase
@@ -2182,6 +2200,28 @@ local function dispatch(event)
 			state.think_dur = vim.loop.now() - state.think_start
 			state.think_start = nil
 			state.think_idx = nil
+		elseif st == "message_delta" then
+			-- message_delta fires once per assistant MESSAGE (1:1 with message_start),
+			-- carrying that message's own final output_tokens — not a running total
+			-- across the turn. A turn spans several messages (text → tool_use →
+			-- tool_result → text, …), so the spinner's live counter must SUM each
+			-- message's contribution rather than replace it, or it would jump back
+			-- down every time a new message starts (live 2026-07-30: matches the
+			-- official TUI's continuously-climbing "↓ N tokens", not a thinking-only
+			-- count that froze outside the thinking phase). Subagent inner events flow
+			-- through this same dispatch tagged with a non-nil parent_tool_use_id —
+			-- skip those so a subagent's output doesn't silently inflate the PARENT
+			-- spinner's count. usage.output_tokens_details.thinking_tokens is already
+			-- INCLUDED in output_tokens (confirmed in captured stream logs), so the
+			-- live in-flight estimate must be zeroed here too or it double-counts
+			-- once this message's total is committed.
+			local is_top_level = event.parent_tool_use_id == nil or event.parent_tool_use_id == vim.NIL
+			local out_tokens = (se.usage or {}).output_tokens
+			if is_top_level and type(out_tokens) == "number" then
+				state.turn_output_tokens = (state.turn_output_tokens or 0) + out_tokens
+				state.think_tokens = 0
+				state.think_base = 0
+			end
 		end
 	elseif ev_type == "user" then
 		-- A user event arriving FROM the CLI carries tool_result content: the most

@@ -818,18 +818,18 @@ mod._tick_typing_ph = tick_typing_ph
 -- The phase (Typing / Thinking / a tool) shows ONCE — on the activity line or the
 -- cornered ●/└ tool block — never duplicated here. The 110ms tick re-renders so
 -- the timer climbs in place.
--- Live thinking-token count formatter. Below 1,100 the raw integer reads fine
--- (e.g. "632"); at/above 1,100 the four-digit run gets noisy, so collapse to a
--- one-decimal "K" form (2504 → "2.5K"). Uppercase K by request — distinct from
--- the lowercase-k reference-switcher form in widgets.fmt_tokens, which is a
--- different surface with its own convention.
-local function fmt_think_tokens(n)
+-- Live turn-output-token count formatter. Below 1,100 the raw integer reads
+-- fine (e.g. "632"); at/above 1,100 the four-digit run gets noisy, so collapse
+-- to a one-decimal "K" form (2504 → "2.5K"). Uppercase K by request — distinct
+-- from the lowercase-k reference-switcher form in widgets.fmt_tokens, which is
+-- a different surface with its own convention.
+local function fmt_turn_tokens(n)
 	if n >= 1100 then
 		return string.format("%.1fK", n / 1000)
 	end
 	return tostring(n)
 end
-mod._fmt_think_tokens = fmt_think_tokens
+mod._fmt_turn_tokens = fmt_turn_tokens
 
 local function spinner_label()
 	local frame = SPINNER[spin_i]
@@ -844,9 +844,17 @@ local function spinner_label()
 	-- the phase now shows exactly once, either as the in-body activity line
 	-- (●∙∙ Typing / Thinking) or as the cornered ●/└ tool block. Duplicating it in
 	-- the bracket was the redundancy the user asked to cut. The bracket keeps only
-	-- the climbing turn timer + the token count when one exists (thinking).
-	if type(state.think_tokens) == "number" and state.think_tokens > 0 then
-		parts[#parts + 1] = string.format("↓ %s tokens", fmt_think_tokens(state.think_tokens))
+	-- the climbing turn timer + the turn's running output-token count: committed
+	-- totals from every finished message (turn_output_tokens, summed on
+	-- message_delta) PLUS the live in-flight estimate for whichever message is
+	-- still streaming (think_tokens, from the thinking_tokens system event,
+	-- zeroed once its message commits so it isn't double-counted). Without the
+	-- live half the count would freeze for the entire duration of a
+	-- thinking-heavy message (live 2026-07-30) — message_delta only fires once
+	-- a message ENDS, matching the official TUI's continuously-climbing count.
+	local shown_tokens = (state.turn_output_tokens or 0) + (state.think_tokens or 0)
+	if shown_tokens > 0 then
+		parts[#parts + 1] = string.format("↓ %s tokens", fmt_turn_tokens(shown_tokens))
 	end
 	-- "\n" puts the interrupt hint on its OWN line (set_hint splits on newlines):
 	-- the status word can be long and eol virtual text never soft-wraps, so keeping

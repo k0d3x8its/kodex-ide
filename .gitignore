@@ -22,3 +22,4 @@ session-log.md
 # (committing .fable-active would turn fable-mode ON for anyone who clones).
 /.work/.fable-active
 /.work/GATES.md
+/.work/scratch/

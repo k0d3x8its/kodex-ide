@@ -1132,7 +1132,7 @@ local function open_diff_card_float(d)
 	lines[#lines + 1] = "" -- spacer
 	lines[#lines + 1] = "" -- button-row placeholder
 	d.row = #lines - 1 -- 0-indexed button row
-	lines[#lines + 1] = "  ←/→ select · ⏎ confirm · a accept · x reject"
+	lines[#lines + 1] = "  ←/→ select h/l · ⏎ confirm · a accept · x reject"
 	body_hl[#body_hl + 1] = { #lines - 1, "ClaudeDim" }
 
 	-- Shared geometry/scroll/resize helpers (panel_float_geom, harden_float_scroll,

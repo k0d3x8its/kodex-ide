@@ -1443,6 +1443,39 @@ local function render_rate_limit(info)
 	hl_lines(first + 2, first + 4, "ClaudeLabel") -- the three options
 end
 
+-- A hook's `systemMessage` field (session_timer.py's 45m/context-window handoff
+-- nudge, or any other hook that sets it) reaches the CLI as a top-level
+-- `{type:"attachment", attachment:{type:"hook_system_message", content, hookName,
+-- hookEvent}}` stream-json event — confirmed against a captured panel transcript
+-- (2026-08-06). Nothing rendered this event before: dispatch's elseif chain had no
+-- "attachment" branch, so the message silently reached the panel's own subprocess
+-- and vanished — the user saw the alert in an interactive terminal CC session (the
+-- CLI's own UI renders systemMessage directly) but never in the panel, because the
+-- panel builds its own transcript from the stream and this event type was unhandled.
+-- Severity by leading emoji: session_timer.py's two tiers are 🚨 (urgent) and ⚠️
+-- (suggest); anything else (e.g. the plain "✓ Session timer reset.") reads as a
+-- neutral dim notice rather than guessing at a hook we don't know about.
+local function render_hook_system_message(attachment)
+	local msg = attachment.content
+	if type(msg) ~= "string" or msg == "" then
+		return
+	end
+	remove_typing_ph()
+	local buf = state.panel_buf
+	if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+		return
+	end
+	local hl = "ClaudeDim"
+	if msg:find("🚨", 1, true) then
+		hl = "ClaudeError"
+	elseif msg:find("⚠", 1, true) then
+		hl = "ClaudeBurnWarn"
+	end
+	local first = vim.api.nvim_buf_line_count(buf)
+	buf_append({ msg, "" })
+	hl_lines(first, first, hl)
+end
+
 -- The advisor tool (the "advisor strategy") is a SERVER-side tool: the executor
 -- model escalates a hard call to a stronger advisor model, which streams back as an
 -- `advisor_tool_result` content block, then the executor resumes. Two quirks drive
@@ -2099,6 +2132,12 @@ local function dispatch(event)
 		-- resetsAt is live and account-authoritative — comparing it against the file's
 		-- resets_at for the same window is how the burn bar detects that staleness.
 		require("utils.claude_burn").note_live(event.rate_limit_info or {})
+	elseif
+		ev_type == "attachment"
+		and type(event.attachment) == "table"
+		and event.attachment.type == "hook_system_message"
+	then
+		render_hook_system_message(event.attachment)
 	elseif ev_type == "system" and event.subtype == "thinking_tokens" then
 		-- Live in-flight estimate for the CURRENT (not yet committed) message's
 		-- thinking block. message_delta below only fires once the message ENDS, so

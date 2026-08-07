@@ -110,5 +110,37 @@ if ok4 and type(res4) == "table" then
 end
 H.check("future file resets_at keeps the real percentage even with a stale live cache", has_crit4, res4)
 
+-- 5. Regression: a live rate_limit_event for five_hour must not leak a countdown
+--    into a tier that was picked specifically to drop countdowns for width (the
+--    2026-08-06 bug — live.five_hour populated inflated the "bars, no countdown"
+--    tier past maxwidth, so chunks() fell through to the no-bar tier and the
+--    burn bar vanished even though the richer "bars, no countdown" tier would
+--    have fit). Three real meters (5h/7d/ctx, matching the reported repro) at a
+--    maxwidth that fits the bar-only tier but not the bar+countdown tier: the
+--    bar tier must render bars AND must not carry a "↻" chunk.
+write_state(
+	string.format(
+		[[{"rate_limits":{"five_hour":{"used_percentage":62,"resets_at":%d},"seven_day":{"used_percentage":23,"resets_at":%d}},"context_window":{"used_percentage":17}}]],
+		os.time() + 13740,
+		os.time() + 165600
+	)
+)
+burn.note_live({ rateLimitType = "five_hour", resetsAt = os.time() + 13740 })
+local ok5, res5 = pcall(burn.chunks, 61)
+H.check("live five_hour telemetry does not crash the width fit", ok5, not ok5 and res5)
+local has_bar, has_countdown = false, false
+if ok5 and type(res5) == "table" then
+	for _, chunk in ipairs(res5) do
+		if chunk[1]:find("▕") then
+			has_bar = true
+		end
+		if chunk[1]:find("↻") then
+			has_countdown = true
+		end
+	end
+end
+H.check("bar-only tier still shows bars at maxwidth=61", has_bar, res5)
+H.check("bar-only tier drops the countdown instead of falling back to no-bar", not has_countdown, res5)
+
 vim.fn.delete(STATE)
 H.summary("claude_burn")

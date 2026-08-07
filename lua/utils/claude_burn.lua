@@ -184,8 +184,12 @@ end
 -- wall-clock-verified fresh whenever `stale` is false) and falls back to
 -- `live_resets_at` only when stale or the file has none — `live` can itself
 -- lag the file right after a rollover (see is_stale's comment), so it is NOT
--- unconditionally preferred.
-local function add_meter(out, glyph, label, pct, resets_at, show_bar, stale, live_resets_at)
+-- unconditionally preferred. `show_reset` gates the live fallback too: when the
+-- caller picked a leaner tier specifically to drop the countdown for width, the
+-- live fallback must not silently reintroduce it (regression: a live-populated
+-- five_hour window inflated the "bars, no countdown" tier past maxwidth, so
+-- chunks() fell through to the no-bar tier — see claude_burn_spec.lua).
+local function add_meter(out, glyph, label, pct, resets_at, show_bar, stale, live_resets_at, show_reset)
 	-- vim.json.decode maps JSON null → vim.NIL (userdata, truthy), not Lua nil, so a
 	-- bare `== nil` check leaks it through to severity()/math.floor and crashes on a
 	-- number-vs-userdata compare. Reject anything that isn't a real number here.
@@ -204,7 +208,7 @@ local function add_meter(out, glyph, label, pct, resets_at, show_bar, stale, liv
 	local reset_source
 	if not stale and type(resets_at) == "number" then
 		reset_source = resets_at
-	else
+	elseif stale and show_reset then
 		reset_source = (type(live_resets_at) == "number") and live_resets_at or resets_at
 	end
 	if type(reset_source) == "number" then
@@ -231,7 +235,8 @@ local function build(rl, cw, show_bar, show_reset)
 			show_reset and rl.five_hour.resets_at or nil,
 			show_bar,
 			is_stale(rl.five_hour.resets_at),
-			live.five_hour
+			live.five_hour,
+			show_reset
 		)
 	end
 	if type(rl.seven_day) == "table" then
@@ -244,7 +249,8 @@ local function build(rl, cw, show_bar, show_reset)
 			show_reset and rl.seven_day.resets_at or nil,
 			show_bar,
 			is_stale(rl.seven_day.resets_at),
-			live.seven_day
+			live.seven_day,
+			show_reset
 		)
 	end
 	-- Context is always %-only (a hint, least critical) so it survives truncation.

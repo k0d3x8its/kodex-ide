@@ -138,8 +138,22 @@ local function render_question_card()
 	state.qask_ns = state.qask_ns or vim.api.nvim_create_namespace("ClaudeQaskRow")
 
 	local lines, hl = {}, {}
-	lines[#lines + 1] = "  " .. (question.question or "")
-	hl[#hl + 1] = { #lines - 1, "ClaudeProse" }
+	-- EVERY body insert goes through push(): the CLI's question/option text, and
+	-- (more importantly) the user's OWN typed custom-answer/note text, can carry
+	-- embedded "\n" (a pasted multi-line answer needs no special action to trigger
+	-- this — a plain paste into the prompt float is enough). nvim_buf_set_lines
+	-- throws "replacement string item contains newlines" on ANY item that isn't a
+	-- single line, which killed the whole card (live 2026-08-06 — mirrors the
+	-- permission card's same-shaped bug, fixed there by gate.lua's own push()).
+	local function push(text, group)
+		for _, sub in ipairs(vim.split(text, "\n", { plain = true })) do
+			lines[#lines + 1] = sub
+			if group then
+				hl[#hl + 1] = { #lines - 1, group }
+			end
+		end
+	end
+	push("  " .. (question.question or ""), "ClaudeProse")
 	lines[#lines + 1] = "" -- spacer
 
 	for i, d in ipairs(dopts) do
@@ -154,16 +168,14 @@ local function render_question_card()
 		if d.kind == "custom" and pick and pick.kind == "custom" then
 			label = label .. ": " .. pick.text
 		end
-		lines[#lines + 1] = "  " .. marker .. mark .. label
 		-- Highlighted row pops burnt-orange; model options read prose-orange; the two
 		-- synthetic affordances (Type something / Chat about this) get ClaudeLabel
 		-- purple so they're visibly distinct from the gray (ClaudeDim) descriptions
 		-- they used to share a colour with.
 		local grp = (i == ci) and "ClaudeQuestion" or ((d.kind == "model") and "ClaudeProse" or "ClaudeLabel")
-		hl[#hl + 1] = { #lines - 1, grp }
+		push("  " .. marker .. mark .. label, grp)
 		if d.desc ~= "" then
-			lines[#lines + 1] = "        " .. d.desc
-			hl[#hl + 1] = { #lines - 1, "ClaudeDim" }
+			push("        " .. d.desc, "ClaudeDim")
 		end
 	end
 
@@ -173,11 +185,9 @@ local function render_question_card()
 	-- swaps which note shows. Empty = dim placeholder; set = prose-orange (real content).
 	local note = q.notes[q.qi]
 	if note and note ~= "" then
-		lines[#lines + 1] = "  Notes: " .. note
-		hl[#hl + 1] = { #lines - 1, "ClaudeProse" }
+		push("  Notes: " .. note, "ClaudeProse")
 	else
-		lines[#lines + 1] = "  Notes: Add notes…"
-		hl[#hl + 1] = { #lines - 1, "ClaudeDim" }
+		push("  Notes: Add notes…", "ClaudeDim")
 	end
 	lines[#lines + 1] = "" -- spacer
 

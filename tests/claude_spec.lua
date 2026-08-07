@@ -1377,6 +1377,50 @@ H.check(
 	vim.inspect(rq4)
 )
 
+-- ── T18b: newline-carrying question/option fields must not crash the card ─────
+-- Same shape as T17c's permission-card regression: nvim_buf_set_lines throws on
+-- ANY item containing "\n". The question TEXT and an option's DESCRIPTION are
+-- CLI-supplied and can be multi-line (live crash 2026-08-06 — question.lua never
+-- got the same push()-style split guard gate.lua's permission card already has).
+feed({
+	type = "control_request",
+	request_id = "req-ask-nl",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "AskUserQuestion",
+		input = {
+			questions = {
+				{
+					question = "line one\nline two\nline three",
+					header = "NL",
+					multiSelect = false,
+					options = {
+						{ label = "A", description = "desc one\ndesc two" },
+						{ label = "B" },
+					},
+				},
+			},
+		},
+	},
+})
+H.check(
+	"T18b multi-line question/desc still opens the card",
+	claude.state.qask ~= nil and claude.state.qask.request_id == "req-ask-nl",
+	vim.inspect(claude.state.qask)
+)
+H.check(
+	"T18b card buffer holds the split question/desc lines",
+	(function()
+		local b = claude.state.qask and claude.state.qask.buf
+		if not (b and vim.api.nvim_buf_is_valid(b)) then
+			return false
+		end
+		local txt = table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\1")
+		return txt:find("line two", 1, true) ~= nil and txt:find("desc two", 1, true) ~= nil
+	end)()
+)
+claude._cancel_question()
+
 -- ── T19: question-card parity — free nav, Type something, Chat about this ─────
 
 -- Free navigation between questions WITHOUT answering (Tab/⇥ + arrows). Two
@@ -2113,5 +2157,43 @@ H.check(
 )
 claude._resolve_permission("deny") -- clear the fallback card
 watch_result = true -- restore default for any later test
+
+-- ── T32: hook systemMessage attachments render in the transcript ──────────────
+-- A hook's `systemMessage` (e.g. session_timer.py's 45m/context-window nudge)
+-- arrives as a top-level `{type:"attachment", attachment:{type:"hook_system_message"}}`
+-- event — confirmed against a captured panel transcript (2026-08-06). dispatch()
+-- had no branch for it and the message silently vanished with no UI trace.
+-- typing_ph, if active, is REPLACED in place (remove 2, append 2) rather than
+-- grown — so line COUNT alone isn't a reliable signal here; assert on content.
+feed({
+	type = "attachment",
+	attachment = {
+		type = "hook_system_message",
+		content = "🚨 Hand off NOW — 55m elapsed. Recommend → /checkpoint.",
+		hookName = "Stop",
+		hookEvent = "Stop",
+	},
+})
+H.check(
+	"T32 the rendered line carries the message text",
+	(function()
+		local lines = vim.api.nvim_buf_get_lines(claude.state.panel_buf, 0, -1, false)
+		for _, l in ipairs(lines) do
+			if l:find("Hand off NOW", 1, true) then
+				return true
+			end
+		end
+		return false
+	end)()
+)
+-- A non-hook attachment type (unrelated future use of the same top-level event)
+-- must NOT render — only hook_system_message is handled.
+local before_other_attach = vim.api.nvim_buf_line_count(claude.state.panel_buf)
+feed({ type = "attachment", attachment = { type = "some_other_kind", content = "should not render" } })
+H.check(
+	"T32 an unrelated attachment type is ignored, not rendered",
+	vim.api.nvim_buf_line_count(claude.state.panel_buf) == before_other_attach,
+	"before=" .. before_other_attach .. " after=" .. vim.api.nvim_buf_line_count(claude.state.panel_buf)
+)
 
 H.summary("claude")

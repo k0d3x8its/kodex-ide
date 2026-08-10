@@ -2337,8 +2337,13 @@ local function dispatch(event)
 				if pet_emit then
 					pet_emit("typing")
 				end -- Clawd: Claude generating output
-			elseif btype == "thinking" then
-				render_thinking(block.thinking or "")
+			elseif btype == "thinking" and type(block.thinking) == "string" and block.thinking ~= "" then
+				-- Model sometimes emits a near-zero-content thinking block (only a
+				-- signature_delta, no thinking_delta text) right before a snap
+				-- tool_use — real API behavior, confirmed via KODEX_CLAUDE_EVENTLOG
+				-- capture, not a stream bug. Skip it rather than render a
+				-- header-only fold with no body.
+				render_thinking(block.thinking)
 			elseif btype == "server_tool_use" and (block.name == "advisor") then
 				-- Escalation to the advisor model: "● Advising using <model>" header. The
 				-- advice arrives as a separate advisor_tool_result block (below). Without

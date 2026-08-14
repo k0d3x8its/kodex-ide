@@ -221,9 +221,16 @@ function Widgets.open_prompt_float(title, initial, on_commit, opts)
 	vim.cmd("startinsert!")
 	-- Pre-fill with the existing value so it can be edited/repopulated. Typed AFTER
 	-- startinsert! (in insert mode) so it lands in the prompt line past the "❯ " arrow;
-	-- "n" = no remap, plain literal text (the note never contains termcodes).
+	-- "n" = no remap, plain literal text (the note never contains termcodes) — but
+	-- that's an assumption about callers, not a guarantee, so strip control bytes
+	-- (e.g. a literal ESC) before replaying as keystrokes: with no
+	-- replace_termcodes, one would leave insert mode and run the remainder as
+	-- normal-mode commands in the panel.
 	if initial and initial ~= "" then
-		vim.api.nvim_feedkeys(initial, "n", false)
+		local safe = initial:gsub("%c", "")
+		if safe ~= "" then
+			vim.api.nvim_feedkeys(safe, "n", false)
+		end
 	end
 end
 
@@ -249,9 +256,13 @@ local function files_mode(base, cmd)
 	if base == "fd" or base == "fdfind" or base == "find" then
 		return true
 	end
-	return cmd:match("%s%-l%f[%s]") ~= nil
-		or cmd:match("%-%-files%-with%-matches") ~= nil
-		or cmd:match("%-%-files%f[%s]") ~= nil
+	-- %f[%s] (frontier) never matches at end-of-string, so a TRAILING flag (e.g.
+	-- a command ending in "... -l") was missed. Pad with a trailing space so the
+	-- frontier always has whitespace to land on.
+	local padded = cmd .. " "
+	return padded:match("%s%-l%f[%s]") ~= nil
+		or padded:match("%-%-files%-with%-matches") ~= nil
+		or padded:match("%-%-files%f[%s]") ~= nil
 end
 function Widgets.search_descriptor(name, input)
 	if name == "Grep" then
@@ -269,6 +280,17 @@ function Widgets.search_descriptor(name, input)
 		local base = word and (word:match("([^/]+)$") or word)
 		local verb = base and SEARCH_CMDS[base]
 		if not verb then
+			return nil
+		end
+		-- A command chained past the search binary via ;/&&/|/backtick renders in
+		-- search mode with ONLY the search binary's own pattern shown — the
+		-- chained tail (e.g. "grep foo; rm -rf ~") never reaches the transcript,
+		-- which is the permanent audit record. Fall back to the generic Bash
+		-- render (full raw command via corner_one_line) for anything chained.
+		-- Strip quoted spans first — a bare "[;|`]" test would also flag a
+		-- routine regex alternation like rg "error|warn" and misclassify it.
+		local unquoted = c:gsub('"[^"]*"', ""):gsub("'[^']*'", "")
+		if unquoted:match("[;|`]") or unquoted:match("&&") then
 			return nil
 		end
 		-- Pattern: prefer the first quoted string (keeps multi-word patterns whole),
@@ -340,6 +362,9 @@ function Widgets.render_todo_lines(todos)
 		-- In-progress tasks read better in their gerund activeForm ("Applying …").
 		local text = (status == "in_progress" and t.activeForm and t.activeForm ~= "") and t.activeForm
 			or (t.content or "")
+		-- content/activeForm are model-controlled; an embedded newline throws in
+		-- nvim_buf_set_lines ("replacement string item contains newlines").
+		text = tostring(text):gsub("[\r\n]+", " ")
 		lines[#lines + 1] = PAD .. glyph .. " " .. text
 		local glyph_hl = status == "completed" and "ClaudeTodoCheck" or (TEXTHL[status] or "ClaudeTodoPending")
 		hls[#hls + 1] = {
@@ -574,8 +599,16 @@ function Widgets.update_todo_widget()
 		state.todo_buf = buf
 	end
 	vim.bo[buf].modifiable = true
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+	-- pcall + unconditional modifiable restore: `buf_append` (core.lua) learned
+	-- this the hard way — an uncaught throw here leaves state.todo_buf writable
+	-- AND state.todo_h stale, which mis-stacks every bottom float afterward. This
+	-- buffer isn't covered by dispatch's own outer pcall (that one only re-locks
+	-- state.panel_buf), so it needs its own restore.
+	local ok, err = pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, lines)
 	vim.bo[buf].modifiable = false
+	if not ok then
+		error(err, 0)
+	end
 	state.todo_ns = state.todo_ns or vim.api.nvim_create_namespace("claude_todo")
 	vim.api.nvim_buf_clear_namespace(buf, state.todo_ns, 0, -1)
 	for i, spans in ipairs(hls) do
@@ -943,7 +976,10 @@ end
 -- Terminal (non-running) subagent statuses. task_updated/task_notification set
 -- "completed"; keep the others so a failed/cancelled run still counts as "done"
 -- for the auto-dismiss (else the bar would hang forever).
-local TERMINAL_STATUS = { completed = true, failed = true, cancelled = true, error = true }
+-- "interrupted" is what init.lua assigns to every still-running subagent when
+-- the user interrupts a turn (init.lua:2642) — omitting it here left the
+-- switcher (and the rows it reserves) stuck open for the rest of the session.
+local TERMINAL_STATUS = { completed = true, failed = true, cancelled = true, error = true, interrupted = true }
 
 -- True only when there is ≥1 subagent AND every one has reached a terminal status.
 function Widgets.subagents_all_done()

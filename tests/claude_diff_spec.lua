@@ -1083,6 +1083,75 @@ H.check(
 	vim.inspect(D.state.anchors)
 )
 
+-- ── T28: gate.try_prewrite_gate → accept end-to-end, incl. the TOCTOU re-check ──
+-- Goal 12 batch 1 Medium finding (gate.lua:179/255): the pre-write diff is
+-- reconstructed from disk at REQUEST time, but the accept path releases "allow"
+-- carrying the original old_string/new_string, which the CLI then replays
+-- against whatever is on disk when it finally writes. T20 above exercises
+-- accept_all's wire behavior but constructs claude.state.prewrite BY HAND
+-- (skipping gate.try_prewrite_gate entirely), so it never carries a
+-- fingerprint — this is the first test to go through the real
+-- try_prewrite_gate → reconstruct_edit → accept_all → on_prewrite_resolve
+-- chain, proving (a) a normal accept with no intervening disk change still
+-- allows, and (b) a disk change between request and accept denies instead of
+-- silently replaying stale old_string/new_string.
+local gate = require("utils.claude.gate")
+
+-- (a) No disk change between request and accept → allow.
+local t28a = ws .. "/prewrite_toctou_a.txt"
+vim.fn.writefile({ "line1", "line2", "line3" }, t28a)
+claude.state.prewrite = nil
+local gated_a =
+	gate.try_prewrite_gate("toctou-a", "Edit", { file_path = t28a, old_string = "line2", new_string = "LINE2-new" })
+H.check("T28a try_prewrite_gate opened the diff", gated_a == true)
+D2.accept_all()
+vim.wait(200, function()
+	return D2.state.current == nil
+end)
+local pr28a = last_pw_response()
+H.check(
+	"T28a no disk change → accept allows",
+	pr28a and pr28a.response.request_id == "toctou-a" and pr28a.response.response.behavior == "allow",
+	vim.inspect(pr28a)
+)
+H.check("T28a held request cleared", claude.state.prewrite == nil)
+
+-- (b) File changes on disk WHILE the diff sits open, before accept → deny.
+local t28b = ws .. "/prewrite_toctou_b.txt"
+vim.fn.writefile({ "alpha1", "alpha2", "alpha3" }, t28b)
+claude.state.prewrite = nil
+local gated_b =
+	gate.try_prewrite_gate("toctou-b", "Edit", { file_path = t28b, old_string = "alpha2", new_string = "ALPHA2-new" })
+H.check("T28b try_prewrite_gate opened the diff", gated_b == true)
+-- Simulate an out-of-band disk change during the review window (the orig
+-- buffer's own readonly lock — T25 — blocks a stray `:w` of ITS buffer, but
+-- an external process/tool writing the same path is exactly what the
+-- fingerprint check exists to catch).
+vim.wait(20) -- let mtime/size actually differ from the fingerprint captured above
+vim.fn.writefile({ "alpha1", "alpha2-EXTERNAL-EDIT", "alpha3" }, t28b)
+D2.accept_all()
+vim.wait(200, function()
+	return D2.state.current == nil
+end)
+local pr28b = last_pw_response()
+H.check(
+	"T28b disk changed mid-review → accept denies instead of replaying stale old_string/new_string",
+	pr28b and pr28b.response.request_id == "toctou-b" and pr28b.response.response.behavior == "deny",
+	vim.inspect(pr28b)
+)
+H.check(
+	"T28b deny message names the staleness, not a generic rejection",
+	pr28b
+		and pr28b.response.response.message
+		and pr28b.response.response.message:find("changed on disk", 1, true) ~= nil,
+	vim.inspect(pr28b)
+)
+H.check("T28b held request cleared even on the TOCTOU path", claude.state.prewrite == nil)
+H.check(
+	"T28b external edit survives untouched (never overwritten by a stale replay)",
+	table.concat(vim.fn.readfile(t28b), "|") == "alpha1|alpha2-EXTERNAL-EDIT|alpha3"
+)
+
 claude.state.panel_buf = nil
 
 H.summary("claude_diff")

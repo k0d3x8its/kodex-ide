@@ -2094,17 +2094,19 @@ H.check(
 )
 claude.state.host_ctx_enabled = t30_prev_host_ctx
 
--- ── T31: MultiEdit/NotebookEdit auto-allow refuses to fire when watch() no-ops ──
--- 2026-07-19 audit finding: MultiEdit/NotebookEdit have NO pre-write gate — the
--- post-write claude_diff.watch() call is their SOLE review surface. Security fix:
--- watch() now returns false on any of its silent no-op exits (nil/empty path,
--- panel inactive, bufadd failure), and the dispatcher must refuse to auto-allow
--- when that happens — falling back to the generic permission card instead of
--- writing with ZERO review at any point.
+-- ── T31: MultiEdit/NotebookEdit never auto-allow, watch() result or not ─────────
+-- 2026-07-19 audit finding fixed the watch()==false no-op case; Goal 12 /code-crit
+-- (Critical, gate.lua:168, .work/GOAL12-FINDINGS.md) found the watch()==true "happy
+-- path" was STILL a silent auto-allow — the write landed before any human decision,
+-- with only a post-write vimdiff review after the fact. For a self-executing target
+-- (~/.bashrc, .git/hooks/pre-commit, nvim config) the write IS the exploit; a
+-- post-write undo is too late. Fix: MultiEdit/NotebookEdit always fall back to the
+-- generic permission card before any decision, watch() result or not — watch() only
+-- controls whether the eventual "Allow once" also gets a post-write vimdiff review.
 claude.state.job_id = 99
 claude.state.working = true
 
--- Happy path: watch() succeeds → auto-allow fires immediately, no card.
+-- watch() succeeds → still stops for a decision, no silent allow.
 watch_result = true
 local sends_me1 = #chansend_calls
 feed({
@@ -2116,11 +2118,10 @@ feed({
 		input = { file_path = "/tmp/multi.lua", edits = {} },
 	},
 })
-local r_me1 = last_control_response()
 H.check(
-	"T31 watch()==true auto-allows MultiEdit with no card",
-	r_me1 and r_me1.response.request_id == "req-me-1" and claude.state.perm == nil,
-	vim.inspect({ resp = r_me1, perm = claude.state.perm })
+	"T31 watch()==true sends NO control_response (no silent auto-allow)",
+	#chansend_calls == sends_me1,
+	"sends delta=" .. (#chansend_calls - sends_me1)
 )
 H.check(
 	"T31 watch()==true still arms post-write review",
@@ -2128,12 +2129,13 @@ H.check(
 	vim.inspect(watch_calls)
 )
 H.check(
-	"T31 sent exactly one control_response for the happy path",
-	#chansend_calls == sends_me1 + 1,
-	"delta=" .. (#chansend_calls - sends_me1)
+	"T31 watch()==true opens the permission card instead of writing unattended",
+	claude.state.perm ~= nil and claude.state.perm.request_id == "req-me-1",
+	vim.inspect(claude.state.perm)
 )
+claude._resolve_permission("deny") -- clear the card
 
--- Failure path: watch() no-ops (false) → must NOT auto-allow; falls back to card.
+-- watch() no-ops (false) → same fallback, no post-write review armed.
 watch_result = false
 local sends_me2 = #chansend_calls
 feed({

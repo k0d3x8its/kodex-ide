@@ -2045,6 +2045,34 @@ end
 vim.fn.chansend = prior_chansend
 vim.notify = prior_notify
 
+-- ── S32b: buffered keystrokes at open must not resolve the card ────────────────
+-- Goal 12 batch 1 High finding (gate.lua, adversarial): the model controls
+-- exactly when a can_use_tool request fires, so it can time one to land mid-
+-- keystroke — whatever the user had already typed (aimed at an unrelated
+-- buffer/command) used to get delivered to the freshly-focused card instead
+-- and could resolve the decision before the user read a word of it.
+-- open_permission_float now drains pending input (getchar(0), NOT getchar(1) —
+-- mode 1 only peeks without consuming) before opening. "a" resolves Allow
+-- once if it reaches the card's keymap; stuffing it into typeahead BEFORE the
+-- card opens and confirming the card is still up + unresolved proves the
+-- drain actually consumed it rather than leaving it to fire once the keymap
+-- attaches.
+vim.api.nvim_input("a")
+feed({
+	type = "control_request",
+	request_id = "cr-drain",
+	request = { subtype = "can_use_tool", tool_name = "Bash", input = { command = "ls" } },
+})
+H.check(
+	"S32b buffered keystroke drained — card still open, not resolved",
+	claude.state.perm ~= nil and claude.state.perm.request_id == "cr-drain",
+	vim.inspect(claude.state.perm)
+)
+if claude.state.perm then
+	require("utils.claude.gate").resolve_permission("deny")
+	vim.wait(30)
+end
+
 -- ── S33: CLI death sweeps stranded decision/compact state (F5+F9) ──────────────
 -- FINDINGS § Q-ERROR-AUDIT F5: on_exit cleared job/working/system_ready but NOT
 -- the decision modals — a crash with a card up left it stranded ("Waiting…"

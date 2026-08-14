@@ -356,9 +356,19 @@ local function close_question_card(receipt, receipt_hl)
 		clear_hint()
 	end
 	if state.decision_reopen_bar then
-		state.decision_reopen_bar = false
+		-- Consume the flag INSIDE the scheduled callback, not before scheduling —
+		-- same race as gate.lua's resolve_permission (advisor-flagged): a new
+		-- decision card arriving in the gap before this runs must be able to
+		-- inherit the still-true flag and reopen the bar on ITS OWN resolve,
+		-- rather than finding an already-consumed flag and stranding the bar.
 		vim.schedule(function()
-			prompt_input()
+			if state.perm or state.qask or state.prewrite or state.diff_card then
+				return
+			end
+			if state.decision_reopen_bar then
+				state.decision_reopen_bar = false
+				prompt_input()
+			end
 		end)
 	elseif state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
 		-- No chat bar to reopen: keep focus in the Claude panel rather than letting it

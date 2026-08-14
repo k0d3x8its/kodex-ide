@@ -12,11 +12,14 @@ H.stub_project_root("/tmp")
 -- Minimal stubs so the module loads under -u NONE (mirrors claude_spec.lua).
 package.loaded["utils.term_layout"] = { place_vertical = function() end }
 package.loaded["utils.claude_diff"] = {
-  on_panel_open = function() end, on_panel_close = function() end,
-  on_diff_open = function() end, on_diff_close = function() end,
+	on_panel_open = function() end,
+	on_panel_close = function() end,
+	on_diff_open = function() end,
+	on_diff_close = function() end,
 }
 package.loaded["utils.opencode"] = {
-  state = { opencode_active = false }, toggle = function() end,
+	state = { opencode_active = false },
+	toggle = function() end,
 }
 
 local claude = require("utils.claude")
@@ -24,13 +27,17 @@ claude.setup({ width_pct = 0.40 })
 
 -- True when any highlight range in `hls` uses group `g`.
 local function has_group(hls, g)
-  for _, h in ipairs(hls) do if h[3] == g then return true end end
-  return false
+	for _, h in ipairs(hls) do
+		if h[3] == g then
+			return true
+		end
+	end
+	return false
 end
 
 -- Convenience: transform one markdown string into (clean, hls) line arrays.
 local function md(str)
-  return claude._build_md_lines(vim.split(str, "\n", { plain = true }))
+	return claude._build_md_lines(vim.split(str, "\n", { plain = true }))
 end
 
 -- ── Headings (# markers KEPT as the level cue; padded to a full-width bar) ──
@@ -84,39 +91,59 @@ H.check("Code: fence rows dropped", c[2]:find("```", 1, true) == nil)
 H.check("Code: ClaudeCodeBlock bg group", has_group(hl[2], "ClaudeCodeBlock"))
 H.check("Code: gutter group", has_group(hl[1], "ClaudeCodeGutter"))
 -- Padded to a solid block (display width uniform across rows).
-H.check("Code: rows padded to common width",
-  vim.fn.strdisplaywidth(c[1]) == vim.fn.strdisplaywidth(c[2]),
-  vim.fn.strdisplaywidth(c[1]) .. " vs " .. vim.fn.strdisplaywidth(c[2]))
+H.check(
+	"Code: rows padded to common width",
+	vim.fn.strdisplaywidth(c[1]) == vim.fn.strdisplaywidth(c[2]),
+	vim.fn.strdisplaywidth(c[1]) .. " vs " .. vim.fn.strdisplaywidth(c[2])
+)
 
 -- ── Fenced directory tree → glyphed tree, not flat code ─────────────────────
 c, hl = md("```\nmyproj/\n├── lua/\n│   └── init.lua\n└── README.md\n```")
 H.check("Fenced tree: NOT a code block (no gutter ▎)", c[1]:sub(1, #"▎") ~= "▎", c[1])
-H.check("Fenced tree: dir gets folder glyph + ClaudeDir",
-  has_group(hl[1], "ClaudeDir") or has_group(hl[2], "ClaudeDir"))
-H.check("Fenced tree: structure dimmed", (function()
-  for _, h in ipairs(hl) do for _, x in ipairs(h) do if x[3] == "ClaudeDim" then return true end end end
-end)())
+H.check(
+	"Fenced tree: dir gets folder glyph + ClaudeDir",
+	has_group(hl[1], "ClaudeDir") or has_group(hl[2], "ClaudeDir")
+)
+H.check(
+	"Fenced tree: structure dimmed",
+	(function()
+		for _, h in ipairs(hl) do
+			for _, x in ipairs(h) do
+				if x[3] == "ClaudeDim" then
+					return true
+				end
+			end
+		end
+	end)()
+)
 
 -- ── Code block: treesitter syntax highlighting (when lua parser available) ──
 c, hl = md('```lua\nlocal x = "hi"  -- c\n```')
 local function any_syntax_group(hls_list)
-  for _, line in ipairs(hls_list) do
-    for _, h in ipairs(line) do
-      if type(h[3]) == "string" and h[3]:match("^ClaudeCode%u")
-          and h[3] ~= "ClaudeCodeBlock" and h[3] ~= "ClaudeCodeGutter"
-          and h[3] ~= "ClaudeCodeLang" then
-        return h[3]
-      end
-    end
-  end
-  return nil
+	for _, line in ipairs(hls_list) do
+		for _, h in ipairs(line) do
+			if
+				type(h[3]) == "string"
+				and h[3]:match("^ClaudeCode%u")
+				and h[3] ~= "ClaudeCodeBlock"
+				and h[3] ~= "ClaudeCodeGutter"
+				and h[3] ~= "ClaudeCodeLang"
+			then
+				return h[3]
+			end
+		end
+	end
+	return nil
 end
 local has_lua_parser = pcall(vim.treesitter.get_string_parser, "local x = 1", "lua")
 if has_lua_parser then
-  H.check("Code: lua body syntax-highlighted (themed ClaudeCode* span present)",
-    any_syntax_group(hl) ~= nil, tostring(any_syntax_group(hl)))
+	H.check(
+		"Code: lua body syntax-highlighted (themed ClaudeCode* span present)",
+		any_syntax_group(hl) ~= nil,
+		tostring(any_syntax_group(hl))
+	)
 else
-  print("SKIP  Code: lua treesitter parser unavailable in this env")
+	print("SKIP  Code: lua treesitter parser unavailable in this env")
 end
 -- Base block bg still present regardless of syntax availability.
 H.check("Code: block bg retained alongside syntax", has_group(hl[2], "ClaudeCodeBlock"))
@@ -133,19 +160,85 @@ H.check("Table: row count (frame + 3 data)", #c == 6, "got " .. #c)
 H.check("Table: cell values present", c[4]:find("a", 1, true) and c[5]:find("b", 1, true))
 
 -- ── Wide table fits the panel (overflow would hard-wrap + shatter the box) ──
-c = md("| Name | Type | Note |\n|---|---|---|\n| CLAUDE.md | Config | Global standing instructions and conventions here |\n| KNOWLEDGE.md | Reference | Empirical facts |")
+c = md(
+	"| Name | Type | Note |\n|---|---|---|\n| CLAUDE.md | Config | Global standing instructions and conventions here |\n| KNOWLEDGE.md | Reference | Empirical facts |"
+)
 local maxw = 0
-for _, l in ipairs(c) do maxw = math.max(maxw, vim.fn.strdisplaywidth(l)) end
+for _, l in ipairs(c) do
+	maxw = math.max(maxw, vim.fn.strdisplaywidth(l))
+end
 H.check("Wide table: every line fits panel width", maxw <= math.floor(vim.o.columns * 0.40), "maxw=" .. maxw)
 H.check("Wide table: long cell wrapped to extra rows", #c > 6, "got " .. #c)
-H.check("Wide table: frame intact (top ┌ / bottom ┘)",
-  c[1]:sub(1, #"┌") == "┌" and c[#c]:sub(-#"┘") == "┘")
+H.check("Wide table: frame intact (top ┌ / bottom ┘)", c[1]:sub(1, #"┌") == "┌" and c[#c]:sub(-#"┘") == "┘")
 
 -- ── Mixed document still flows ──────────────────────────────────────────────
 c = md("# Heading\n\nSome **bold** prose.\n\n- item one\n\n> a quote")
-H.check("Mixed: heading + list + quote all rendered",
-  vim.trim(c[1]) == "# Heading"
-    and (function() for _, l in ipairs(c) do if l == "• item one" then return true end end end)()
-    and (function() for _, l in ipairs(c) do if l:find("a quote", 1, true) then return true end end end)())
+H.check("Mixed: heading + list + quote all rendered", vim.trim(c[1]) == "# Heading" and (function()
+	for _, l in ipairs(c) do
+		if l == "• item one" then
+			return true
+		end
+	end
+end)() and (function()
+	for _, l in ipairs(c) do
+		if l:find("a quote", 1, true) then
+			return true
+		end
+	end
+end)())
+
+-- ── Batch-2 fix regressions (Goal 12) ────────────────────────────────────────
+local markdown = require("utils.claude.markdown")
+
+-- disp_take: empty input must not throw (s:byte(1) on "" is nil).
+H.check("disp_take: empty string returns empty, no throw", markdown.disp_take("", 5) == "")
+
+-- disp_take: a width narrower than one multibyte codepoint's display width must
+-- still consume the WHOLE codepoint, never split it mid-byte-sequence.
+do
+	local cjk = "中" -- 3 UTF-8 bytes, display width 2
+	local out = markdown.disp_take(cjk, 1)
+	H.check("disp_take: narrow width still consumes whole multibyte codepoint", out == cjk, "got " .. #out .. " bytes")
+end
+
+-- wrap_text: a single multibyte token wider than the column must hard-break on
+-- codepoint boundaries, never emit invalid partial-byte sequences.
+do
+	local rows = markdown.wrap_text("中文字符测试", 2) -- 6 CJK chars, width 2 col
+	local reassembled = table.concat(rows)
+	H.check("wrap_text: multibyte hard-break reassembles losslessly", reassembled == "中文字符测试", reassembled)
+	for _, r in ipairs(rows) do
+		H.check("wrap_text: every row fits its width", vim.fn.strdisplaywidth(r) <= 2, r)
+	end
+end
+
+-- render_table: a CJK cell forced into a narrow column (many columns shave the
+-- widest down near the floor) must not crash and must keep the box frame intact.
+do
+	local ok = pcall(function()
+		return md(
+			"| a | b | c | d | e | f | g |\n|---|---|---|---|---|---|---|\n| 中文内容测试文字 | x | x | x | x | x | x |"
+		)
+	end)
+	H.check("render_table: narrow multibyte column does not throw", ok)
+end
+
+-- render_table: a run of ONLY separator rows (no real header/data row) must not
+-- vanish — falls back to plain inline-parsed text.
+do
+	c = md("|---|---|\n|:--|--:|")
+	local joined = table.concat(c, "\n")
+	H.check("render_table: separator-only run does not vanish", #c > 0 and joined ~= "", joined)
+end
+
+-- parse_inline: "**" with no adjacent non-space char is arithmetic-like prose,
+-- not emphasis — markers must survive, not be eaten.
+c = md("result = 3 ** 2 ** 5")
+H.check("parse_inline: spaced ** is not treated as bold", c[1]:find("**", 1, true) ~= nil, c[1])
+
+-- render_heading: a heading ending in a literal "#" (no preceding space) must
+-- keep it — only a whitespace-preceded closing run is the ATX-close syntax.
+c = md("# C#")
+H.check("render_heading: trailing # without leading space is kept", vim.trim(c[1]) == "# C#", c[1])
 
 H.summary("claude_markdown")

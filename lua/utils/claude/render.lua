@@ -946,7 +946,12 @@ local function write_body_lines(entry, limit)
 	local code = entry.code_lines
 	local total = #code
 	local shown = limit and math.min(limit, total) or total
-	local ok, syn = pcall(markdown.code_ts_hls, entry.lang or "", code)
+	-- Parse only the lines actually rendered (`shown`), not the whole file — the
+	-- collapsed preview (limit == WRITE_HEAD_K) only ever shows the first 10 lines,
+	-- so a full treesitter parse+query over a large Write's entire content on
+	-- every render was pure waste.
+	local parse_src = shown == total and code or vim.list_slice(code, 1, shown)
+	local ok, syn = pcall(markdown.code_ts_hls, entry.lang or "", parse_src)
 	if not ok then
 		syn = nil
 	end
@@ -991,12 +996,25 @@ local function write_body_lines(entry, limit)
 	return lines, hls
 end
 
+-- Hard safety cap on wrap_disp's input, in bytes. A tool result with no
+-- whitespace (base64 blob, minified JS, single-line JSON dump — routine, not
+-- adversarial) is ONE "word" to gmatch("%S+"), so the hard-split loop below
+-- ran #line/width times, calling disp_take twice and reallocating a shrinking
+-- multi-MB string on EVERY pass — O(n²) bytes, hanging nvim before any caller's
+-- own row cap ever got a chance to bound the output. No caller needs more than
+-- this many bytes rendered anyway.
+local WRAP_DISP_MAX_BYTES = 8192
+
 -- Greedy display-width word-wrap: split `s` into rows no wider than `width` cells.
 -- A single word longer than width is hard-split via disp_take so it never overflows.
 -- Used for the advisor summary so the whole sentence reads instead of clipping.
 local function wrap_disp(s, width)
+	s = tostring(s)
+	if #s > WRAP_DISP_MAX_BYTES then
+		s = s:sub(1, WRAP_DISP_MAX_BYTES) .. "…"
+	end
 	local rows, line = {}, ""
-	for word in tostring(s):gmatch("%S+") do
+	for word in s:gmatch("%S+") do
 		if line == "" then
 			line = word
 		elseif vim.fn.strdisplaywidth(line .. " " .. word) <= width then
@@ -1006,8 +1024,9 @@ local function wrap_disp(s, width)
 			line = word
 		end
 		while vim.fn.strdisplaywidth(line) > width do -- lone over-long word: hard-split
-			rows[#rows + 1] = disp_take(line, width)
-			line = line:sub(#disp_take(line, width) + 1)
+			local part = disp_take(line, width) -- computed once, not twice, per pass
+			rows[#rows + 1] = part
+			line = line:sub(#part + 1)
 		end
 	end
 	if line ~= "" then
@@ -1368,6 +1387,11 @@ local function abort_decision_state(receipt)
 	-- Safe when no compaction is in flight: with no extmark armed the receipt
 	-- rewrite is skipped and only the (already-nil) timer handle is cleared.
 	finish_compact_modal("interrupted")
+	-- Set on every tool_use, cleared only on tool_result. If the CLI dies
+	-- mid-tool this teardown sweep is the only other place that runs, so clear
+	-- it here too — otherwise the activity line stays suppressed until the next
+	-- tool_use overwrites it.
+	state.tool_run = nil
 end
 Render.abort_decision_state = abort_decision_state
 
@@ -1399,17 +1423,23 @@ local function is_rate_limit_blocking(status)
 		return false
 	end
 	local s = status:lower()
-	if
-		s == "allowed"
-		or s:find("allow", 1, true)
-		or s:find("warn", 1, true)
-		or s:find("approach", 1, true)
-		or s == "ok"
-	then
+	-- A blacklist of exact-known-safe values is meant to fail closed on any
+	-- unknown status — but the original s:find("allow") substring check also
+	-- matched "not_allowed"/"disallowed"/"allowance_exceeded", the most natural
+	-- names for a genuinely BLOCKING status, and treated them as safe. Anchoring
+	-- to exact matches + prefix-anchored warning forms already fixes that (none
+	-- of those three equal "allowed" or start with "warn"/"approach", so they
+	-- now correctly fall through to blocking) — no separate not_/dis rule
+	-- needed, and adding one would just trade this false-negative for a new
+	-- false-positive on some future safe status that happens to start with
+	-- "dis" (e.g. a hypothetical "disabled"). The enum is still [VERIFY]-open;
+	-- don't guess further than the evidence in hand supports.
+	if s == "allowed" or s == "ok" or s:match("^warn") or s:match("^approach") then
 		return false
 	end
 	return true
 end
+Render._is_rate_limit_blocking = is_rate_limit_blocking -- exposed for the Goal-12 regression spec
 
 local function render_rate_limit(info)
 	local status = info.status
@@ -1648,13 +1678,14 @@ local function parse_search_result(body)
 	if #body == 0 then
 		return 0, {}
 	end
-	local n = body[1]:match("^Found%s+(%d+)")
-	if n then
+	if body[1]:match("^Found%s+%d+") then
 		local files = {}
 		for i = 2, #body do
 			files[#files + 1] = body[i]
 		end
-		return tonumber(n), files
+		-- Derive the count from the actual file list, not the CLI's own "Found N
+		-- files" header — the two can disagree.
+		return #files, files
 	end
 	if body[1]:match("^No files") or body[1]:match("^No matches") then
 		return 0, {}
@@ -1779,7 +1810,13 @@ function Render.expand_result()
 			if sp and sp[1] and ep and ep[1] then
 				local s, en = sp[1], ep[1]
 				local d = (cur >= s and cur <= en) and 0 or math.min(math.abs(cur - s), math.abs(cur - en))
-				if not pick_d or d < pick_d then
+				-- Distance ceiling: adjacent result blocks whose trailing blank line
+				-- got dropped can end up with overlapping [start,end] marks, so
+				-- "nearest by distance" with no ceiling could toggle a block the
+				-- cursor isn't anywhere near. Cap the tolerance to this block's own
+				-- height (min 1) so only a genuinely close miss still counts.
+				local tolerance = math.max(en - s + 1, 1)
+				if d <= tolerance and (not pick_d or d < pick_d) then
 					pick_d, pick = d, { e = e, s = s, en = en }
 				end
 			end
@@ -2031,8 +2068,13 @@ local function dispatch(event)
 	-- a COMPACT nested one-liner for its tool calls in main, then RETURN — do NOT
 	-- fall through to the full inline render (that flooded main with every inner
 	-- event). See FINDINGS § Q-SUBAGENT-STREAM.
+	-- control_request MUST always reach its own branches below (the CLI blocks
+	-- its turn until every control_request is answered — dropping one hangs the
+	-- session), even if the CLI ever tags a subagent's tool-permission request
+	-- with parent_tool_use_id the way it tags that subagent's other inner events.
+	-- The short-circuit below is for renderable subagent activity only.
 	local parent = event.parent_tool_use_id
-	if parent then
+	if parent and ev_type ~= "control_request" then
 		local sub = subagent_by_id(parent)
 		if sub then
 			-- The subagent's model isn't in the spawn event — it first appears on its
@@ -2067,6 +2109,11 @@ local function dispatch(event)
 			render_subagent_inline(event, sub) -- compact, capped trail in main
 			return
 		end
+		-- parent_tool_use_id is real but no subagent matched it (e.g. a deferred
+		-- dismiss race) — this is still not a main-transcript event; drop it rather
+		-- than falling through to the full inline render below, which is exactly
+		-- what this function's own comment above says must never happen.
+		return
 	end
 
 	if ev_type == "system" and event.subtype == "init" then
@@ -2114,8 +2161,14 @@ local function dispatch(event)
 		elseif event.compact_result ~= nil and event.compact_result ~= vim.NIL then
 			-- Boundary (with stats) usually lands in the same batch; defer the bare close so
 			-- it wins. The guard skips if the boundary already finalized.
+			-- Capture the mark at schedule time and compare identity on fire: if a
+			-- second compaction starts before this timer fires, state.compact_mark
+			-- now points at the NEW compaction, and a bare `if state.compact_mark`
+			-- check would stop ITS timer and show a false "done" while it's still
+			-- running.
+			local scheduled_mark = state.compact_mark
 			vim.defer_fn(function()
-				if state.compact_mark then
+				if state.compact_mark and state.compact_mark == scheduled_mark then
 					finish_compact_modal(nil)
 				end
 			end, 500)
@@ -2370,9 +2423,15 @@ local function dispatch(event)
 				-- capture the full list (each call replaces it) and re-render the float.
 				local sd = block.id and widgets.search_descriptor(name, input)
 				if name == "TodoWrite" then
-					state.todos = input.todos or {}
-					widgets.update_todo_widget()
-					widgets.reflow_bottom_floats()
+					-- input.todos is model-controlled and unvalidated; a non-table value
+					-- (e.g. a string) passes the widget's `todos and #todos > 0` guard
+					-- (#"oops" == 1) and then throws in ipairs(). Reject the shape here,
+					-- once, rather than trusting every downstream reader.
+					if type(input.todos) == "table" then
+						state.todos = input.todos
+						widgets.update_todo_widget()
+						widgets.reflow_bottom_floats()
+					end
 				elseif name == "TaskCreate" or name == "TaskUpdate" then
 					-- Headless toolset has no TodoWrite; the plan rides the Task* family.
 					-- Drives the same bottom-pinned widget, not an inline tool block.

@@ -2578,4 +2578,84 @@ H.check(
 claude.interrupt()
 vim.wait(30)
 
+-- ── S40: MultiEdit/NotebookEdit must NOT auto-allow when the target is watchable —
+-- Goal 12 /code-crit Critical finding (gate.lua:168, .work/GOAL12-FINDINGS.md): only
+-- Edit/Write are in GATED_EDIT_TOOLS, so MultiEdit/NotebookEdit skip try_prewrite_gate
+-- entirely. render.lua's can_use_tool branch then auto-allows them the moment
+-- claude_diff.watch() succeeds — the write lands before ANY human decision, with only
+-- a post-write vimdiff review after the fact. For a self-executing target (~/.bashrc,
+-- .git/hooks/pre-commit, nvim config) the write IS the exploit; undo-after-write is too
+-- late. Fix must route MultiEdit/NotebookEdit through a decision surface (permission
+-- card, same as the watch()-failure fallback already one line below it) BEFORE
+-- allowing, never straight to auto-allow.
+local s40_diff = package.loaded["utils.claude_diff"]
+local prior_s40_watch = s40_diff.watch
+s40_diff.watch = function()
+	return true
+end -- simulate a successful watch (existing, readable target)
+
+local s40_sends = {}
+local prior_chansend_s40 = vim.fn.chansend
+vim.fn.chansend = function(_, data)
+	table.insert(s40_sends, data)
+	return #data
+end
+
+local function s40_allowed(request_id)
+	for _, line in ipairs(s40_sends) do
+		if line:find(request_id, 1, true) and line:find('"allow"', 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+feed({
+	type = "control_request",
+	request_id = "s40-multiedit",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "MultiEdit",
+		input = { file_path = "/home/k0d3x/.bashrc", edits = { { old_string = "a", new_string = "b" } } },
+	},
+})
+H.check(
+	"S40 MultiEdit is not auto-allowed once watch() succeeds — a decision surface opens first",
+	not s40_allowed("s40-multiedit"),
+	"sends=" .. vim.inspect(s40_sends)
+)
+H.check(
+	"S40 MultiEdit opens a permission card instead of writing unattended",
+	claude.state.perm ~= nil,
+	"perm=" .. tostring(claude.state.perm)
+)
+if claude.state.perm then
+	require("utils.claude.gate").resolve_permission("deny")
+	vim.wait(30)
+end
+
+s40_sends = {}
+feed({
+	type = "control_request",
+	request_id = "s40-notebook",
+	request = {
+		subtype = "can_use_tool",
+		tool_name = "NotebookEdit",
+		input = { notebook_path = "/home/k0d3x/.bashrc", new_source = "x" },
+	},
+})
+H.check(
+	"S40 NotebookEdit is not auto-allowed once watch() succeeds — a decision surface opens first",
+	not s40_allowed("s40-notebook"),
+	"sends=" .. vim.inspect(s40_sends)
+)
+H.check("S40 NotebookEdit opens a permission card instead of writing unattended", claude.state.perm ~= nil)
+if claude.state.perm then
+	require("utils.claude.gate").resolve_permission("deny")
+	vim.wait(30)
+end
+
+vim.fn.chansend = prior_chansend_s40
+s40_diff.watch = prior_s40_watch
+
 H.summary("claude_stream")

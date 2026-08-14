@@ -162,8 +162,11 @@ Gate.send_control_error = send_control_error
 -- Write/Edit) hold the request open and show a PRE-write diff reconstructed from
 -- the tool input — accept releases "allow" (the CLI then writes + narrates,
 -- post-approval), reject releases "deny" (nothing touches disk). The rest
--- (MultiEdit/NotebookEdit) keep the old contract: auto-allow, then the post-write
--- FileChangedShell+vimdiff flow owns the review.
+-- (MultiEdit/NotebookEdit) have no pre-write diff reconstruction (multi-edit lists /
+-- notebook cells), so they fall back to the generic permission card instead — same
+-- "decision before write" contract, just without the diff preview (render.lua's
+-- can_use_tool dispatch). Never auto-allow: for a self-executing target the write
+-- IS the exploit (Critical, Goal 12 /code-crit, .work/GOAL12-FINDINGS.md).
 local EDIT_TOOLS = { Edit = true, Write = true, MultiEdit = true, NotebookEdit = true }
 local GATED_EDIT_TOOLS = { Edit = true, Write = true }
 Gate.EDIT_TOOLS = EDIT_TOOLS
@@ -173,7 +176,7 @@ Gate.GATED_EDIT_TOOLS = GATED_EDIT_TOOLS
 -- having written anything: read the (still pristine) file from disk and mirror the
 -- CLI's plain-text old_string→new_string replacement, honouring replace_all.
 -- Returns a lines list, or nil when reconstruction isn't possible (file missing,
--- old_string absent/empty) — the caller falls back to auto-allow + post-write.
+-- old_string absent/empty) — the caller falls back to the generic permission card.
 -- Disk, not buffer: the CLI edits the on-disk content, so unsaved buffer edits
 -- must not leak into the "proposed" side.
 local function reconstruct_edit(path, input)
@@ -295,8 +298,10 @@ end
 -- reject. On resolve it replies (send_permission_response), closes the float, and
 -- drops a one-line receipt into the transcript so the scrollback records the
 -- decision. One card at a time (the CLI blocks the turn awaiting our
--- control_response). Edits never reach here (auto-allowed → vimdiff). Mirrors
--- OpenCode's card.
+-- control_response). GATED edits (Edit/Write) never reach here — they get the
+-- pre-write diff card instead (try_prewrite_gate); MultiEdit/NotebookEdit route
+-- here same as Bash/WebFetch, since they have no pre-write diff reconstruction.
+-- Mirrors OpenCode's card.
 
 -- Repaint the float's button row (p.row, 0-indexed last content line) in place:
 -- the active option pops (ClaudeQuestion), the rest dim (ClaudeDim). Called on

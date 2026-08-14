@@ -361,10 +361,22 @@ local function buf_append(lines)
 	if not (buf and vim.api.nvim_buf_is_valid(buf)) then
 		return
 	end
+	-- nvim_buf_set_lines hard-rejects any entry containing "\n" ("replacement
+	-- string item contains newlines"). Several render.lua branches (Edit/Artifact
+	-- headers, hook systemMessage, rate-limit type) fed model/CLI-controlled text
+	-- straight through without stripping — sanitize here ONCE so every caller is
+	-- covered, present and future, instead of chasing each call site.
+	local clean = {}
+	for i, line in ipairs(lines) do
+		clean[i] = tostring(line):gsub("[\r\n]+", " ")
+	end
 	vim.bo[buf].modifiable = true
 	local last = vim.api.nvim_buf_line_count(buf)
-	vim.api.nvim_buf_set_lines(buf, last, last, false, lines)
+	local ok, err = pcall(vim.api.nvim_buf_set_lines, buf, last, last, false, clean)
 	vim.bo[buf].modifiable = false
+	if not ok then
+		error(err, 0)
+	end
 	-- auto-follow: keep the newest line in view as output streams. We use
 	-- nvim_win_call + `normal! G` rather than nvim_win_set_cursor because setting
 	-- the cursor of a NON-focused window (the common case — focus is in the input

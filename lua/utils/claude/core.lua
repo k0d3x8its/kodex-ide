@@ -333,12 +333,17 @@ local SEP_FRAC = 0.5
 -- call so it shrinks/extends with the window instead of wrapping. Falls back to
 -- the configured width when the window isn't realised yet (e.g. cold render).
 local function sep_line()
-	local w = panel_width()
-	if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
-		w = vim.api.nvim_win_get_width(state.panel_win)
-	end
-	return string.rep("─", math.max(math.floor(w * SEP_FRAC), 1))
+	return string.rep("─", math.max(math.floor(panel_width() * SEP_FRAC), 1))
 end
+
+-- Extmarks track which buffer lines are ACTUAL separators (appended via
+-- append_separator below), independent of their current line number — an
+-- extmark moves with edits, so refit_separators can find them again after the
+-- buffer has grown. Without this, refit_separators had to guess by content
+-- ("is this line entirely '─'?"), which also matched horizontal-rule lines
+-- inside Claude's OWN rendered markdown output, rewriting those to the panel
+-- width too.
+local sep_ns = vim.api.nvim_create_namespace("ClaudeSepMark")
 
 -- Append lines to the panel buffer, bypassing its nomodifiable lock.
 --
@@ -397,6 +402,18 @@ local function buf_append(lines)
 	end
 end
 
+-- Append a separator line and mark it (sep_ns) so refit_separators can find it
+-- again by identity, not by content-sniffing. Single line only — always the
+-- new last line right after buf_append, so the extmark position is exact.
+local function append_separator()
+	local buf = state.panel_buf
+	buf_append({ sep_line() })
+	if buf and vim.api.nvim_buf_is_valid(buf) then
+		local row = vim.api.nvim_buf_line_count(buf) - 1
+		vim.api.nvim_buf_set_extmark(buf, sep_ns, row, 0, {})
+	end
+end
+
 -- ─── Highlight helpers ────────────────────────────────────────────────────────
 
 -- Apply a highlight group to a contiguous range of lines (0-indexed) in the
@@ -444,7 +461,9 @@ end
 
 Core.panel_width = panel_width
 Core.sep_line = sep_line
+Core.sep_ns = sep_ns
 Core.buf_append = buf_append
+Core.append_separator = append_separator
 Core.hl_lines = hl_lines
 Core.hl_range = hl_range
 Core.free_below = free_below

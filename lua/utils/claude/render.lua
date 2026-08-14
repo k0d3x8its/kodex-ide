@@ -2504,20 +2504,17 @@ local function dispatch(event)
 					gate.show_permission_card(event)
 				end
 			else
-				-- MultiEdit/NotebookEdit: never gated by design — pre-load the target so
-				-- the FileChangedShell interceptor catches the write, then auto-allow.
-				-- The vimdiff review happens AFTER the CLI writes.
-				local watched = require("utils.claude_diff").watch(input.file_path or input.notebook_path)
-				if watched then
-					gate.send_permission_response(event.request_id, "allow", { input = req.input })
-				else
-					-- watch() no-op'd (empty/nil path, panel inactive, or bufadd failed) —
-					-- MultiEdit/NotebookEdit has NO other review surface, so auto-allowing
-					-- here would write with zero review at any point (security: 2026-07-19
-					-- audit finding). Fall back to the generic permission card, same as the
-					-- gated-tools reconstruction-failure branch above.
-					gate.show_permission_card(event)
-				end
+				-- MultiEdit/NotebookEdit: not in GATED_EDIT_TOOLS (no pre-write DIFF
+				-- reconstruction for multi-edit lists / notebook cells), but they MUST
+				-- still stop for a decision before the write lands — auto-allowing here
+				-- put the write ahead of any human decision, and for a self-executing
+				-- target (~/.bashrc, .git/hooks/pre-commit, nvim config) the write IS the
+				-- exploit; a post-write undo is too late (Critical, Goal 12 /code-crit,
+				-- .work/GOAL12-FINDINGS.md, gate.lua:168). Pre-load the target regardless
+				-- of the decision surface so an eventual "Allow once" still gets the
+				-- post-write vimdiff review via the FileChangedShell interceptor.
+				require("utils.claude_diff").watch(input.file_path or input.notebook_path)
+				gate.show_permission_card(event)
 			end
 		elseif tool == "AskUserQuestion" then
 			-- Structured multiple-choice questions ride the same gate but are NOT an

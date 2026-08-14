@@ -43,6 +43,7 @@ local buf_append = core.buf_append
 local hl_lines = core.hl_lines
 local hl_range = core.hl_range
 local sep_line = core.sep_line
+local append_separator = core.append_separator
 local panel_width = core.panel_width
 
 local build_md_lines = markdown.build_md_lines
@@ -242,7 +243,7 @@ local function render_user(text, note, steer)
 	-- no longer end with a trailing divider — the next turn's top one divides them.
 	if not last_line_is_sep() then
 		local sep_at = vim.api.nvim_buf_line_count(state.panel_buf)
-		buf_append({ sep_line() })
+		append_separator()
 		hl_lines(sep_at, sep_at, "ClaudeHeader")
 	end
 	-- Fence-aware echo: prose lines get the ❯ arrow (first) / 2-space indent and

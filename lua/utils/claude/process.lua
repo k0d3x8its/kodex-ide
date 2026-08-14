@@ -103,12 +103,22 @@ local function eventlog_write(line)
 	if not eventlog_path then
 		return
 	end
-	local fh = io.open(eventlog_path, "a")
-	if not fh then
+	-- lstat (NOT stat) so a pre-planted symlink at eventlog_path is seen as a
+	-- symlink, not followed — every line written here is a raw stream-json
+	-- turn (full conversation, tool-read file contents, any credential the
+	-- session touched); a symlink redirect would append that verbatim into
+	-- whatever the link points at. Same guard `mod.caveman_active` (init.lua)
+	-- already applies on the read side.
+	local st = vim.loop.fs_lstat(eventlog_path)
+	if st and st.type ~= "file" then
 		return
 	end
-	fh:write(line, "\n")
-	fh:close()
+	local fd = vim.loop.fs_open(eventlog_path, "a", tonumber("600", 8))
+	if not fd then
+		return
+	end
+	vim.loop.fs_write(fd, line .. "\n")
+	vim.loop.fs_close(fd)
 end
 
 --- Reset the stdout line-buffer. Called by init's ensure_panel_buf (new buffer)
@@ -130,6 +140,22 @@ local function uuid4()
 	)
 end
 Process.uuid4 = uuid4
+
+-- Encode + write one stream-json {type:"user"} turn message to the live
+-- process's stdin. Shared by dispatch_send, steer, and send_followup — all
+-- three write the identical envelope; factored so a checked-send fix lands
+-- once instead of drifting across three copies (process.lua:433 finding).
+-- Returns true only when the write actually landed (chansend returning 0
+-- means the channel is closed/closing — the process died between the last
+-- check and this write).
+local function write_user_message(text)
+	local msg = vim.json.encode({
+		type = "user",
+		message = { role = "user", content = { { type = "text", text = text } } },
+	})
+	local ok, written = pcall(vim.fn.chansend, state.job_id, msg .. "\n")
+	return ok and written ~= 0
+end
 
 -- Standing guidance appended to the panel session's system prompt. In headless
 -- SDK mode claude has no Grep/Glob tool, so it searches via Bash — steer it to
@@ -232,6 +258,13 @@ end
 -- nil punched into the array part would be an ipairs-stopping hole.
 local function strip_nulls(node)
 	if vim.islist(node) then
+		-- An empty table is ambiguous between JSON `[]` and `{}` — vim.islist
+		-- treats {} as a (zero-length) list, so an empty object nested in a
+		-- decoded event would otherwise silently re-encode as `[]` downstream,
+		-- losing its empty_dict identity.
+		if next(node) == nil then
+			return node
+		end
 		local compacted = {}
 		for _, item in ipairs(node) do
 			if item ~= vim.NIL then
@@ -433,20 +466,14 @@ local function dispatch_send(text)
 	state.flavor_idx = math.random(#FLAVOR)
 	state.flavor_word = FLAVOR[state.flavor_idx]
 	start_spinner()
-	-- One stream-json `user` message per turn, newline-terminated. The process
-	-- reads it from stdin, streams events back, and waits for the next message.
-	local msg = vim.json.encode({
-		type = "user",
-		message = { role = "user", content = { { type = "text", text = text } } },
-	})
-	-- chansend returns bytes written — 0 means the channel is closed/closing
-	-- (the process died between ensure_process and here, before on_exit fired). The
-	-- dropped result used to leave state.working=true + the spinner climbing forever
-	-- with no result event ever coming. Treat 0 (or a pcall error) as process death:
-	-- tear down the working state so the panel doesn't hang. on_exit still runs its
-	-- own sweep when the async exit lands.
-	local ok, written = pcall(vim.fn.chansend, state.job_id, msg .. "\n")
-	if not ok or written == 0 then
+	-- One stream-json `user` message per turn. The process reads it from stdin,
+	-- streams events back, and waits for the next message. A failed write (the
+	-- process died between ensure_process and here, before on_exit fired) used
+	-- to leave state.working=true + the spinner climbing forever with no result
+	-- event ever coming — treat it as process death: tear down the working
+	-- state so the panel doesn't hang. on_exit still runs its own sweep when
+	-- the async exit lands.
+	if not write_user_message(text) then
 		state.working = false
 		stop_spinner()
 		clear_hint()
@@ -533,13 +560,25 @@ local function steer(text)
 	-- separator (user-reported 2026-07-15). The next stream event re-adds the placeholder
 	-- below the echo.
 	remove_typing_ph()
-	for _, m in ipairs(msgs) do
+	for index, m in ipairs(msgs) do
 		render_user(m, nil, true) -- echo as a steered user line (mid-transcript)
-		local msg = vim.json.encode({
-			type = "user",
-			message = { role = "user", content = { { type = "text", text = m } } },
-		})
-		pcall(vim.fn.chansend, state.job_id, msg .. "\n")
+		-- write_user_message can fail mid-loop (process died between messages).
+		-- Sibling senders (dispatch_send, send_followup) already guard this
+		-- exact write; steer was the one holdout — a dropped write here quietly
+		-- lost the user's queued + just-typed messages while the transcript
+		-- still showed them as delivered. Restore whatever didn't make it back
+		-- onto the queue rather than discarding it.
+		if not write_user_message(m) then
+			for restore = index, #msgs do
+				state.queue[#state.queue + 1] = msgs[restore]
+			end
+			render_queue()
+			vim.notify(
+				"Claude: message not delivered (session closed) — next message starts a fresh session",
+				vim.log.levels.WARN
+			)
+			return true
+		end
 	end
 	render_queue() -- queue drained → clear the amber queued lines
 	return true
@@ -565,12 +604,7 @@ local function send_followup(text)
 	end
 	remove_typing_ph()
 	render_user(text, nil, true)
-	local msg = vim.json.encode({
-		type = "user",
-		message = { role = "user", content = { { type = "text", text = text } } },
-	})
-	local ok, written = pcall(vim.fn.chansend, state.job_id, msg .. "\n")
-	return ok and written ~= 0
+	return write_user_message(text)
 end
 Process.send_followup = send_followup
 

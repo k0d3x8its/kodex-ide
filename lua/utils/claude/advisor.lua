@@ -45,11 +45,17 @@ local panel_float_geom
 local harden_float_scroll
 local pet_attach_surface -- Clawd hops onto the modal's top border while it's open
 local pet_attach_panel -- …and back to the panel corner on close
+-- A question/permission card can arrive while this picker is up (see
+-- show_question_card/show_permission_card's open-guards) and queue behind it —
+-- unlike those cards, the picker has no queue of its own to hand off to on close,
+-- so it must explicitly poke init to retry whatever's waiting (mirrors effort.lua).
+local try_resume_decision_queues
 
 --- Inject init's float helpers. Called once from init after they are defined.
 function Advisor.wire(hooks)
 	panel_float_geom = hooks.panel_float_geom
 	harden_float_scroll = hooks.harden_float_scroll
+	try_resume_decision_queues = hooks.try_resume_decision_queues
 	pet_attach_surface = hooks.pet_attach_surface
 	pet_attach_panel = hooks.pet_attach_panel
 end
@@ -176,15 +182,25 @@ end
 
 --- Close the picker without applying. Refocuses the panel window.
 function Advisor.close()
-	if modal.win and vim.api.nvim_win_is_valid(modal.win) then
-		vim.api.nvim_win_close(modal.win, true)
-	end
-	if modal.prev_win and vim.api.nvim_win_is_valid(modal.prev_win) then
-		pcall(vim.api.nvim_set_current_win, modal.prev_win)
-	end
+	local was_open = Advisor.active()
+	local win, prev_win = modal.win, modal.prev_win
+	-- Nil the tracked fields BEFORE closing the window (mirrors effort.lua/
+	-- question.lua's close_question_card) so the WinClosed fallback autocmd below
+	-- no-ops when THIS call is what triggers the close, instead of recursing.
 	modal.win, modal.buf, modal.ns, modal.on_confirm, modal.prev_win = nil, nil, nil, nil, nil
-	if pet_attach_panel then
+	if win and vim.api.nvim_win_is_valid(win) then
+		pcall(vim.api.nvim_win_close, win, true)
+	end
+	if prev_win and vim.api.nvim_win_is_valid(prev_win) then
+		pcall(vim.api.nvim_set_current_win, prev_win)
+	end
+	if was_open and pet_attach_panel then
 		pet_attach_panel()
+	end
+	-- A question/permission card may be queued behind this picker (see the wire-time
+	-- doc above) — only worth trying if the picker was actually open.
+	if was_open and try_resume_decision_queues then
+		pcall(try_resume_decision_queues)
 	end
 end
 
@@ -240,6 +256,20 @@ function Advisor.open(on_confirm)
 	if pet_attach_surface then
 		pet_attach_surface(modal.win)
 	end
+
+	-- Float vanished by some path OTHER than Advisor.close() → run the same teardown
+	-- so modal state doesn't strand a live, focusable, keymap-bound window (mirrors
+	-- effort.lua's identical fallback).
+	local opened_win = modal.win
+	vim.api.nvim_create_autocmd("WinClosed", {
+		pattern = tostring(opened_win),
+		once = true,
+		callback = function()
+			if modal.win == opened_win then
+				Advisor.close()
+			end
+		end,
+	})
 
 	local function map(lhs, fn)
 		vim.keymap.set("n", lhs, fn, { buffer = modal.buf, nowait = true, silent = true })

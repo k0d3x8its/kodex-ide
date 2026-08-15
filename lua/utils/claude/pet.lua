@@ -48,6 +48,21 @@ local PRIORITY = {
 	"idle",
 	"sleep",
 }
+M._PRIORITY = PRIORITY -- exposed so the render-map completeness spec derives its
+-- state list from here instead of hand-maintaining a second copy that drifts
+-- stale (2026-08-15, Goal 12 batch 3 — the spec's own list had silently fallen
+-- 4 states behind this one).
+
+-- Flash values that are a one-shot RESULT indicator: once the idle progression
+-- starts ticking (M.advance's first stage match), these yield to idle/groove/
+-- sleep instead of freezing the pet on the result sprite forever. Implements
+-- fresh_conditions' `flash` doc below ("persist until the next turn or user
+-- action supersedes them") for ALL flash values, not just `happy` — previously
+-- diff_approved/diff_rejected/error left M.idle_from nil'd instead of started,
+-- so this handoff never fired for them, and user_action's own idle_from-gated
+-- guard could never rescue them either (2026-08-15, Goal 12 batch 3
+-- Critical/High).
+local ONE_SHOT_FLASH = { happy = true, diff_approved = true, diff_rejected = true, error = true }
 
 -- ── Idle progression schedule (spec §Idle Progression) ───────────────────────
 -- Seconds-since-idle-start → phase. Ordered high→low so the first threshold met
@@ -263,7 +278,13 @@ local function refresh()
 		-- pcall: emit runs on the hot stream-json dispatch path (which also renders
 		-- the transcript). The renderer is a no-op stub today, but once the image.nvim
 		-- renderer lands a throw here must NOT propagate up and break dispatch.
-		pcall(M.render, next_state, prev)
+		local render_ok, render_err = pcall(M.render, next_state, prev)
+		if not render_ok and vim and vim.notify then
+			-- Surface instead of silently swallowing (2026-08-15 fix, Goal 12 batch 3
+			-- Medium) — previously a render throw here left zero trace; "the pet
+			-- stopped updating" had nothing to grep for.
+			vim.notify("pet render failed: " .. tostring(render_err), vim.log.levels.WARN)
+		end
 	end
 	return M.state
 end
@@ -347,6 +368,11 @@ function M.emit(event, data)
 	elseif event == "diff_resolve" then
 		c.diff = nil
 		c.flash = data.accepted and "diff_approved" or "diff_rejected"
+		-- Same handoff as the result/ok path below: start the idle clock so this
+		-- one-shot flash decays into idle/groove/sleep (2026-08-15 fix, Goal 12
+		-- batch 3 Critical — diff_open had already nil'd idle_from, and nothing
+		-- here restarted it, so the pet froze on this sprite forever).
+		enter_idle(now)
 	elseif event == "diff_close" then
 		-- Safety-net clear. on_diff_close is the single choke point EVERY diff resolve
 		-- path funnels through — the card, the prewrite gate, AND the winbar
@@ -367,9 +393,13 @@ function M.emit(event, data)
 			c.flash = "happy"
 			enter_idle(now)
 		else
+			-- Same handoff as the ok branch above (2026-08-15 fix, Goal 12 batch 3):
+			-- an error flash used to leave idle_from nil'd, so it could neither decay
+			-- to sleep nor be rescued by user_action (its guard requires idle_from
+			-- ~= nil). enter_idle starts the clock; ONE_SHOT_FLASH still lets `error`
+			-- outrank idle/groove/sleep in the resolver until the clock actually ticks.
 			c.flash = "error"
-			c.idle_phase = nil
-			M.idle_from = nil
+			enter_idle(now)
 		end
 	elseif event == "interrupt" then
 		-- User aborted the turn (control_request interrupt). Surface the error sprite
@@ -381,8 +411,8 @@ function M.emit(event, data)
 		c.work = nil
 		c.subagent = false
 		c.flash = "error"
-		c.idle_phase = nil
-		M.idle_from = nil
+		-- Same one-shot handoff as result's error branch above (2026-08-15 fix).
+		enter_idle(now)
 	elseif event == "user_action" then
 		-- Any interaction that resets the idle progression (panel focus, keymap,
 		-- diff interaction). Only meaningful while idling; ignored mid-turn.
@@ -406,13 +436,17 @@ function M.advance(now)
 	if M.idle_from == nil then
 		return M.state
 	end
-	local elapsed = (now or 0) - M.idle_from
+	-- Clamp: an inconsistent injected `now` (vs the wall clock M.idle_from was set
+	-- from) could otherwise go negative, matching no stage and leaving idle_phase
+	-- stale instead of resetting (2026-08-15 fix, Goal 12 batch 3 Low). Harmless
+	-- today (the real clock is monotonic); a latent trap for the test harness.
+	local elapsed = math.max(0, (now or 0) - M.idle_from)
 	for _, stage in ipairs(IDLE_STAGES) do
 		if elapsed >= stage.at then
 			M.cond.idle_phase = stage.phase
-			-- happy is a one-shot; once the idle clock is ticking, drop it so idle/
-			-- groove/sleep can surface.
-			if M.cond.flash == "happy" then
+			-- One-shot RESULT flashes yield to the idle progression once it starts
+			-- ticking — see ONE_SHOT_FLASH's own comment above.
+			if ONE_SHOT_FLASH[M.cond.flash] then
 				M.cond.flash = nil
 			end
 			break

@@ -123,23 +123,28 @@ function Widgets.open_prompt_float(title, initial, on_commit, opts)
 	})
 	vim.wo[win].winhighlight = "FloatBorder:ClaudeBarBorder,FloatTitle:ClaudeBarBorder,NormalFloat:ClaudeBarBg"
 
-	-- Overlay mode only: this float is `relative="win"` to the anchor card — if
-	-- that card closes by ANY path while the overlay is still open (CLI death/
-	-- reset via abort_permission_cards, a concurrent queue-drain, anything other
-	-- than this float's own finish()), nvim does not auto-close a dependent float
-	-- when its anchor dies; it's left orphaned and can be repositioned against
-	-- whatever window/buffer is current, which is how it ends up drawn over
-	-- unrelated content (live-reported: stray note box over the editor pane).
-	-- A `relative="win"` float must not be able to outlive its anchor — that's a
-	-- structural invariant, not conditional on identifying which path triggered
-	-- it. Close ONLY this window directly (not via finish()/on_commit — those
-	-- assume the card still exists to refocus/resolve against; the card is
-	-- already gone by the time this fires). `once` because this float's own
-	-- normal close (finish()) already tears it down before the card ever closes
-	-- in the ordinary path, so this only fires in the orphan case.
-	if opts.at then
+	-- This float must not be able to outlive the caller's own window — if that
+	-- window closes by ANY path while the prompt is still open (CLI death/reset,
+	-- a concurrent queue-drain, anything other than this float's own finish()),
+	-- nvim does not auto-close a dependent float when its anchor/caller dies;
+	-- left orphaned, it can be repositioned against whatever window/buffer is
+	-- current, which is how it ends up drawn over unrelated content (live-
+	-- reported: stray note box over the editor pane; also the editor-relative
+	-- mode's own "Type something"/note float staying open and focused over a
+	-- torn-down question card, silently eating further keystrokes). Overlay mode
+	-- (`opts.at`) watches its anchor window; every other mode watches
+	-- `opts.watch_win` if the caller supplies one (question.lua passes its
+	-- card's own win) — either way this is a structural invariant, not
+	-- conditional on identifying which path triggered the close. Close ONLY this
+	-- window directly (not via finish()/on_commit — those assume the caller
+	-- still exists to refocus/resolve against; it's already gone by the time
+	-- this fires). `once` because this float's own normal close (finish())
+	-- already tears it down before the watched window ever closes in the
+	-- ordinary path, so this only fires in the orphan case.
+	local watch_win = (opts.at and opts.at.win) or opts.watch_win
+	if watch_win then
 		vim.api.nvim_create_autocmd("WinClosed", {
-			pattern = tostring(opts.at.win),
+			pattern = tostring(watch_win),
 			once = true,
 			callback = function()
 				if vim.api.nvim_win_is_valid(win) then
@@ -173,8 +178,13 @@ function Widgets.open_prompt_float(title, initial, on_commit, opts)
 			pcall(vim.api.nvim_win_close, win, true)
 		end
 		if opts.guard and not opts.guard() then
+			-- The caller's modal vanished while the user was typing (session died, a
+			-- concurrent teardown fired) — text is real and was about to commit, but
+			-- there's nowhere left to deliver it. Notify rather than silently dropping
+			-- it, so the user isn't left wondering where their typed answer went.
+			vim.notify("Claude: typed answer discarded (card closed before it could be saved)", vim.log.levels.WARN)
 			return
-		end -- caller's modal gone while typing
+		end
 		local refocus_win = opts.refocus and opts.refocus()
 		if refocus_win and vim.api.nvim_win_is_valid(refocus_win) then
 			pcall(vim.api.nvim_set_current_win, refocus_win)

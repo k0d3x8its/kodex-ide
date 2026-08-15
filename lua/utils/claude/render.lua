@@ -37,6 +37,8 @@ local markdown = require(require_prefix .. "markdown")
 local widgets = require(require_prefix .. "widgets")
 local gate = require(require_prefix .. "gate")
 local question = require(require_prefix .. "question")
+local effort = require(require_prefix .. "effort")
+local advisor = require(require_prefix .. "advisor")
 
 local state = core.state
 local buf_append = core.buf_append
@@ -1384,6 +1386,12 @@ end
 local function abort_decision_state(receipt)
 	gate.abort_permission_cards(receipt)
 	question.abort_question_card(receipt)
+	-- Effort/Advisor have no card of their own to close via the two sweeps above —
+	-- without this, CLI death or a session reset left a live, focusable, keymap-bound
+	-- slider/picker on screen (its <CR> still applies to the NEXT respawned session).
+	-- Both close() calls are no-ops when their modal isn't open.
+	effort.close()
+	advisor.close()
 	-- Safe when no compaction is in flight: with no extmark armed the receipt
 	-- rewrite is skipped and only the (already-nil) timer handle is cleared.
 	finish_compact_modal("interrupted")

@@ -1438,18 +1438,43 @@ slash.wire({
 })
 mod._slash = slash -- test hook
 
+-- Effort/Advisor now participate in the qask/perm open-guard (show_question_card
+-- and show_permission_card both check effort.active()/advisor.active()) — a card
+-- can be QUEUED because one of these modals was up when it arrived. Unlike the
+-- qask/perm/diff_card/prewrite guards, these two have no card of their own to
+-- hand the queue off from when they close, so without this nothing would ever
+-- re-attempt a card queued behind a slider/picker. Tries the question queue
+-- first, then the permission queue, and only when nothing else (another card OR
+-- the other of these two modals) is still blocking.
+local function try_resume_decision_queues()
+	if state.qask or state.perm or state.diff_card or state.prewrite or effort.active() or advisor.active() then
+		return
+	end
+	if state.qask_queue and #state.qask_queue > 0 then
+		question.show_question_card(table.remove(state.qask_queue, 1))
+		return
+	end
+	if state.perm_queue and #state.perm_queue > 0 then
+		gate.show_permission_card(table.remove(state.perm_queue, 1))
+	end
+end
+
 -- ─── Effort slider (/effort) ──────────────────────────────────────────────────
 -- The reasoning-effort modal (claude/effort.lua). Same float helpers as the slash
 -- menu; confirming respawns the process with the new --effort (see mod.pick_effort).
 effort.wire({
 	panel_float_geom = panel_float_geom,
 	harden_float_scroll = harden_float_scroll,
+	attach_panel_float_resize = attach_panel_float_resize,
+	set_bottom_pad = set_bottom_pad,
+	clear_bottom_pad = clear_bottom_pad,
 	pet_attach_surface = function(win)
 		pcall(pet_render.attach_to_surface, win)
 	end,
 	pet_attach_panel = function()
 		pcall(pet_render.attach_to_panel, state.panel_win)
 	end,
+	try_resume_decision_queues = try_resume_decision_queues,
 })
 mod._effort = effort -- test hook
 
@@ -1466,6 +1491,7 @@ advisor.wire({
 	pet_attach_panel = function()
 		pcall(pet_render.attach_to_panel, state.panel_win)
 	end,
+	try_resume_decision_queues = try_resume_decision_queues,
 })
 mod._advisor = advisor -- test hook
 

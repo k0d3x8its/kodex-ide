@@ -14,25 +14,15 @@ local H = dofile("tests/helpers.lua")
 local pr = require("utils.claude.pet_render")
 local pet = require("utils.claude.pet")
 
--- The 14 canonical pet states (docs/clawd-overlay-spec.md § States → assets). This
--- is the renderer's contract with the pure machine: every state pet.resolve() can
--- return must map to an asset.
-local STATES = {
-	"error",
-	"diff_wait",
-	"diff_rejected",
-	"diff_approved",
-	"debugging",
-	"cleaning",
-	"reading",
-	"subagent",
-	"thinking",
-	"typing",
-	"happy",
-	"headphones_groove",
-	"idle",
-	"sleep",
-}
+-- Every state the pure machine's resolver can return. This is the renderer's
+-- contract with pet.lua: every state pet.resolve() can return must map to an
+-- asset. Derived from pet._PRIORITY (2026-08-15 fix, Goal 12 batch 3 High)
+-- instead of a hand-maintained duplicate — the previous hardcoded 14-entry list
+-- had silently fallen 4 states behind PRIORITY's actual 18 (missing `building`,
+-- `notification`, `advising`, `hero`), so this check's own "covers EVERY state"
+-- claim was false and a future PR dropping one of those 4 from STATE_ASSET would
+-- have passed with zero test failure.
+local STATES = pet._PRIORITY
 
 -- ── Map completeness (PR-MAP) ────────────────────────────────────────────────
 local map = pr._STATE_ASSET

@@ -15,10 +15,10 @@
 --     delete (Kitty d=p) was tried and REJECTED: live Ghostty accumulated static
 --     placements (multiple frozen Clawds) even though the payload was valid.
 --   • Z-order: kitty images composite ABOVE nvim text floats regardless of zindex
---     (spike Q2) — a card would bleed the pet on top of it. So the pet HIDES while
---   • Z-order: the pet owns a high-zindex float and re-anchors above whichever
---     bottom surface is active (chat, permission, question, or diff review).
--- state name): stdpath("cache")/kodex_clawd/<skin>/<asset>/000.png…015.png.
+--     (spike Q2), so the pet owns a high-zindex float (see ensure_win) and
+--     re-anchors above whichever bottom surface is active (chat, permission,
+--     question, or diff review) instead of trying to hide behind one.
+--   • Frame cache layout: stdpath("cache")/kodex_clawd/<skin>/<asset>/000.png…015.png.
 --
 -- Everything degrades to a no-op when image.nvim, the assets, or a graphics
 -- terminal are absent (spec § Licensing: a fresh clone without the fetch step must
@@ -487,6 +487,17 @@ local function ensure_win()
 	end
 	-- Recreating the window: the cached frame Images are bound to the OLD (now dead)
 	-- window and would render nothing, so drop them to rebind against the new one.
+	-- Clear each outgoing Image first, mirroring M.teardown() — dropping the table
+	-- bare abandons a live kitty placement per Image (2026-08-15 fix, Goal 12 batch
+	-- 3 Medium): repeated pet_win invalidation/recreate cycles would otherwise leak
+	-- one full placement set per cycle, uncapped.
+	for _, frames in pairs(frames_cache) do
+		for _, img in ipairs(frames) do
+			pcall(function()
+				img:clear(true)
+			end)
+		end
+	end
 	frames_cache = {}
 	shown_img = nil
 	if not (pet_buf and vim.api.nvim_buf_is_valid(pet_buf)) then
@@ -611,21 +622,35 @@ local function ensure_padded(asset, prows, fw, fh)
 	end
 	-- Equal pad top+bottom centers the sprite (feet at the fitted mid-cell); the roll
 	-- then shifts it UP by the lift. lift < p, so nothing wraps around the canvas.
-	-- Build into a staging dir and swap it in back-to-back (fetch-script pattern):
-	-- another live nvim instance may hold Image objects into the old dir, and an
-	-- up-front rm would feed its render ticks "No such file" for the whole convert.
-	local staging = out .. ".staging"
+	-- Build into a PID-suffixed staging dir and swap it in back-to-back (fetch-script
+	-- pattern): another live nvim instance may hold Image objects into the old dir,
+	-- and an up-front rm would feed its render ticks "No such file" for the whole
+	-- convert. The PID suffix (2026-08-15 fix, Goal 12 batch 3 Medium) means two
+	-- concurrent instances building the same never-before-cached asset never share a
+	-- staging path, so neither can observe the other's half-written files — only the
+	-- final `mv` races, and either side's fully-built `out` is a valid result.
+	local staging = ("%s.staging.%d"):format(out, vim.fn.getpid())
+	-- Shell-escaped (not Lua %q, which doesn't escape $/backtick — 2026-08-15 fix,
+	-- Goal 12 batch 3 Medium/security): every current input is hardcoded/static, but
+	-- this closes the injection primitive before `skin`/asset ever becomes
+	-- user-settable. `timeout` bounds the worst case (a stalled `convert`/filesystem
+	-- would otherwise hang this synchronous call — and the render seam that calls it
+	-- — forever; Goal 12 batch 3 High) to a one-time cache-build stall instead of an
+	-- indefinite editor freeze; the existing filereadable(out0) check below already
+	-- falls back to raw frames on any failure, timeout included.
+	local staging_q, raw_dir_q, out_q =
+		vim.fn.shellescape(staging), vim.fn.shellescape(raw_dir), vim.fn.shellescape(out)
 	local cmd = (
-		"rm -rf %q && mkdir -p %q && for f in %q/*.png; do "
+		"rm -rf %s && mkdir -p %s && for f in %s/*.png; do "
 		.. 'convert "$f" -background none -gravity center -extent %dx%d '
-		.. '-roll +0-%d %q/"$(basename "$f")" || exit 1; done '
-		.. "&& rm -rf %q && mv %q %q"
-	):format(staging, staging, raw_dir, fw, fh + 2 * p, lift, staging, out, staging, out)
-	vim.fn.system({ "bash", "-c", cmd })
+		.. '-roll +0-%d %s/"$(basename "$f")" || exit 1; done '
+		.. "&& rm -rf %s && mv %s %s"
+	):format(staging_q, staging_q, raw_dir_q, fw, fh + 2 * p, lift, staging_q, out_q, staging_q, out_q)
+	vim.fn.system({ "timeout", "10", "bash", "-c", cmd })
 	if vim.fn.filereadable(out0) == 1 then
 		return out
 	end
-	trace("padded %s FAILED (convert missing?) — falling back to raw frames", asset)
+	trace("padded %s FAILED (convert missing/timeout?) — falling back to raw frames", asset)
 	return nil
 end
 
@@ -763,8 +788,14 @@ local function clear_shown()
 end
 
 -- ── Timers ───────────────────────────────────────────────────────────────────
+-- Consecutive on_swap_tick failures before the swap timer stops itself rather
+-- than keep re-firing a throwing callback at full frequency (2026-08-15 fix,
+-- Goal 12 batch 3 Medium — see on_swap_tick's own pcall wrapper below).
+local SWAP_TICK_MAX_FAILURES = 5
+local swap_tick_failures = 0
+
 -- One animation tick: validate the anchor, then advance one frame.
-local function on_swap_tick()
+local function on_swap_tick_body()
 	if not (ready and pet_win and vim.api.nvim_win_is_valid(pet_win)) then
 		return
 	end
@@ -815,6 +846,34 @@ local function on_swap_tick()
 	swap_to(frames[frame_i])
 end
 
+-- Wraps on_swap_tick_body in a top-level pcall: previously only the individual
+-- image ops inside swap_to were pcall'd, so a throw anywhere else in the body
+-- (ensure_win/anchor_geom/ensure_frames/frame_placement/frames_cache indexing)
+-- would propagate out of a REPEATING vim.loop timer callback that keeps firing
+-- regardless — up to 10x/sec at DEFAULT_FPS — turning one bug into a standing
+-- error storm instead of a job that fails once (2026-08-15 fix, Goal 12 batch 3
+-- Medium). After SWAP_TICK_MAX_FAILURES consecutive throws, stop the timer
+-- rather than keep re-firing at full frequency forever.
+local function on_swap_tick()
+	local ok, err = pcall(on_swap_tick_body)
+	if ok then
+		swap_tick_failures = 0
+		return
+	end
+	swap_tick_failures = swap_tick_failures + 1
+	trace("swap tick FAILED (%d/%d): %s", swap_tick_failures, SWAP_TICK_MAX_FAILURES, tostring(err))
+	if swap_tick_failures >= SWAP_TICK_MAX_FAILURES and swap_timer then
+		trace("swap tick: %d consecutive failures, stopping timer", swap_tick_failures)
+		pcall(function()
+			swap_timer:stop()
+		end)
+		pcall(function()
+			swap_timer:close()
+		end)
+		swap_timer = nil
+	end
+end
+
 -- Idle-progression pump: drive pet.advance on a real clock so idle → groove →
 -- idle → sleep walks forward. Uses the SAME clock source as pet.M.now so elapsed
 -- math is consistent. pet.advance is a cheap no-op when not idling.
@@ -825,6 +884,7 @@ end
 local function start_timers()
 	if not swap_timer then
 		swap_timer = vim.loop.new_timer()
+		swap_tick_failures = 0
 		local interval = math.max(math.floor(1000 / cfg.fps), 30)
 		swap_timer:start(interval, interval, vim.schedule_wrap(on_swap_tick))
 	end
@@ -862,6 +922,7 @@ function M.render_state(name, _prev)
 
 	-- A holding asset finishes its cycle before yielding to the idle asset; anything
 	-- more urgent (typing/thinking/tools/cards) interrupts and cancels the hold.
+	local reentrant_hold = hold_cycle and asset == current_asset
 	if hold_cycle and asset ~= current_asset then
 		if asset == "idle" then
 			pending_state = name
@@ -884,10 +945,43 @@ function M.render_state(name, _prev)
 	end
 
 	local frames, key = ensure_frames(asset)
+
+	if reentrant_hold then
+		-- Re-entrant call for the SAME held asset — e.g. an anchor-mode switch
+		-- (attach_to_panel/attach_to_surface re-driving render_state) mid-hold.
+		-- Resync the frame-set key/geometry for the new mode, but don't restart
+		-- the in-progress hold animation: resetting frame_i here would silently
+		-- extend/corrupt the intended one-shot hold (2026-08-15 fix, Goal 12
+		-- batch 3 Medium — previously neither guard above fires when
+		-- asset == current_asset, so execution fell through to the frame_i = 1
+		-- reset below unconditionally).
+		current_key = key
+		if #frames == 0 then
+			hold_cycle = false
+			pending_state = nil
+			clear_shown()
+			return
+		end
+		frame_i = math.min(frame_i, #frames)
+		active_place = place_cache[key]
+		ensure_win()
+		swap_to(frames[frame_i])
+		start_timers()
+		return
+	end
+
 	current_asset = asset
 	current_key = key
 	frame_i = 1
 	if #frames == 0 then
+		-- Nothing to hold when the asset has no frames (missing/deleted cache
+		-- dir) — release any hold this transition just set above. Without this,
+		-- on_swap_tick's OWN empty-frames early return fires before it ever
+		-- reaches its hold-release branch, latching hold_cycle true forever and
+		-- blanking the pet on every idle return (2026-08-15 fix, Goal 12 batch 3
+		-- High).
+		hold_cycle = false
+		pending_state = nil
 		clear_shown()
 		return
 	end -- assets missing: show nothing
@@ -1051,7 +1145,10 @@ end
 function M.setup(opts)
 	opts = opts or {}
 	cfg.skin = opts.skin or cfg.skin
-	cfg.fps = opts.fps or cfg.fps
+	-- Clamp to >=1: fps=0 would make start_timers' 1000/cfg.fps interval `inf`,
+	-- handing libuv a non-finite ms timer interval (2026-08-15 fix, Goal 12 batch
+	-- 3 Low).
+	cfg.fps = math.max(opts.fps or cfg.fps, 1)
 	cfg.width = opts.width or cfg.width
 	cfg.height = opts.height or cfg.height
 	if opts.enabled ~= nil then

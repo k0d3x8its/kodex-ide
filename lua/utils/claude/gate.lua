@@ -31,6 +31,8 @@ local core = require(require_prefix .. "core")
 -- here is cycle-free, unlike the gate<->question hook-injection pattern above.
 local widgets = require(require_prefix .. "widgets")
 local process = require(require_prefix .. "process")
+local effort = require(require_prefix .. "effort")
+local advisor = require(require_prefix .. "advisor")
 
 local state = core.state
 local buf_append = core.buf_append
@@ -1118,7 +1120,10 @@ show_permission_card = function(event)
 	-- against it. on_prewrite_resolve drains perm_queue when the held request finally
 	-- clears (Gate-3 finding, advisor 2026-07-22 discriminating probe T17f — the guard
 	-- only covered show_diff_card's forward direction, not this reverse one).
-	if state.perm or state.qask or state.diff_card or state.prewrite then
+	-- Same reasoning as question.lua's show_question_card guard — the effort/advisor
+	-- floats collide with this card's geometry+focus the same way they collide with
+	-- the question card.
+	if state.perm or state.qask or state.diff_card or state.prewrite or effort.active() or advisor.active() then
 		state.perm_queue = state.perm_queue or {}
 		state.perm_queue[#state.perm_queue + 1] = event
 		return

@@ -102,6 +102,12 @@ H.check(
 H.check("P-EVT9 result ok → happy", pet.emit("result", { ok = true, now = 100 }) == "happy")
 H.check("P-EVT10 result failure → error", pet.emit("result", { ok = false }) == "error")
 
+-- Regression (2026-08-15, Goal 12 batch 3 Medium): result failure used to leave
+-- idle_from nil'd, so the error flash could never decay to idle/groove/sleep.
+reset()
+pet.emit("result", { ok = false, now = 0 })
+H.check("P-EVT11 result failure starts idle decay too", pet.advance(10) == "idle")
+
 -- ── Interrupt (P-INT) — aborted turn flashes error (user-chosen sprite) ────────
 reset()
 pet.emit("tool_use", { name = "Read", input = {} }) -- pet now "reading"
@@ -125,6 +131,32 @@ H.check("P-DIFF1 diff_open → diff_wait", pet.emit("diff_open") == "diff_wait")
 H.check("P-DIFF2 accept → diff_approved", pet.emit("diff_resolve", { accepted = true }) == "diff_approved")
 pet.emit("diff_open")
 H.check("P-DIFF3 reject → diff_rejected", pet.emit("diff_resolve", { accepted = false }) == "diff_rejected")
+
+-- Regression (2026-08-15, Goal 12 batch 3 Critical): diff_resolve used to leave
+-- idle_from nil'd (diff_open had already cleared it), so M.advance's early-return
+-- guard made the idle clock permanently dead — the pet froze on diff_approved/
+-- diff_rejected forever instead of eventually decaying to sleep like `happy` does.
+reset()
+pet.emit("diff_open")
+H.check("P-DIFF4 accept", pet.emit("diff_resolve", { accepted = true, now = 0 }) == "diff_approved")
+H.check("P-DIFF5 t=10 decays to idle (diff_approved dropped)", pet.advance(10) == "idle")
+H.check("P-DIFF6 t=65 decays all the way to sleep", pet.advance(65) == "sleep")
+
+reset()
+pet.emit("diff_open")
+pet.emit("diff_resolve", { accepted = false, now = 0 })
+H.check("P-DIFF7 reject also starts idle decay", pet.advance(10) == "idle")
+
+-- Regression (2026-08-15, Goal 12 batch 3 High): user_action's guard
+-- (`if M.idle_from ~= nil`) always failed for a diff flash before this fix, since
+-- idle_from was never restarted — so user interaction could never rescue it. With
+-- diff_resolve now starting the clock, user_action can genuinely reset it.
+reset()
+pet.emit("diff_open")
+pet.emit("diff_resolve", { accepted = true, now = 0 })
+pet.emit("user_action", { now = 5 })
+H.check("P-DIFF8 user_action rescues a diff flash — t=15 (10s past reset) idle", pet.advance(15) == "idle")
+H.check("P-DIFF9 clock genuinely reset — t=25 (20s past reset) groove", pet.advance(25) == "headphones_groove")
 
 -- ── Subagent (P-SUB) ─────────────────────────────────────────────────────────
 reset()
@@ -153,6 +185,16 @@ reset()
 pet.emit("typing")
 local before = pet.state
 H.check("P-IDLE9 advance no-op mid-turn", pet.advance(999) == before)
+
+-- Regression (2026-08-15, Goal 12 batch 3 Low): an inconsistent injected `now`
+-- producing negative elapsed used to match no IDLE_STAGES threshold and leave
+-- idle_phase stale instead of resetting. Reach headphones_groove, then advance
+-- with a `now` before idle_from — the clamp must reset to idle, not stay stuck.
+reset()
+pet.emit("result", { ok = true, now = 0 })
+pet.advance(20) -- 20s elapsed → headphones_groove
+H.check("P-IDLE10 pre-check: groove reached", pet.state == "headphones_groove")
+H.check("P-IDLE11 negative elapsed clamps to 0 — resets to idle, not stale groove", pet.advance(-5) == "idle")
 
 -- ── Permission / question modal → building | notification (P-PERM) ────────────
 -- Edit/Write permission → building; any other modal → notification; both outrank

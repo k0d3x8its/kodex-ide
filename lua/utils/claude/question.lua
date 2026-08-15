@@ -6,18 +6,21 @@
 -- back in updatedInput.answers). Extracted from the former monolithic claude.lua
 -- (Goal 15.4) to relieve init's main-chunk 200-local ceiling.
 --
--- Dependencies: core.state + core buffer helpers, widgets.float_bottom_row, and ten
--- init-owned float/pad/spinner/permission helpers injected via Question.wire{} (they
--- couple to init's chat-bar/float/permission machinery; injection avoids a require
--- cycle and lets 15.5 re-home the float+permission helpers with a one-line change
--- here). show_question_card is called by init's dispatcher; the rest are exposed
--- only so init can re-export the `mod._question*` test hooks.
+-- Dependencies: core.state + core buffer helpers, widgets.float_bottom_row, and the
+-- init-owned float/pad/spinner/permission helpers injected via Question.wire{} —
+-- see the wire() function below for the current list (they couple to init's
+-- chat-bar/float/permission machinery; injection avoids a require cycle and lets
+-- 15.5 re-home the float+permission helpers with a one-line change here).
+-- show_question_card is called by init's dispatcher; the rest are exposed only so
+-- init can re-export the `mod._question*` test hooks.
 
 local Question = {}
 
 local require_prefix = "utils.claude."
 local core = require(require_prefix .. "core")
 local widgets = require(require_prefix .. "widgets")
+local effort = require(require_prefix .. "effort")
+local advisor = require(require_prefix .. "advisor")
 
 local state = core.state
 local buf_append = core.buf_append
@@ -75,7 +78,7 @@ end
 
 -- ─── Question card (AskUserQuestion) ──────────────────────────────────────────
 -- Claude's AskUserQuestion tool arrives on the SAME can_use_tool gate as a
--- permission (no new flag — see .work/FINDINGS.md § Q-ASK), but is NOT an
+-- permission (no new flag — see .work/archive/legacy-findings.md § Q-ASK), but is NOT an
 -- allow/reject decision: it carries up to 4 questions, each with its own option
 -- list, and the answer rides back in updatedInput.answers (a map keyed by each
 -- question's TEXT, value = chosen label, or an array of labels for multiSelect).
@@ -87,18 +90,46 @@ end
 -- question has a pick. Per question the option list is the model's options PLUS two
 -- synthetic affordances mirroring the Claude Code TUI: "Type something" (free-text
 -- answer) and "Chat about this" (bail → dismiss → reopen the chat bar). Keys:
---   ↑/↓ j/k  move highlight within the question
---   ⇥ / →    next question · ⇤ / ← prev question (no answer required)
---   <Space>  toggle a multiSelect option
---   <CR>     select the highlighted option (records pick; advances to the next
---            UNanswered question, or submits when all are answered). On the
---            "Type something" row it opens an input; "Chat about this" denies with
---            feedback so the model opens a clarification dialogue.
---   <Esc>/q  cancel (allow with NO answers → the CLI emits "Question dismissed").
+--   ↑/↓ j/k     move highlight within the question
+--   ⇥ / → / l   next question · ⇤ / ← / h  prev question (no answer required)
+--   <Space>     toggle a multiSelect option
+--   <CR>        single-select: records the highlighted option as the pick. multi-
+--               Select: confirms the ALREADY-toggled set (does nothing on its own —
+--               toggle at least one option with <Space> first). Either way, once
+--               recorded it advances to the next UNanswered question, or submits
+--               when all are answered. On the "Type something" row it opens an
+--               input; "Chat about this" denies with feedback so the model opens a
+--               clarification dialogue.
+--   n           add/edit a free-text note for the current question.
+--   <Esc>/q     cancel (allow with NO answers → the CLI emits "Question dismissed").
 -- Reuses the permission card's geometry + chat-bar dismiss/reopen plumbing.
 
 local Q_CUSTOM = "Type something"
 local Q_CHAT = "Chat about this"
+
+-- Cap on how many AskUserQuestion events can pile up in state.qask_queue while
+-- another card/modal is up. Nothing upstream schema-validates or rate-limits this
+-- tool's calls before they reach the panel, so an unbounded queue is a plausible
+-- (if low-severity — one keypress per dismissal) way to lock the chat bar behind a
+-- long dismiss chain the user never asked for.
+local QASK_QUEUE_CAP = 20
+
+-- The CLI does not schema-validate AskUserQuestion input before forwarding it here,
+-- so a malformed `questions` value (wrong type, missing text) must not be trusted
+-- blindly — indexing into it elsewhere in this file assumes this shape already
+-- holds. Returns false for anything that isn't an array of tables each carrying a
+-- string `question`.
+local function valid_questions(list)
+	if type(list) ~= "table" then
+		return false
+	end
+	for _, q in ipairs(list) do
+		if type(q) ~= "table" or type(q.question) ~= "string" then
+			return false
+		end
+	end
+	return true
+end
 
 -- The display option list for a question: model options first, then the two
 -- synthetic affordances. Each entry: { kind = "model"|"custom"|"chat",
@@ -138,6 +169,7 @@ local function render_question_card()
 	state.qask_ns = state.qask_ns or vim.api.nvim_create_namespace("ClaudeQaskRow")
 
 	local lines, hl = {}, {}
+	local cursor_line -- 1-based row of the highlighted marker, for the scroll-follow below
 	-- EVERY body insert goes through push(): the CLI's question/option text, and
 	-- (more importantly) the user's OWN typed custom-answer/note text, can carry
 	-- embedded "\n" (a pasted multi-line answer needs no special action to trigger
@@ -173,6 +205,9 @@ local function render_question_card()
 		-- purple so they're visibly distinct from the gray (ClaudeDim) descriptions
 		-- they used to share a colour with.
 		local grp = (i == ci) and "ClaudeQuestion" or ((d.kind == "model") and "ClaudeProse" or "ClaudeLabel")
+		if i == ci then
+			cursor_line = #lines + 1 -- 1-based row this option's push() is about to add
+		end
 		push("  " .. marker .. mark .. label, grp)
 		if d.desc ~= "" then
 			push("        " .. d.desc, "ClaudeDim")
@@ -214,6 +249,13 @@ local function render_question_card()
 
 	-- SW anchor keeps the bottom edge pinned; only the top moves as height changes.
 	pcall(vim.api.nvim_win_set_height, q.win, float_h)
+	-- Follow the highlighted marker: a tall question (many options/long descriptions)
+	-- can exceed the vim.o.lines-4 height cap above, and nothing else moves the
+	-- viewport — without this, overflow content (including the nav hint) rendered
+	-- permanently below the visible window with no way to reach it.
+	if cursor_line then
+		pcall(vim.api.nvim_win_set_cursor, q.win, { cursor_line, 0 })
+	end
 	-- Reserve the card's footprint as bottom padding so existing Claude output is
 	-- pushed ABOVE the card instead of being covered by it (same contract the chat
 	-- float uses). float_h interior + 2 rounded-border rows + 1 blank separator.
@@ -235,10 +277,12 @@ local function move_question_choice(delta)
 	if not q then
 		return
 	end
-	local n = #question_display_options(q.questions[q.qi])
-	if n == 0 then
-		return
-	end
+	-- question_display_options always appends the 2 synthetic rows, so n >= 2 always.
+	-- q.questions[q.qi] should never be nil (goto_question clamps qi into range and
+	-- qi never changes elsewhere), but question_display_options indexes straight into
+	-- it with no nil guard of its own — the `or {}` here is cheap insurance against
+	-- that assumption ever breaking silently into an uncaught throw.
+	local n = #question_display_options(q.questions[q.qi] or {})
 	q.choice[q.qi] = (q_choice(q) - 1 + delta) % n + 1
 	render_question_card()
 end
@@ -367,7 +411,13 @@ local function close_question_card(receipt, receipt_hl)
 			end
 			if state.decision_reopen_bar then
 				state.decision_reopen_bar = false
-				prompt_input()
+				-- pcall'd: this runs on the next event-loop tick, after the flag above is
+				-- already consumed — an uncaught throw here would leave the chat bar
+				-- unreopened with nothing left to retry it.
+				local ok, err = pcall(prompt_input)
+				if not ok then
+					vim.notify("Claude: failed to reopen the chat bar — " .. tostring(err), vim.log.levels.WARN)
+				end
 			end
 		end)
 	elseif state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
@@ -393,8 +443,18 @@ function Question.abort_question_card(receipt)
 	local queued = state.qask_queue
 	state.qask_queue = nil
 	for _, queued_event in ipairs(queued or {}) do
-		send_permission_response(queued_event.request_id, "allow", { input = (queued_event.request or {}).input or {} })
+		send_permission_response(
+			queued_event.request_id,
+			"allow",
+			{ input = (queued_event.request or {}).input or {}, quiet = true }
+		)
 	end
+	-- No chat bar to hand back to a dead session (mirrors gate.abort_permission_cards).
+	-- Unconditional: a queued-only event never sets this flag itself, but an earlier
+	-- card in the same dismiss chain may have left it true for a later card to inherit
+	-- (show_question_card's own comment on why it doesn't blindly reset this) — with
+	-- the whole session dying, nothing will ever consume it otherwise.
+	state.decision_reopen_bar = false
 	if not state.qask then
 		return
 	end
@@ -418,7 +478,9 @@ local function recorded_answer(q, i)
 		local labels, sel = {}, q.sel[i] or {}
 		for oi, opt in ipairs(question.options or {}) do
 			if sel[oi] then
-				labels[#labels + 1] = opt.label
+				-- opt.label or "" — a nil label silently no-ops the append (`t[#t+1]=nil`),
+				-- so a checked option the user visibly ticked vanishes from the array.
+				labels[#labels + 1] = opt.label or ""
 			end
 		end
 		return labels
@@ -427,21 +489,37 @@ local function recorded_answer(q, i)
 	if p and p.kind == "custom" then
 		return p.text
 	elseif p and p.kind == "option" then
-		return p.label
+		-- Normalize here too: question_display_options already does `opt.label or ""`,
+		-- so a model option with no label reads as "" on-screen — mirror that here or a
+		-- nil label silently vanishes from the submitted answer with no length change.
+		return p.label or ""
 	end
 	return nil
 end
 
 -- Build the answers map from every question's recorded pick and submit ONE
--- control_response: allow with updatedInput.answers (the § Q-ASK wire shape; reuses
+-- control_response: allow with updatedInput.answers (the .work/archive/legacy-findings.md § Q-ASK wire shape; reuses
 -- send_permission_response's allow path, which sends updatedInput verbatim).
 local function submit_question_answers()
 	local q = state.qask
 	if not q then
 		return
 	end
+	-- The wire format keys answers by each question's literal TEXT (schema-required —
+	-- see the annotations note below), so two questions with identical text in one
+	-- event necessarily collide: the later answer silently overwrites the earlier
+	-- one. Can't be fixed without changing the wire shape; surface it instead of
+	-- letting it disappear with no signal.
+	local seen_question_text = {}
 	local answers = {}
 	for i, question in ipairs(q.questions) do
+		if seen_question_text[question.question] then
+			vim.notify(
+				'Claude: two questions share the text "' .. question.question .. '" — only the last answer is kept',
+				vim.log.levels.WARN
+			)
+		end
+		seen_question_text[question.question] = true
 		local ans = recorded_answer(q, i)
 		-- multiSelect always records its (possibly empty) array; single-select only
 		-- when actually picked (nil = unanswered, leave the key absent).
@@ -467,9 +545,20 @@ local function submit_question_answers()
 	if next(annotations) then
 		merged.annotations = annotations
 	end
-	send_permission_response(q.request_id, "allow", { input = merged })
+	-- Capture the delivered flag — chansend can return 0 if the CLI already died
+	-- (session-toggle-close nulls job_id synchronously; the float can survive it).
+	-- Unconditionally printing "✓ Answered" here would tell the user their answers
+	-- were received when the wire write never landed (mirrors resolve_permission).
+	local delivered = send_permission_response(q.request_id, "allow", { input = merged })
 	local n = #q.questions
-	close_question_card("✓ Answered " .. n .. (n == 1 and " question" or " questions"), "ClaudeQuestion")
+	if delivered then
+		close_question_card("✓ Answered " .. n .. (n == 1 and " question" or " questions"), "ClaudeQuestion")
+	else
+		close_question_card(
+			"✗ Answer not delivered (session closed) — next message starts a fresh session",
+			"ClaudeDim"
+		)
+	end
 end
 
 -- After recording a pick: submit if EVERY question is now answered, else advance to
@@ -502,8 +591,12 @@ local function cancel_question()
 	if not q then
 		return
 	end
-	send_permission_response(q.request_id, "allow", { input = q.input })
-	close_question_card("✗ Questions dismissed", "ClaudeDim")
+	local delivered = send_permission_response(q.request_id, "allow", { input = q.input })
+	if delivered then
+		close_question_card("✗ Questions dismissed", "ClaudeDim")
+	else
+		close_question_card("✗ Dismiss not delivered (session closed)", "ClaudeDim")
+	end
 end
 Question.cancel_question = cancel_question
 
@@ -537,7 +630,7 @@ end
 -- serializes to `message` on the wire) + the question summary, so the model opens a
 -- clarification dialogue instead of silently moving on. Reusing cancel_question's
 -- allow-no-answers (the first bug) was a dismiss; sending it as `feedback` (the second
--- bug) was dropped → bare deny → model saw "permission denied". § Q-ASK addendum.
+-- bug) was dropped → bare deny → model saw "permission denied". .work/archive/legacy-findings.md § Q-ASK addendum.
 local function respond_to_claude_question()
 	local q = state.qask
 	if not q then
@@ -548,10 +641,14 @@ local function respond_to_claude_question()
 		.. "response into account and then reformulate the questions if appropriate. "
 		.. "Start by asking them what they would like to clarify. Questions asked: "
 		.. question_summary(q)
-	send_permission_response(q.request_id, "deny", { message = message })
+	local delivered = send_permission_response(q.request_id, "deny", { message = message })
 	-- close_question_card reopens the dismissed chat bar (draft restored) so the user
 	-- can immediately type their clarification once the model asks.
-	close_question_card("💬 Chat about this", "ClaudeQuestion")
+	if delivered then
+		close_question_card("💬 Chat about this", "ClaudeQuestion")
+	else
+		close_question_card("✗ Not delivered (session closed)", "ClaudeDim")
+	end
 end
 Question.respond_to_claude_question = respond_to_claude_question
 
@@ -582,6 +679,11 @@ local function open_prompt_float(title, initial, on_commit)
 		refocus = function()
 			return state.qask and state.qask.win
 		end,
+		-- Tears the prompt float down automatically if the card's own window closes
+		-- out from under it (e.g. abort_question_card on session death) — this is
+		-- the ONE open_prompt_float caller with no opts.at, so without this it was
+		-- also the one branch that skipped the orphan-cleanup autocmd entirely.
+		watch_win = state.qask and state.qask.win,
 	})
 end
 
@@ -637,6 +739,20 @@ local function select_question_choice()
 	end
 	-- model option
 	if question.multiSelect then
+		-- <CR> used to record a "confirmed" pick unconditionally, even with nothing
+		-- toggled via <Space> — the card's own hint says "⏎ select", but arrowing to an
+		-- option and pressing <CR> without ever pressing <Space> silently submitted an
+		-- EMPTY answer array. Refuse instead: confirm only once at least one option is
+		-- toggled, so <CR> on a bare highlight just repaints (no state change, no submit).
+		local sel = q.sel[q.qi]
+		if not (sel and next(sel)) then
+			-- A bare repaint here looks identical to <CR> just not registering at all —
+			-- toggle at least one option with <Space> first, so tell the user that
+			-- instead of leaving them pressing <CR> against what looks like a frozen card.
+			vim.notify("Claude: toggle at least one option with <Space> before confirming", vim.log.levels.WARN)
+			render_question_card()
+			return
+		end
 		q.picks[q.qi] = { kind = "multi" } -- confirmed; labels live in sel
 	else
 		q.picks[q.qi] = { kind = "option", index = d.index, label = d.label }
@@ -687,32 +803,32 @@ local function open_question_float(q)
 		render_question_card()
 	end)
 
-	local function map(k, fn)
-		vim.keymap.set("n", k, fn, { buffer = buf, nowait = true, silent = true })
+	local function map(lhs, fn, desc)
+		vim.keymap.set("n", lhs, fn, { buffer = buf, nowait = true, silent = true, desc = desc })
 	end
 	map("<Up>", function()
 		move_question_choice(-1)
-	end)
+	end, "Question card: move up")
 	map("k", function()
 		move_question_choice(-1)
-	end)
+	end, "Question card: move up")
 	map("<Down>", function()
 		move_question_choice(1)
-	end)
+	end, "Question card: move down")
 	map("j", function()
 		move_question_choice(1)
-	end)
-	map("<Tab>", next_question)
-	map("<Right>", next_question)
-	map("l", next_question)
-	map("<S-Tab>", prev_question)
-	map("<Left>", prev_question)
-	map("h", prev_question)
-	map("<Space>", toggle_question_choice)
-	map("<CR>", select_question_choice)
-	map("n", prompt_question_note) -- "n to add notes" (card-level note field)
-	map("<Esc>", cancel_question)
-	map("q", cancel_question)
+	end, "Question card: move down")
+	map("<Tab>", next_question, "Question card: next question")
+	map("<Right>", next_question, "Question card: next question")
+	map("l", next_question, "Question card: next question")
+	map("<S-Tab>", prev_question, "Question card: previous question")
+	map("<Left>", prev_question, "Question card: previous question")
+	map("h", prev_question, "Question card: previous question")
+	map("<Space>", toggle_question_choice, "Question card: toggle multiSelect option")
+	map("<CR>", select_question_choice, "Question card: select highlighted option")
+	map("n", prompt_question_note, "Question card: add a note") -- "n to add notes" (card-level note field)
+	map("<Esc>", cancel_question, "Question card: cancel")
+	map("q", cancel_question, "Question card: cancel")
 
 	-- Float vanished by some path OTHER than our teardown (which nils state.qask
 	-- first) → cancel so the CLI isn't left blocked on the turn.
@@ -744,18 +860,46 @@ show_question_card = function(event)
 	-- request open, with no card up to guard against a new arrival; on_prewrite_resolve
 	-- drains qask_queue when the held request finally clears (Gate-3 finding, advisor
 	-- 2026-07-22 discriminating probe T17f).
-	if state.qask or state.perm or state.diff_card or state.prewrite then
+	-- effort.active()/advisor.active(): the slider/picker floats share this card's
+	-- SW-anchor/near-identical geometry and also take focus — without this check the
+	-- card opens UNDERNEATH the still-focused modal and silently steals its keys: a
+	-- model-timed AskUserQuestion could catch a stray <CR> meant for the slider,
+	-- submitting an option-1 answer nobody read.
+	if state.qask or state.perm or state.diff_card or state.prewrite or effort.active() or advisor.active() then
 		state.qask_queue = state.qask_queue or {}
+		if #state.qask_queue >= QASK_QUEUE_CAP then
+			-- Drop-and-auto-allow past the cap rather than growing forever: whatever is
+			-- blocking the queue is already going to take a while to drain by hand.
+			send_permission_response(
+				event.request_id,
+				"allow",
+				{ input = (event.request or {}).input or {}, quiet = true }
+			)
+			if state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf) then
+				local recl = vim.api.nvim_buf_line_count(state.panel_buf)
+				buf_append({ "✗ A question was dropped — too many are already queued" })
+				hl_lines(recl, recl, "ClaudeDim")
+			end
+			return
+		end
 		state.qask_queue[#state.qask_queue + 1] = event
 		return
 	end
 
 	local req = event.request or {}
 	local input = req.input or {}
+	-- The CLI doesn't schema-validate this tool's input before forwarding it — a
+	-- malformed `questions` value falls through to the zero-questions auto-allow
+	-- below instead of opening a card that would throw the first time anything
+	-- indexes into it.
+	local questions = input.questions
+	if not valid_questions(questions) then
+		questions = {}
+	end
 	local q = {
 		request_id = event.request_id,
 		input = input,
-		questions = input.questions or {},
+		questions = questions,
 		qi = 1,
 		choice = {}, -- choice[i] = highlighted display-option index per question
 		sel = {}, -- sel[i]    = { [modelOptIndex] = true } per multiSelect question

@@ -208,7 +208,13 @@ H.check(
 	table.concat(slash._all_commands(), ",")
 )
 
--- (c) A disk name that duplicates a namespaced advertised command is NOT added twice.
+-- (c) A disk name that shares a display SUFFIX with a namespaced advertised command
+-- is a distinct command, not a duplicate — batch-5 /code-crit (adversarial): the old
+-- suppress-on-suffix-collision behaviour let an advertised "evil:tdd" hide a real
+-- local "tdd" the user could otherwise have run, with no way to tell one had vanished.
+-- Both must now survive in the universe (exact full-name identity is the only thing
+-- push() dedupes), and render_menu falls back to showing the FULL name for either row
+-- once their display labels collide (see label_counts in render_menu).
 claude.state.slash_commands = { "caveman:caveman", "review" }
 slash._test_disk_names = { "caveman", "my-brand-new-skill" }
 slash._refresh_disk_names()
@@ -220,8 +226,8 @@ for _, n in ipairs(all) do
 	end
 end
 H.check(
-	"S4b disk name duplicating a namespaced command is deduped (no bare 'caveman')",
-	caveman_count == 0,
+	"S4b disk 'caveman' survives alongside the namespaced 'caveman:caveman' (not suppressed)",
+	caveman_count == 1,
 	"count=" .. caveman_count .. " all=" .. table.concat(all, ",")
 )
 H.check("S4b the namespaced original is still present", has(all, "caveman:caveman"))
@@ -309,5 +315,41 @@ type_prompt_line("go /brai")
 H.check("S7b a valid mid-line prefix stays highlighted", has_midline_mark() == true)
 type_prompt_line("go /braix")
 H.check("S7b an invalid mid-line prefix turns plain", has_midline_mark() == false)
+
+-- ── S6c: is_command's unambiguous-suffix gate (batch-5 adversarial finding
+-- slash.lua:469) — a forgeable trust signal was fixed by requiring the suffix be
+-- unique before granting the "known command" highlight. The gate only changes the
+-- outcome when NO bare entry named `name` exists anywhere (see is_command's own
+-- doc) — this is the one reachable case: two different namespaced names sharing a
+-- suffix with no bare command of that name.
+slash._test_disk_names = {}
+claude.state.slash_commands = { "pluginA:shared", "pluginB:shared" }
+slash._refresh_disk_names()
+H.check(
+	"S6c ambiguous suffix (two namespaced names, no bare entry) is NOT a known command",
+	slash.is_command("shared") == false
+)
+-- A single namespaced name's suffix is still trusted (the unambiguous case).
+claude.state.slash_commands = { "pluginA:onlyone" }
+slash._refresh_disk_names()
+H.check("S6c unambiguous suffix is still a known command", slash.is_command("onlyone") == true)
+-- A real bare entry is trusted regardless of an unrelated namespaced collision.
+claude.state.slash_commands = { "pluginA:tdd", "pluginB:tdd" }
+slash._test_disk_names = { "tdd" }
+slash._refresh_disk_names()
+H.check(
+	"S6c a genuine bare entry is trusted even when its suffix is separately ambiguous",
+	slash.is_command("tdd") == true
+)
+slash._test_disk_names = {}
+
+-- ── S8: is_valid_name (batch-5 security/adversarial: reject a hostile basename
+-- before it reaches the menu buffer or an outgoing prompt insertion) ────────────
+H.check("S8 a normal skill name is valid", slash._is_valid_name("code-review") == true)
+H.check("S8 a namespaced name is valid", slash._is_valid_name("plugin:skill") == true)
+H.check("S8 an embedded newline is rejected", slash._is_valid_name("foo\nbar") == false)
+H.check("S8 an empty string is rejected", slash._is_valid_name("") == false)
+H.check("S8 a non-string is rejected", slash._is_valid_name(42) == false)
+H.check("S8 a name over the length cap is rejected", slash._is_valid_name(string.rep("a", 81)) == false)
 
 H.summary("claude_slash")

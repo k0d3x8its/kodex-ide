@@ -116,7 +116,10 @@ local function render()
 		return 0
 	end
 	local width = select(2, panel_float_geom())
-	local textw = math.max(width - 2, 20) -- 1-col inset each side for the blurb
+	-- 1-col inset each side for the blurb/note text. No artificial floor: a width
+	-- below 22 used to floor at 20 anyway, letting wrap() emit lines wider than the
+	-- float actually is.
+	local textw = math.max(width - 2, 1)
 	local activ = active_index()
 
 	local lines, hls = {}, {} -- hls: { {lnum0, col0, col_end_or_-1, hl}, ... }
@@ -157,7 +160,13 @@ local function render()
 		add(" " .. l, "ClaudeSlashDesc")
 	end
 	add("")
-	add(" ↑/↓ to move · Enter to confirm · Esc to cancel", "ClaudeEffortHint")
+	-- Wrapped like BLURB/RECO above (not a single raw add()) — at panel widths under
+	-- ~125 columns this line doesn't fit unwrapped, and with `wrap` now false on the
+	-- window (see open()) an unwrapped overlong line would just be clipped instead
+	-- of soft-wrapping, hiding half the keybind hint.
+	for _, l in ipairs(wrap(" ↑/↓ to move · Enter to confirm · Esc to cancel", textw)) do
+		add(l, "ClaudeEffortHint")
+	end
 
 	vim.bo[modal.buf].modifiable = true
 	vim.api.nvim_buf_set_lines(modal.buf, 0, -1, false, lines)
@@ -181,7 +190,12 @@ local function render()
 end
 
 --- Close the picker without applying. Refocuses the panel window.
-function Advisor.close()
+--- `defer_resume` (default false): when true, skip resuming any queued question/
+--- permission card — the caller (confirm(), below) takes responsibility for
+--- resuming it AFTER its own on_confirm callback runs, so a queued card can't
+--- open and steal focus mid-callback, before the advisor mutation is actually
+--- applied.
+function Advisor.close(defer_resume)
 	local was_open = Advisor.active()
 	local win, prev_win = modal.win, modal.prev_win
 	-- Nil the tracked fields BEFORE closing the window (mirrors effort.lua/
@@ -199,8 +213,11 @@ function Advisor.close()
 	end
 	-- A question/permission card may be queued behind this picker (see the wire-time
 	-- doc above) — only worth trying if the picker was actually open.
-	if was_open and try_resume_decision_queues then
-		pcall(try_resume_decision_queues)
+	if was_open and not defer_resume and try_resume_decision_queues then
+		local ok, err = pcall(try_resume_decision_queues)
+		if not ok then
+			vim.notify("advisor: failed to resume queued card: " .. tostring(err), vim.log.levels.WARN)
+		end
 	end
 end
 
@@ -213,20 +230,43 @@ local function move(delta)
 	render()
 end
 
--- Confirm the highlighted option: close, then hand its id to init's apply hook.
+-- Confirm the highlighted option: close the picker geometry first, THEN hand the
+-- id to init's apply hook, and only after that returns resume any queued card.
+-- Order matters: resuming the queue before cb(id) runs (the old behaviour, via a
+-- plain Advisor.close()) let a queued permission/question card open and steal
+-- focus in the gap between the picker closing and apply_flag_settings actually
+-- being sent — the advisor mutation would then land mid-decision, against a card
+-- the user was already reading.
 local function confirm()
 	local id, cb = OPTIONS[modal.sel].id, modal.on_confirm
-	Advisor.close()
+	local was_open = Advisor.active()
+	Advisor.close(true) -- defer_resume: don't resume the queue yet
 	if cb then
 		cb(id)
 	end
+	if was_open and try_resume_decision_queues then
+		local ok, err = pcall(try_resume_decision_queues)
+		if not ok then
+			vim.notify("advisor: failed to resume queued card: " .. tostring(err), vim.log.levels.WARN)
+		end
+	end
 end
 
---- Open the picker. Preselects the currently-active advisor (or Opus 4.8 when
---- unset), `on_confirm(id)` fires when the user presses <CR> (id nil = No advisor).
+--- Open the picker. Preselects the currently-active advisor (or "No advisor" when
+--- unset — see current_label's doc for how the id=nil row is matched),
+--- `on_confirm(id)` fires when the user presses <CR> (id nil = No advisor). If the
+--- picker is already open, this re-renders it in place with the new on_confirm
+--- callback instead of closing and reopening — a close-then-reopen was observed
+--- to let a queued permission/question card open and take focus during the brief
+--- window the picker was closed, then get buried under the freshly reopened
+--- modal, unreachable until dismissed.
 function Advisor.open(on_confirm)
 	if Advisor.active() then
-		Advisor.close()
+		modal.on_confirm = on_confirm
+		modal.sel = active_index() or modal.sel or 1
+		core.hide_modal_cursor() -- re-arm: the fresh-open path below relies on this too
+		render()
+		return
 	end
 	modal.sel = active_index() or 1
 	modal.on_confirm = on_confirm
@@ -251,6 +291,13 @@ function Advisor.open(on_confirm)
 		zindex = 75, -- above the chat bar / slash menu, alongside permission cards
 	})
 	vim.wo[modal.win].winhighlight = "NormalFloat:ClaudeSlashBg,FloatBorder:ClaudeSlashBorder"
+	-- Nowrap is load-bearing (same invariant as slash.lua's menu, see its own
+	-- comment): the re-fit below sizes the float's height to render()'s returned
+	-- LINE count, which only equals the on-screen row count when nothing soft-
+	-- wraps. render() now wraps its own long lines (BLURB/RECO/hint) in Lua, so
+	-- this only needs to hold for genuinely narrow floats where even a wrapped
+	-- line could still overflow — belt and suspenders.
+	vim.wo[modal.win].wrap = false
 	harden_float_scroll(modal.win)
 	core.hide_modal_cursor() -- hide the cursor over the picker at open (see core doc)
 	if pet_attach_surface then
@@ -300,12 +347,16 @@ function Advisor.open(on_confirm)
 			row = widgets.float_bottom_row(),
 			col = col,
 			width = width,
-			height = n,
+			height = math.max(n, 1), -- nvim rejects height = 0
 		})
 	end
 end
 
---- Friendly label of the currently-active advisor for the statusline, or "off".
+--- Friendly label of the currently-active advisor for the statusline. Returns one
+--- of OPTIONS' own labels ("Opus 5" / "Sonnet 5" / "Fable 5" / "No advisor" — the
+--- id=nil row IS "No advisor", not a special case) when state.advisor_model
+--- matches a known id, or the literal "off" only for the unusual case where it
+--- holds a value absent from OPTIONS entirely (e.g. a future/unrecognized alias).
 function Advisor.current_label()
 	local i = active_index()
 	return i and OPTIONS[i].label or "off"

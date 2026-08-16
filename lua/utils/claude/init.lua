@@ -3405,7 +3405,8 @@ function mod.pick_advisor(id)
 	advisor.open(apply_advisor)
 end
 
---- The current advisor label for the modal statusline ("Opus 4.8" / "off").
+--- The current advisor label for the modal statusline (e.g. "Sonnet 5" / "No
+--- advisor" / "off" — see Advisor.current_label's own doc for what each means).
 function mod.current_advisor()
 	return advisor.current_label()
 end

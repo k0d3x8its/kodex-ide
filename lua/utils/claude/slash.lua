@@ -48,13 +48,60 @@ end
 -- Override via KODEX_CLAUDE_SLASH_CACHE so tests don't clobber the real cache.
 local CACHE_PATH = vim.env.KODEX_CLAUDE_SLASH_CACHE or (vim.fn.stdpath("state") .. "/kodex_claude_slash_commands.json")
 
+-- A slash-command name (whether advertised by the CLI, cached to disk, or scanned
+-- from a directory basename) must look like one: word chars, `-`, `_`, `:`, `.`
+-- only, and bounded in length. Anything else (an embedded newline from a hostile
+-- directory name, a corrupted/tampered cache entry) is rejected rather than
+-- flowing into a buffer write or an outgoing prompt insertion.
+local NAME_PATTERN = "^[%w][%w%-_:%.]*$"
+local MAX_NAME_LEN = 80
+local MAX_CACHE_NAMES = 2000
+
+local function is_valid_name(name)
+	return type(name) == "string" and #name > 0 and #name <= MAX_NAME_LEN and name:match(NAME_PATTERN) ~= nil
+end
+Slash._is_valid_name = is_valid_name -- test hook
+
 --- Persist the CLI's slash-command names for next session. Called from the init
 --- capture (render.lua) with the freshly-advertised list.
 function Slash.save_cache(names)
 	if type(names) ~= "table" or #names == 0 then
 		return
 	end
-	pcall(vim.fn.writefile, { vim.json.encode(names) }, CACHE_PATH)
+	local valid = {}
+	for _, name in ipairs(names) do
+		if is_valid_name(name) then
+			valid[#valid + 1] = name
+			if #valid >= MAX_CACHE_NAMES then
+				break
+			end
+		end
+	end
+	if #valid == 0 then
+		return
+	end
+	-- Guard against a transient partial capture silently regressing a previously
+	-- good, larger cache (observed live: a good ~202-name cache clobbered down to
+	-- 3 names by one short-lived capture). Growth-or-equal only; never shrink.
+	local ok, existing = pcall(vim.fn.readfile, CACHE_PATH)
+	if ok and existing and existing[1] then
+		local ok2, old = pcall(vim.json.decode, existing[1])
+		if ok2 and type(old) == "table" and #valid < #old then
+			vim.notify(
+				string.format("slash: refusing to shrink command cache (%d -> %d names)", #old, #valid),
+				vim.log.levels.WARN
+			)
+			return
+		end
+	end
+	if vim.fn.getftype(CACHE_PATH) == "link" then
+		vim.notify("slash: refusing to write cache through a symlink: " .. CACHE_PATH, vim.log.levels.WARN)
+		return
+	end
+	local ok3 = pcall(vim.fn.writefile, { vim.json.encode(valid) }, CACHE_PATH)
+	if not ok3 then
+		vim.notify("slash: failed to persist command cache to " .. CACHE_PATH, vim.log.levels.WARN)
+	end
 end
 
 --- Load the cached names into state.slash_commands when the live session hasn't
@@ -70,10 +117,10 @@ function Slash.ensure_commands()
 	end
 	local ok2, names = pcall(vim.json.decode, lines[1])
 	if ok2 and type(names) == "table" and #names > 0 then
-		-- F10: filter non-string elements (corrupted cache → name:match crash).
+		-- F10: filter non-string / malformed elements (corrupted or tampered cache).
 		local filtered = {}
 		for _, name in ipairs(names) do
-			if type(name) == "string" then
+			if is_valid_name(name) then
 				filtered[#filtered + 1] = name
 			end
 		end
@@ -124,9 +171,8 @@ local BUILTIN_DESC = {
 	advisor = "Choose the advisor model (opens a picker)",
 }
 
--- name → resolved first-sentence description, or false when we looked and found
--- nothing (so we don't re-scan). nil = not yet resolved. Built lazily on first
--- menu open by ensure_descriptions().
+-- name → resolved first-sentence description. nil = not yet resolved. Built lazily
+-- on first menu open by ensure_descriptions().
 local desc_cache = nil
 
 -- Skill/command NAMES discovered by scanning the on-disk dirs (the same files the
@@ -202,12 +248,16 @@ local function parse_frontmatter(path)
 	return name, desc
 end
 
--- Glob patterns for every place a skill/command frontmatter file can live. First
--- write wins (see index build below), so user skills take priority over plugin
--- copies, and marketplaces over cache mirrors.
-local function candidate_files()
+-- Glob patterns split HOME (user + plugin/marketplace) from PROJECT (repo-local
+-- `.claude/`). The split matters for trust: a project you merely opened nvim in
+-- must never be able to override a builtin's or a home skill's description (see
+-- build_index below) — only add names/descriptions genuinely new. First write
+-- wins within each group, so user skills still take priority over plugin copies,
+-- and marketplaces over cache mirrors.
+local HOME_PATTERNS = {}
+do
 	local home = vim.fn.expand("~")
-	local pats = {
+	HOME_PATTERNS = {
 		home .. "/.claude/skills/*/SKILL.md",
 		home .. "/.claude/commands/*.md",
 		home .. "/.claude/plugins/marketplaces/*/*/SKILL.md",
@@ -216,21 +266,64 @@ local function candidate_files()
 		home .. "/.claude/plugins/cache/*/*/*/*/SKILL.md",
 		home .. "/.claude/plugins/cache/*/*/*/skills/*/SKILL.md",
 		home .. "/.claude/plugins/cache/*/*/*/commands/*.md",
-		".claude/skills/*/SKILL.md",
-		".claude/commands/*.md",
 	}
+end
+local PROJECT_PATTERNS = { ".claude/skills/*/SKILL.md", ".claude/commands/*.md" }
+
+-- Hard ceiling on how many files a single scan processes — a repo (or a symlink
+-- inside one) pointing at a huge or adversarially large tree must not freeze the
+-- editor on every "/" keystroke.
+local MAX_SCAN_FILES = 500
+
+-- `skip_symlinks`: only applied to the PROJECT scan (see scan_files below). A
+-- user's own `~/.claude/skills/*` entries are routinely symlinks themselves
+-- (a dotfiles-managed skills directory, this repo's own setup included) — that
+-- is trusted, ordinary structure, not an attack surface, so HOME must never be
+-- symlink-filtered. A project's `.claude/` is untrusted content from whatever
+-- repo you happened to open nvim in, so THERE a symlink could point at a huge or
+-- network-mounted tree and is worth bounding.
+local function glob_list(pats, skip_symlinks)
 	local out = {}
 	for _, p in ipairs(pats) do
 		for _, f in ipairs(vim.fn.glob(p, false, true)) do
-			out[#out + 1] = f
+			local keep = true
+			if skip_symlinks then
+				local dir = vim.fn.fnamemodify(f, ":h")
+				keep = vim.fn.getftype(dir) ~= "link"
+			end
+			if keep then
+				out[#out + 1] = f
+				if #out >= MAX_SCAN_FILES then
+					return out
+				end
+			end
 		end
 	end
 	return out
 end
 
+-- One glob pass per menu-open, shared by disk_command_names() (name discovery)
+-- and build_index() (description resolution) — both previously re-globbed the
+-- same directories independently on every open, doubling the scan cost.
+local scanned_home, scanned_project = nil, nil
+local function scan_files()
+	if scanned_home == nil then
+		scanned_home = glob_list(HOME_PATTERNS, false)
+		scanned_project = glob_list(PROJECT_PATTERNS, true)
+	end
+	return scanned_home, scanned_project
+end
+local function invalidate_scan()
+	scanned_home, scanned_project = nil, nil
+end
+
 -- Build the name→description index once. Indexes each file under BOTH its
 -- frontmatter `name:` and its directory/file basename, so a namespaced slash
 -- command ("plugin:skill") can resolve via the "skill" suffix (see resolve()).
+-- Scan order is trust order: HOME first (can add or, via first-write-wins,
+-- shadow nothing yet — index is empty), then BUILTIN_DESC fills any name a home
+-- file didn't cover, THEN project-local files — gated so they can only add
+-- brand-new names, never override a builtin or a home-sourced description.
 local function build_index()
 	local index = {}
 	local function add(key, desc)
@@ -238,7 +331,8 @@ local function build_index()
 			index[key] = first_sentence(desc)
 		end
 	end
-	for _, path in ipairs(candidate_files()) do
+	local home_files, project_files = scan_files()
+	for _, path in ipairs(home_files) do
 		local nm, desc = parse_frontmatter(path)
 		if desc then
 			local base = vim.fn.fnamemodify(path, ":t:r")
@@ -252,6 +346,17 @@ local function build_index()
 	for k, v in pairs(BUILTIN_DESC) do
 		if not index[k] then
 			index[k] = v
+		end
+	end
+	for _, path in ipairs(project_files) do
+		local nm, desc = parse_frontmatter(path)
+		if desc then
+			local base = vim.fn.fnamemodify(path, ":t:r")
+			if base == "SKILL" then
+				base = vim.fn.fnamemodify(path, ":h:t")
+			end
+			add(nm, desc)
+			add(base, desc)
 		end
 	end
 	return index
@@ -293,33 +398,64 @@ end
 -- basename (~/.claude/skills/<name>/SKILL.md → "<name>"), a command file's basename
 -- (commands/<name>.md → "<name>"). These are the un-namespaced tokens typed after
 -- "/"; plugin skills the CLI advertises namespaced ("plugin:skill") de-dupe against
--- these by suffix in all_commands(). Reuses candidate_files() (the description scan's
--- own glob set), so names and descriptions always come from the same files.
+-- these by suffix in all_commands(). Reuses scan_files() (the description scan's own
+-- glob set), so names and descriptions always come from the same files.
+-- Returns (names, project_set): project_set[name] = true for every name sourced
+-- ONLY from the repo-local `.claude/` scan (not also present under home/plugin
+-- dirs) — the menu renders these with a distinct marker (see render_menu) since
+-- a name appearing here exists only because you opened nvim inside this
+-- particular repo, not because you or a plugin installed it.
 local function disk_command_names()
-	local names, seen = {}, {}
-	for _, path in ipairs(candidate_files()) do
+	local names, seen, project_set = {}, {}, {}
+	local home_files, project_files = scan_files()
+	for _, path in ipairs(home_files) do
 		local base = vim.fn.fnamemodify(path, ":t:r") -- file stem
 		if base == "SKILL" then
 			base = vim.fn.fnamemodify(path, ":h:t")
 		end -- dir name
-		if base ~= "" and not seen[base] then
+		-- A directory/file basename is untrusted input (any byte but "/" and NUL on
+		-- Linux) — reject anything that isn't a well-formed command name rather than
+		-- letting a hostile basename (e.g. one containing a newline) reach the menu
+		-- buffer and crash nvim_buf_set_lines.
+		if is_valid_name(base) and not seen[base] then
 			seen[base] = true
 			names[#names + 1] = base
 		end
 	end
-	return names
+	for _, path in ipairs(project_files) do
+		local base = vim.fn.fnamemodify(path, ":t:r")
+		if base == "SKILL" then
+			base = vim.fn.fnamemodify(path, ":h:t")
+		end
+		if is_valid_name(base) and not seen[base] then
+			seen[base] = true
+			names[#names + 1] = base
+			project_set[base] = true
+		end
+	end
+	return names, project_set
 end
 Slash._disk_command_names = disk_command_names -- test hook
+
+-- name → true for disk names sourced ONLY from the repo-local scan. Populated by
+-- refresh_disk_names, consumed by render_menu for the "(project)" marker.
+local disk_project_names = {}
 
 -- Rescan disk for skill/command names (called on menu open). When the set changed
 -- since the last scan (a skill was created/removed), drop the description cache so
 -- the next resolve rebuilds it — otherwise a freshly-created skill would list its
 -- name with no description until the session restarts.
 local function refresh_disk_names()
+	invalidate_scan() -- one fresh glob pass per open, shared by names + descriptions
 	-- Slash._test_disk_names lets specs pin the disk-discovered set to a known list
 	-- (or {} to neutralise it) so menu-lifecycle assertions don't depend on whatever
 	-- skills happen to exist on the test machine. nil in normal use → real scan.
-	local fresh = Slash._test_disk_names or disk_command_names()
+	local fresh, project_set
+	if Slash._test_disk_names then
+		fresh, project_set = Slash._test_disk_names, {}
+	else
+		fresh, project_set = disk_command_names()
+	end
 	local sorted = vim.deepcopy(fresh)
 	table.sort(sorted)
 	local key = table.concat(sorted, "\n")
@@ -328,6 +464,7 @@ local function refresh_disk_names()
 		desc_cache = nil -- force a rebuild so new skills also get their descriptions
 	end
 	disk_names = fresh
+	disk_project_names = project_set
 end
 Slash._refresh_disk_names = refresh_disk_names -- test hook
 
@@ -347,15 +484,21 @@ local function display_name(name)
 end
 
 -- Hard-cap a string to `width` display cells with an ellipsis, so a description
--- can't spill past the (nowrap) float's right edge.
+-- can't spill past the (nowrap) float's right edge. Shrinks by CHARACTER count but
+-- checks DISPLAY width each step — a char-count cut alone can leave double-width
+-- characters (CJK, emoji) still wider than `width` after "fitting".
 local function fit_width(s, width)
 	if width < 2 then
 		return ""
 	end
-	if vim.fn.strdisplaywidth(s) > width then
-		s = vim.fn.strcharpart(s, 0, width - 1) .. "…"
+	if vim.fn.strdisplaywidth(s) <= width then
+		return s
 	end
-	return s
+	local n = vim.fn.strchars(s)
+	while n > 0 and vim.fn.strdisplaywidth(vim.fn.strcharpart(s, 0, n)) > width - 1 do
+		n = n - 1
+	end
+	return vim.fn.strcharpart(s, 0, n) .. "…"
 end
 
 -- Greedy word-wrap `s` into a list of lines each <= `width` display cells. We wrap
@@ -409,7 +552,17 @@ end
 -- Every menu/prefix/exact check goes through this so local commands behave like
 -- advertised ones.
 local function all_commands()
-	local out, seen, suffix_seen = {}, {}, {}
+	-- Lazily seed disk_names on the very first call, even if the menu has never
+	-- been opened yet (e.g. Slash.has_prefix queried while typing before "/" has
+	-- ever triggered Slash.open — a chicken-and-egg that used to leave newly
+	-- created, never-advertised skills unrecognised until some other keystroke
+	-- happened to open the menu). Slash.open's own refresh_disk_names() still runs
+	-- on every open to pick up newly created skills; this only covers the gap
+	-- before the very first open.
+	if disk_names == nil then
+		refresh_disk_names()
+	end
+	local out, seen = {}, {}
 	local function push(name)
 		if name and name ~= "" and not seen[name] then
 			seen[name] = true
@@ -418,7 +571,6 @@ local function all_commands()
 	end
 	for _, name in ipairs(state.slash_commands or {}) do
 		push(name)
-		suffix_seen[name:match("([^:]+)$") or name] = true -- "plugin:skill" ⇒ "skill"
 	end
 	for _, name in ipairs(LOCAL_COMMANDS) do
 		push(name)
@@ -431,62 +583,121 @@ local function all_commands()
 	-- list being empty: once init arrives it is authoritative and already includes these,
 	-- so we don't want the static fallback second-guessing it (keeps the menu identical
 	-- before and after the first message).
+	--
+	-- This gate previously interacted badly with a since-fixed cache bug: if
+	-- Slash.ensure_commands() loaded a truncated disk cache (a handful of names
+	-- instead of the CLI's full ~200), that short list read as "already
+	-- authoritative" and suppressed this fallback, visibly shrinking the menu —
+	-- verified live, batch-5 spec-compliance. The actual fix is at the source:
+	-- Slash.save_cache() now refuses to persist a shrunken cache in the first
+	-- place, so ensure_commands() can no longer load a bogus short list here.
 	if not (state.slash_commands and #state.slash_commands > 0) then
 		for name in pairs(BUILTIN_DESC) do
 			push(name)
 		end
 	end
 	-- Disk-discovered skills/commands (see disk_command_names): the source that makes
-	-- newly-created skills appear without a CLI re-advertise. Skip any name already
-	-- advertised exactly OR present as the suffix of a namespaced advertised name
-	-- ("caveman:caveman" already covers a disk "caveman"), so nothing shows twice.
+	-- newly-created skills appear without a CLI re-advertise. Only an EXACT full-name
+	-- collision is deduped (push() already does that) — a disk name is never
+	-- suppressed just because some other advertised namespaced name happens to
+	-- SHARE its display suffix ("evil:tdd" showing as "/tdd" must never hide the
+	-- real local "tdd"). Ambiguous display collisions are handled by render_menu
+	-- (shows the full name instead of the short label whenever a label isn't
+	-- unique) rather than by hiding one of the candidates here.
 	for _, name in ipairs(disk_names or {}) do
-		if not suffix_seen[name] then
-			push(name)
-		end
+		push(name)
 	end
 	return out
 end
 Slash._all_commands = all_commands -- test hook (dedup / merge assertions)
 
--- Prefix-filter the full command list by `query` (the text after "/"), sorted.
+-- How many advertised/local/disk names share a given display label (the run
+-- after the last ":"). A label is only safe to match/highlight/insert-via-short-
+-- form when exactly one name produces it — otherwise "/tdd" could silently mean
+-- either the real disk-discovered "tdd" or an unrelated "evil:tdd" a plugin
+-- advertised, and there is no way to tell which one a match picked.
+local function display_counts()
+	local counts = {}
+	for _, name in ipairs(all_commands()) do
+		local d = display_name(name)
+		counts[d] = (counts[d] or 0) + 1
+	end
+	return counts
+end
+
+-- Prefix-filter the full command list by `query` (the text after "/"), sorted by
+-- the label actually shown in the menu (display_name), not the raw advertised
+-- name — otherwise a namespaced entry sorts by its "plugin:" prefix while the
+-- menu shows only the run after it, and the visible order looks scrambled.
+-- Matches against the full name OR the shortened display label, so typing the
+-- exact text the menu just showed you ("/ce-code-review") still filters to it
+-- even though that text is a suffix, not a prefix, of the advertised name.
 local function filter_commands(query)
 	local q = (query or ""):lower()
 	local out = {}
 	for _, name in ipairs(all_commands()) do
-		if q == "" or name:lower():sub(1, #q) == q then
+		if q == "" or name:lower():sub(1, #q) == q or display_name(name):lower():sub(1, #q) == q then
 			out[#out + 1] = name
 		end
 	end
-	table.sort(out)
+	table.sort(out, function(a, b)
+		return display_name(a):lower() < display_name(b):lower()
+	end)
 	return out
 end
 
 --- True when `name` is an EXACT known command — matched against the full
---- advertised name OR its post-":" suffix (so the shortened label the menu shows,
---- e.g. "ce-code-review" for "compound-engineering:ce-code-review", also counts).
---- Drives the "highlight a valid /command anywhere in the line" colouring.
+--- advertised name, OR its post-":" suffix but ONLY when that suffix is
+--- unambiguous (exactly one advertised/local/disk name produces it). An
+--- ambiguous suffix (two different namespaced names both displaying as the same
+--- short label) is a forgeable trust signal if matched blindly, so it is treated
+--- as unknown rather than picking either candidate. Drives the "highlight a
+--- valid /command anywhere in the line" colouring AND submit()'s routing check —
+--- both trust surfaces, so both get the stricter unambiguous rule (contrast with
+--- filter_commands/has_prefix above, which are permissive UI-filter helpers with
+--- no trust implication: worst case they show an extra/missing menu row).
+---
+--- The unambiguous-suffix gate only ever changes the outcome when NO exact/bare
+--- entry named `name` exists — e.g. two different namespaced names both suffixing
+--- to "foo" with no bare "foo" anywhere. That's by design, not a gap: when a bare
+--- entry DOES exist (a real disk/local/advertised command literally named `name`),
+--- matching it via `n == name` is always correct regardless of what any unrelated
+--- namespaced entry's suffix happens to collide with — the bare command is real
+--- either way. See S6c in claude_slash_spec.lua for the reachable ambiguous case.
 function Slash.is_command(name)
 	if not name or name == "" then
 		return false
 	end
-	for _, n in ipairs(all_commands()) do
-		if n == name or n:match("([^:]+)$") == name then
+	-- One all_commands() call, one pass to build suffix counts, reused for the
+	-- match loop below — avoids rebuilding the full command universe twice per
+	-- call (this runs once per "/token" per TextChangedI keystroke via init.lua's
+	-- mid-line highlight scan).
+	local names = all_commands()
+	local counts = {}
+	for _, n in ipairs(names) do
+		local d = display_name(n)
+		counts[d] = (counts[d] or 0) + 1
+	end
+	for _, n in ipairs(names) do
+		if n == name or (n:match("([^:]+)$") == name and counts[name] == 1) then
 			return true
 		end
 	end
 	return false
 end
 
---- True when `query` is a prefix of at least one command (drives the input-span
---- "valid vs no-match" coloring in the chat bar). An empty query is always valid.
+--- True when `query` is a prefix of at least one command's full name OR its
+--- shortened display label (drives the input-span "valid vs no-match" coloring
+--- in the chat bar, and gates whether the menu opens at all — see init.lua). An
+--- empty query is always valid. Permissive UI-filter helper, not a trust check
+--- (contrast Slash.is_command above) — matches the label the menu actually shows.
 function Slash.has_prefix(query)
 	if not query or query == "" then
 		return true
 	end
 	local q = query:lower()
 	for _, name in ipairs(all_commands()) do
-		if name:lower():sub(1, #q) == q then
+		if name:lower():sub(1, #q) == q or display_name(name):lower():sub(1, #q) == q then
 			return true
 		end
 	end
@@ -515,13 +726,14 @@ local function render_menu()
 	local indent = "    "
 	local dwidth = math.max(width - #indent - 1, 8) -- desc wrap width (leave a margin)
 
-	-- Empty state: one diagnostic line, no items.
+	-- Empty state: one diagnostic line, no items. all_commands() always includes
+	-- LOCAL_COMMANDS + BUILTIN_DESC regardless of session load-state (see
+	-- all_commands' unconditional builtin seed), so an empty result here always
+	-- means the query genuinely matched nothing — there is no longer a distinct
+	-- "commands not loaded yet" state to diagnose (the pre-first-message case that
+	-- text used to describe no longer produces an empty menu).
 	if n == 0 then
-		-- Distinguish "the CLI never advertised any commands" (list not captured yet —
-		-- send a message so system/init fires, or restart) from "your query matched
-		-- none of the loaded commands". Makes an empty live session self-diagnosing.
-		local loaded = state.slash_commands and #state.slash_commands > 0
-		local msg = loaded and " no matching commands" or " commands not loaded yet — send a message first"
+		local msg = " no matching commands"
 		vim.bo[menu.buf].modifiable = true
 		vim.api.nvim_buf_set_lines(menu.buf, 0, -1, false, { msg })
 		vim.bo[menu.buf].modifiable = false
@@ -536,10 +748,30 @@ local function render_menu()
 		return
 	end
 
+	-- Recomputed once per render (menu.items just changed) rather than per-item, so
+	-- ambiguity is checked against the same snapshot every row uses.
+	local label_counts = display_counts()
+
 	-- Build one item's render block: the "/label" line + its wrapped desc lines.
+	-- Two disambiguation cases:
+	--  - Collision: when the short display label isn't unique across the current
+	--    command universe (an advertised namespaced name and an unrelated disk
+	--    name both show as "/tdd"), show the FULL name instead so the two rows
+	--    are visibly distinct rather than looking like the same command twice.
+	--  - Project provenance: a disk name sourced ONLY from this repo's own
+	--    `.claude/` (not home/plugin dirs) gets a "(project)" tag — nothing else
+	--    in the row distinguishes "a skill you installed" from "a skill this
+	--    cloned repo shipped", and the two should not look identical.
 	local function build(i)
 		local name = menu.items[i]
-		local label = "/" .. display_name(name)
+		local shown = display_name(name)
+		if label_counts[shown] and label_counts[shown] > 1 then
+			shown = name -- ambiguous short label: fall back to the full name
+		end
+		local label = "/" .. shown
+		if disk_project_names[name] then
+			label = label .. " (project)"
+		end
 		local desc = resolve(name) or ""
 		local blk = { name_line = " " .. label, name_end = 1 + #label, desc_lines = {} }
 		for _, l in ipairs(desc ~= "" and wrap_text(desc, dwidth) or {}) do
@@ -719,10 +951,13 @@ function Slash.accept()
 end
 
 -- Compute the menu's SW anchor. `bar_rows` is the chat bar's full occupied height
--- (interior + 2 border), so the menu sits directly above it.
+-- (interior + 2 border), so the menu sits directly above it. Clamped to row 1: a
+-- tall chat bar stacked with tall subagent/todo widgets can otherwise push this
+-- to 0 or negative, positioning the menu off the top of the editor (or getting
+-- rejected outright by nvim_win_set_config).
 local function menu_anchor(bar_rows)
 	local col, width = panel_float_geom()
-	local bottom = widgets.float_bottom_row() - (bar_rows or 3) - 1
+	local bottom = math.max(widgets.float_bottom_row() - (bar_rows or 3) - 1, 1)
 	return col, width, bottom
 end
 
@@ -788,7 +1023,21 @@ function Slash.open(ibuf, query, bar_rows, on_accept)
 		-- buffer's normal submit returns.
 		vim.keymap.set("i", "<CR>", accept_selected, { buffer = ibuf, nowait = true, silent = true })
 	else
-		-- Already open: just re-place (bar height may have changed) + redraw.
+		-- Already open: re-place (bar height may have changed). Also re-target ibuf/
+		-- on_accept and, if the prompt buffer itself changed (chat bar rebuilt while
+		-- the menu stayed live), move the <CR> keymap onto the new buffer — otherwise
+		-- accept_selected keeps writing into the stale buffer and firing the stale
+		-- callback.
+		if ibuf ~= menu.ibuf then
+			if menu.ibuf and vim.api.nvim_buf_is_valid(menu.ibuf) then
+				pcall(vim.keymap.del, "i", "<CR>", { buffer = menu.ibuf })
+			end
+			if ibuf and vim.api.nvim_buf_is_valid(ibuf) then
+				vim.keymap.set("i", "<CR>", accept_selected, { buffer = ibuf, nowait = true, silent = true })
+			end
+			menu.ibuf = ibuf
+		end
+		menu.on_accept = on_accept
 		local c = vim.api.nvim_win_get_config(menu.win)
 		c.row, c.col, c.width = row, col, width
 		vim.api.nvim_win_set_config(menu.win, c)

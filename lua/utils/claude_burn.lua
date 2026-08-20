@@ -1,7 +1,8 @@
 -- lua/utils/claude_burn.lua
 --
 -- KOS Burn Bar reader — renders the account's 5-hour and 7-day rate-limit meters
--- as a statusline-syntax string for the Claude panel's winbar.
+-- as { text, highlight } chunk tuples for the Claude panel's chat-float footer
+-- (nvim_open_win's `footer`, bottom border of the float — see M.chunks below).
 --
 -- Data source: ~/.claude/kos-burn-bar-state.json
 --   Written every turn by the StatusLine-hook tap. The tap script is VENDORED in
@@ -28,10 +29,11 @@ local M = {}
 
 local STATE = vim.fn.expand("~/.claude/kos-burn-bar-state.json")
 
--- Cache the parsed JSON keyed by the file's mtime so the winbar expr (re-evaluated
--- on every redraw) doesn't re-read + re-decode the file each time. On a half-write
--- (decode failure) we keep the last good value rather than blanking the bar.
-local cache = { mtime = -1, data = nil }
+-- Cache the parsed JSON keyed by the file's mtime+size so the winbar expr
+-- (re-evaluated on every redraw) doesn't re-read + re-decode the file each
+-- time. On a half-write (decode failure) we keep the last good value rather
+-- than blanking the bar.
+local cache = { key = nil, data = nil }
 
 -- Live rate_limit_event telemetry (render.lua's dispatch, one call per turn),
 -- keyed by rateLimitType. Unlike the state file this is account-authoritative and
@@ -61,8 +63,11 @@ local function read_state()
 	if not stat then
 		return nil
 	end
-	local mtime = stat.mtime.sec
-	if cache.data and cache.mtime == mtime then
+	-- mtime.sec alone collides on two writes inside the same wall-clock second
+	-- and can be pinned by anything that rewrites the file while holding mtime
+	-- constant (e.g. `touch -m -t`); size is cheap insurance against both.
+	local cache_key = stat.mtime.sec .. ":" .. stat.size
+	if cache.data and cache.key == cache_key then
 		return cache.data
 	end
 	local fd = io.open(STATE, "r")
@@ -75,23 +80,24 @@ local function read_state()
 	if not ok or type(decoded) ~= "table" then
 		return cache.data
 	end
-	cache.mtime = mtime
+	cache.key = cache_key
 	cache.data = decoded
 	return decoded
-end
-
---- True when the burn-bar state file exists (so callers can decide whether to
---- show the meters at all).
-function M.available()
-	return vim.loop.fs_stat(STATE) ~= nil
 end
 
 --- The model display name recorded in the state file (e.g. "Opus 4.8"), or "".
 --- Used as a default for the modal statusline before the panel's own system/init
 --- reports its model. It's the last interactive session's model, so only a hint.
+--- Escaped for `%`: this string reaches a lualine function component, whose
+--- return value is NOT passed through lualine's own `stl_escape` (that only
+--- covers lualine's built-in components) — an unescaped `%{...}` here would be
+--- interpreted as statusline syntax on every redraw.
 function M.model()
 	local d = read_state()
-	return (d and d.model and d.model.display_name) or ""
+	if type(d) ~= "table" or type(d.model) ~= "table" or type(d.model.display_name) ~= "string" then
+		return ""
+	end
+	return (d.model.display_name:gsub("%%", "%%%%"))
 end
 
 -- Number of block segments in a meter bar.
@@ -239,7 +245,11 @@ local function build(rl, cw, show_bar, show_reset)
 			show_reset
 		)
 	end
-	if type(rl.seven_day) == "table" then
+	-- Also gate on used_percentage being a real number here, not just
+	-- rl.seven_day being a table — otherwise gap() fires and add_meter()
+	-- immediately no-ops on its own pct guard, leaving an orphan separator
+	-- that inflates chunks_width with no visible content behind it.
+	if type(rl.seven_day) == "table" and type(rl.seven_day.used_percentage) == "number" then
 		gap()
 		add_meter(
 			out,
@@ -280,8 +290,10 @@ function M.chunks(maxwidth)
 	if not d then
 		return nil
 	end
-	local rl = d.rate_limits or {}
-	local cw = d.context_window or {}
+	-- Same vim.NIL trap as the per-field checks below: a JSON null decodes to
+	-- truthy userdata, so `or {}` alone wouldn't fire.
+	local rl = (type(d.rate_limits) == "table") and d.rate_limits or {}
+	local cw = (type(d.context_window) == "table") and d.context_window or {}
 	maxwidth = maxwidth or 999
 
 	-- richest → leanest

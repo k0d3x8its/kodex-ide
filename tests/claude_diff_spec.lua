@@ -1155,6 +1155,55 @@ H.check(
 	table.concat(vim.fn.readfile(t28b), "|") == "alpha1|alpha2-EXTERNAL-EDIT|alpha3"
 )
 
+-- ─────────────────────────── T29: accept_all refuses a stale disk snapshot
+--
+-- Post-write review, opened the same way T12/T13 do (external write +
+-- checktime). A SECOND external write then lands while the review sits
+-- open — M.push's `dedup-current` check silently drops that write's own
+-- FileChangedShell event (see GOAL12-FINDINGS.md § Batch 6), so without the
+-- fingerprint check accept_all would stamp the FIRST write's now-stale
+-- scratch snapshot over the second write's newer content while reporting
+-- success. Confirms the newer content survives instead.
+local t29 = ws .. "/stale_accept.txt"
+vim.fn.writefile({ "v1" }, t29)
+vim.cmd("edit " .. t29)
+H.ext_write(t29, { "v2-reviewed" })
+D.checktime_all()
+vim.wait(300, function()
+	return D.state.current == t29
+end)
+vim.wait(1100) -- mtime is second-resolution; force it to actually differ
+H.ext_write(t29, { "v3-EXTERNAL-DURING-REVIEW" })
+D.accept_all()
+vim.wait(300)
+H.check(
+	"T29 stale-disk accept does not stomp the newer external write",
+	table.concat(vim.fn.readfile(t29), "|") == "v3-EXTERNAL-DURING-REVIEW",
+	table.concat(vim.fn.readfile(t29), "|")
+)
+H.check("T29 logged the stale-disk abort", has_log("^accept%-all%-stale%-disk:"))
+
+-- ─────────────────────────── T30: sweep_new skips a path older than its watch()
+--
+-- A `pending_new` entry that outlives its own proposal (nothing currently
+-- clears it on a denied/errored write — see GOAL12-FINDINGS.md § Batch 6)
+-- must not let reject_all delete a file whose ctime predates the watch()
+-- call that armed the entry — that's a user-created file, not Claude's.
+-- Deterministic unit-style setup (not relying on OS permission-change
+-- timing): a real file's real ctime, paired with a synthetic `watched_at`
+-- far in the future relative to it, is exactly the condition sweep_new's
+-- ctime check must refuse to promote.
+local t30 = ws .. "/stale-preexisting.txt"
+vim.fn.writefile({ "user content" }, t30)
+local t30_stat = vim.loop.fs_stat(t30)
+D.state.pending_new[t30] = t30_stat.ctime.sec + 1000000 -- "watched" long after this file's real ctime
+claude.state.diff_queue = {}
+D.sweep_new()
+H.check("T30 stale pending_new entry cleared", D.state.pending_new[t30] == nil)
+H.check("T30 stale path NOT promoted to new_files", D.state.new_files[t30] ~= true)
+H.check("T30 stale path NOT queued for review", not vim.tbl_contains(claude.state.diff_queue, t30))
+H.check("T30 logged the stale-skip", has_log("^new%-pending%-stale%-skip:"))
+
 claude.state.panel_buf = nil
 
 H.summary("claude_diff")

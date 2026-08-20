@@ -120,8 +120,14 @@ local function bar_parts(pct)
 end
 
 -- Humanise seconds-until-reset into a compact "2d3h" / "4h12m" / "9m" form.
+-- `resets_at` is an untrusted field from a `$HOME` JSON file (see header) — a
+-- non-finite value (Inf/-Inf/NaN) passes `type() == "number"` and, unguarded,
+-- produces a garbage wraparound string from %d's integer coercion (verified:
+-- `math.huge` does NOT raise under this repo's LuaJIT, it silently wraps to
+-- -9223372036854775808) rather than a crash — still misinformation, not just
+-- a display nit, so bound it here rather than trust the caller.
 local function countdown(resets_at)
-	if type(resets_at) ~= "number" then
+	if type(resets_at) ~= "number" or not (resets_at < math.huge and resets_at > -math.huge) then
 		return ""
 	end
 	local secs = resets_at - os.time()
@@ -198,8 +204,10 @@ end
 local function add_meter(out, glyph, label, pct, resets_at, show_bar, stale, live_resets_at, show_reset)
 	-- vim.json.decode maps JSON null → vim.NIL (userdata, truthy), not Lua nil, so a
 	-- bare `== nil` check leaks it through to severity()/math.floor and crashes on a
-	-- number-vs-userdata compare. Reject anything that isn't a real number here.
-	if type(pct) ~= "number" then
+	-- number-vs-userdata compare. Reject anything that isn't a real, finite number —
+	-- Inf/-Inf/NaN pass type()=="number" and bar_parts'/severity's math would produce
+	-- garbage rather than a clean 0-100 clamp.
+	if type(pct) ~= "number" or not (pct < math.huge and pct > -math.huge) then
 		return
 	end
 	local sev = stale and "ClaudeBurnStale" or ("ClaudeBurn" .. severity(pct))

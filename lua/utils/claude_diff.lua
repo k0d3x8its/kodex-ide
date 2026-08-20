@@ -431,6 +431,14 @@ function M.accept_all()
 	-- without this check accept_all would silently stamp stale content over the
 	-- newer bytes while reporting success. Post-write reviews only — prewrite has
 	-- no disk content yet to go stale against.
+	--
+	-- Same mtime+size collision risk as claude_burn.lua's read_state cache key
+	-- (same-second rewrite of identical length): accepted here because this
+	-- guards against an ORDINARY concurrent writer racing the review window, not
+	-- an adversary deliberately matching mtime+size — the burn-bar cache guards
+	-- an attacker-writable file, this guards a review a human is actively looking
+	-- at. Worth revisiting together if this ever needs the same nsec+content hash
+	-- treatment.
 	if s.orig_fingerprint then
 		local path = s.current
 		local stat = vim.loop.fs_stat(path)
@@ -707,9 +715,17 @@ local function mount_diff(buf, scratch, is_new, prewrite, path)
 				and ("⚠ Claude proposes new file: " .. rel .. "  │  <leader>ca approve & create  │  <leader>cx deny")
 			or ("⚠ Claude proposes: " .. rel .. "  │  <leader>ca approve & write  │  <leader>cx deny")
 	else
+		-- Only the plain-edit case below restores the spec'd "do accept hunk" segment
+		-- (MG 7.2's literal wording) — it's the one review where hunk-level diffget
+		-- is the expected accept-partial workflow; the new-file case is a whole-file-
+		-- additions diff where a hunk-level accept doesn't map to a coherent action.
 		winbar = is_new
 				and ("⚠ Claude created (new file): " .. rel .. "  │  <leader>ca accept all  │  <leader>cx reject (delete file)")
-			or ("⚠ Claude proposed: " .. rel .. "  │  <leader>ca accept all  │  <leader>cx reject all")
+			or (
+				"⚠ Claude proposed: "
+				.. rel
+				.. "  │  <leader>ca accept all  │  <leader>cx reject all  │  do accept hunk"
+			)
 	end
 	vim.wo[scratch_win].winbar = winbar
 

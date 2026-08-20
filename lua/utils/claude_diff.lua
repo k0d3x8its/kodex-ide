@@ -95,6 +95,12 @@ M.state = {
 	-- 'readonly' for the life of the review; this holds the prior value so
 	-- close_diff can restore it.
 	orig_prev_readonly = nil,
+	-- {mtime, size} of `current`'s disk state, captured at open_diff time (post-write
+	-- reviews only). accept_all refuses to write the scratch snapshot back if disk
+	-- has moved since — otherwise a write landing while the review sits open (git
+	-- checkout, another process, a second nvim) is silently reverted with no signal
+	-- that the accept did anything but succeed.
+	orig_fingerprint = nil,
 }
 
 local anchor_ns = vim.api.nvim_create_namespace("claude_diff_anchor")
@@ -110,6 +116,18 @@ local function log(msg)
 	if M.state.debug then
 		table.insert(M.state.log, msg)
 	end
+end
+
+-- `approved` is set (open_prewrite/accept_all) via fnamemodify(path, ":p") but
+-- consumed (the FileChangedShell callback below) via nvim_buf_get_name — these
+-- diverge for a symlinked path, a bind-mount, or a buffer named before an
+-- :lcd. On divergence an approved write gets double-gated: a second post-write
+-- diff opens against pre-edit content, and rejecting it reverts a change the
+-- user already approved. realpath collapses both sides to the same string;
+-- fall back to fnamemodify only when realpath can't resolve (path deleted
+-- between the write and this call, or genuinely doesn't exist yet).
+local function realpath(p)
+	return vim.loop.fs_realpath(p) or vim.fn.fnamemodify(p, ":p")
 end
 
 -- Mark "right here" in the panel transcript as where a hunk for `path` belongs.
@@ -200,7 +218,13 @@ function M.watch(path)
 	-- finishes a tool) picks up the created file and opens a whole-file-additions
 	-- diff directly, bypassing FCS/W13 entirely.
 	if vim.fn.filereadable(abs) == 0 then
-		M.state.pending_new[abs] = true
+		-- Timestamp, not just `true`: nothing currently clears this entry on a
+		-- denied permission or a tool error (that signal lives in gate.lua/render.lua,
+		-- outside this file — see GOAL12-FINDINGS.md § Batch 6 for the deferred cross-
+		-- file half of this fix), so a stale entry can otherwise live for the whole
+		-- panel session. sweep_new() uses this to refuse promoting a path whose ctime
+		-- predates this watch() call — i.e. a file the USER created, not Claude.
+		M.state.pending_new[abs] = os.time()
 		log("watch-new-pending:" .. abs)
 		return true
 	end
@@ -266,6 +290,18 @@ local function close_diff()
 	-- → `buffer #` resurrects the panel (phantom 2nd panel column, live-observed
 	-- 2026-07-03). Instead: close a window we created; restore the tracked prior
 	-- buffer for a reused window; fresh empty buffer as the last resort.
+	-- Post-write new-file case: open_diff blanked the REAL-path buffer (not a
+	-- throwaway scratch — the file already exists on disk with Claude's content)
+	-- so the diff renders whole-file additions. If the review is ABANDONED rather
+	-- than accepted/rejected, that blank+modified buffer was never restored here
+	-- before this fix — the next :w/:wa/autowriteall on it would truncate the
+	-- file Claude just created. Reload from disk (the real content is still
+	-- there; only the buffer was blanked) rather than leaving it empty.
+	if not s.prewrite and s.kind == "new" and s.orig_buf and vim.api.nvim_buf_is_valid(s.orig_buf) then
+		pcall(vim.api.nvim_buf_call, s.orig_buf, function()
+			vim.cmd("silent! edit!")
+		end)
+	end
 	if s.prewrite and s.kind == "new" and s.orig_buf and vim.api.nvim_buf_is_valid(s.orig_buf) then
 		local w = vim.fn.bufwinid(s.orig_buf)
 		if
@@ -295,11 +331,18 @@ local function close_diff()
 	s.orig_win_created, s.orig_prev_buf = nil, nil
 	s.orig_win, s.scratch_win = nil, nil
 	s.orig_prev_readonly = nil
+	s.orig_fingerprint = nil
 	s.kind = "edit"
 	s.prewrite = false
 	-- Notify the Claude panel that the diff is resolved so it can unlock the
 	-- input bar (MG 7.2 — mirrors the on_diff_open call in open_diff below).
-	claude.on_diff_close()
+	-- pcall'd for the same reason open_diff pcalls the matching on_diff_open call:
+	-- a throw here must not leave in_close latched true forever, which would
+	-- permanently disable the WinClosed abandoned-review safety net.
+	local ok, err = pcall(claude.on_diff_close)
+	if not ok then
+		log("on-diff-close-FAILED:" .. tostring(err))
+	end
 	in_close = false
 	vim.schedule(M.process_next)
 end
@@ -381,6 +424,35 @@ function M.accept_all()
 		log("accept-all-skipped-invalid:" .. tostring(s.current))
 		close_diff()
 		return
+	end
+	-- The scratch snapshot is from diff-open time; a write to `s.current` landing
+	-- WHILE the review sat open (git checkout, another process, a second nvim) is
+	-- dedup'd away by M.push's `dedup-current` check and never reopens the diff, so
+	-- without this check accept_all would silently stamp stale content over the
+	-- newer bytes while reporting success. Post-write reviews only — prewrite has
+	-- no disk content yet to go stale against.
+	if s.orig_fingerprint then
+		local path = s.current
+		local stat = vim.loop.fs_stat(path)
+		local changed = not stat or stat.mtime.sec ~= s.orig_fingerprint.mtime or stat.size ~= s.orig_fingerprint.size
+		if changed then
+			log("accept-all-stale-disk:" .. tostring(path))
+			close_diff()
+			vim.schedule(function()
+				vim.notify(
+					"Claude: "
+						.. vim.fn.fnamemodify(path or "?", ":t")
+						.. " changed on disk while this review was open — reopening the diff against the current content",
+					vim.log.levels.WARN
+				)
+			end)
+			if path then
+				-- close_diff() already scheduled process_next; pushing synchronously
+				-- before that scheduled call fires means it will pick this path up.
+				M.push(path)
+			end
+			return
+		end
 	end
 	local lines = vim.api.nvim_buf_get_lines(s.scratch, 0, -1, false)
 	vim.api.nvim_buf_set_lines(s.orig_buf, 0, -1, false, lines)
@@ -519,7 +591,7 @@ end
 -- Shared window mount for BOTH diff flavours (post-write open_diff and pre-write
 -- open_prewrite): host the orig buffer in a real editor window, split the scratch
 -- (proposed) to its right, diffthis both, wrap, lenses, winbar, keymaps.
-local function mount_diff(buf, scratch, is_new, prewrite)
+local function mount_diff(buf, scratch, is_new, prewrite, path)
 	-- Reset teardown bookkeeping for this mount (see M.state field docs).
 	M.state.orig_win_created = nil
 	M.state.orig_prev_buf = nil
@@ -623,14 +695,21 @@ local function mount_diff(buf, scratch, is_new, prewrite)
 	-- without reading a notify that may have scrolled away.
 	-- Post-write new-file reject DELETES the file (it shouldn't exist); pre-write
 	-- wording says approve/deny — nothing is on disk yet either way.
+	-- The target path is part of what this approval surface must show — a
+	-- basename-only winbar rendered a proposed write to ~/.ssh/config identically
+	-- to a project-local `config` (security finding, batch 6). `:~` tildifies the
+	-- home dir but keeps the rest of the path, so an outside-project target reads
+	-- differently from a project-local one at a glance.
+	local rel = path and vim.fn.fnamemodify(path, ":~") or "?"
 	local winbar
 	if prewrite then
-		winbar = is_new and "⚠ Claude proposes new file  │  <leader>ca approve & create  │  <leader>cx deny"
-			or "⚠ Claude proposes  │  <leader>ca approve & write  │  <leader>cx deny"
+		winbar = is_new
+				and ("⚠ Claude proposes new file: " .. rel .. "  │  <leader>ca approve & create  │  <leader>cx deny")
+			or ("⚠ Claude proposes: " .. rel .. "  │  <leader>ca approve & write  │  <leader>cx deny")
 	else
 		winbar = is_new
-				and "⚠ Claude created (new file)  │  <leader>ca accept all  │  <leader>cx reject (delete file)"
-			or "⚠ Claude proposed  │  <leader>ca accept all  │  <leader>cx reject all"
+				and ("⚠ Claude created (new file): " .. rel .. "  │  <leader>ca accept all  │  <leader>cx reject (delete file)")
+			or ("⚠ Claude proposed: " .. rel .. "  │  <leader>ca accept all  │  <leader>cx reject all")
 	end
 	vim.wo[scratch_win].winbar = winbar
 
@@ -691,9 +770,18 @@ local function open_diff(path)
 		vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
 	end
 
+	-- Fingerprint disk NOW, before the review sits open for an arbitrary duration —
+	-- accept_all compares against this to detect a write landing while unreviewed.
+	local fp_stat = vim.loop.fs_stat(path)
+	s.orig_fingerprint = fp_stat and { mtime = fp_stat.mtime.sec, size = fp_stat.size } or nil
+
 	local scratch = vim.api.nvim_create_buf(false, true) -- nofile scratch
 	vim.api.nvim_buf_set_lines(scratch, 0, -1, false, disk)
-	vim.api.nvim_buf_set_name(scratch, "[Claude proposed] " .. vim.fn.fnamemodify(path, ":t"))
+	-- `:~` (tildified full path), not `:t` (basename only) — the approval surface
+	-- this buffer name is part of MUST show the directory, not just the filename:
+	-- a proposed write to ~/.ssh/config rendered identically to a project-local
+	-- `config` when only the basename was shown (security finding, batch 6).
+	vim.api.nvim_buf_set_name(scratch, "[Claude proposed] " .. vim.fn.fnamemodify(path, ":~"))
 	-- Match the real file's filetype so the proposed column gets the same
 	-- syntax/treesitter (Dracula) highlighting as the orig column — a bare nofile
 	-- scratch has no filetype and renders plain, so the right pane looked unlit
@@ -704,7 +792,7 @@ local function open_diff(path)
 		vim.bo[scratch].filetype = ft
 	end
 
-	mount_diff(buf, scratch, is_new, false)
+	mount_diff(buf, scratch, is_new, false, path)
 
 	s.current, s.scratch, s.orig_buf = path, scratch, buf
 	s.kind = is_new and "new" or "edit"
@@ -759,7 +847,10 @@ function M.open_prewrite(path, proposed)
 	if s.current ~= nil then
 		return false
 	end
-	local abs = vim.fn.fnamemodify(path, ":p")
+	-- realpath, not plain fnamemodify: `abs` becomes s.current below, which is what
+	-- accept_all keys `approved` by — see realpath()'s doc comment for why this
+	-- must match the FileChangedShell callback's own key.
+	local abs = realpath(path)
 	local is_new = vim.fn.filereadable(abs) == 0
 
 	local buf
@@ -768,7 +859,8 @@ function M.open_prewrite(path, proposed)
 		-- buffer here would be BF_NEW, and the post-approval checktime would raise the
 		-- blocking W13 dialog on it (the exact trap watch() dodges). close_diff wipes it.
 		buf = vim.api.nvim_create_buf(false, true)
-		vim.api.nvim_buf_set_name(buf, "[No file] " .. vim.fn.fnamemodify(abs, ":t"))
+		-- `:~`, not `:t` — see the matching comment in open_diff (security finding).
+		vim.api.nvim_buf_set_name(buf, "[No file] " .. vim.fn.fnamemodify(abs, ":~"))
 	else
 		-- Real pre-edit content: the file is still untouched on disk, so loading the
 		-- buffer (or reusing an already-loaded one) IS the "before" side.
@@ -782,7 +874,7 @@ function M.open_prewrite(path, proposed)
 
 	local scratch = vim.api.nvim_create_buf(false, true)
 	vim.api.nvim_buf_set_lines(scratch, 0, -1, false, proposed)
-	vim.api.nvim_buf_set_name(scratch, "[Claude proposed] " .. vim.fn.fnamemodify(abs, ":t"))
+	vim.api.nvim_buf_set_name(scratch, "[Claude proposed] " .. vim.fn.fnamemodify(abs, ":~"))
 	-- Filetype = same syntax/treesitter (Dracula) highlighting as the orig column;
 	-- see open_diff for why (bare nofile scratch renders plain). Match on abs path.
 	local ft = vim.filetype.match({ filename = abs })
@@ -790,7 +882,7 @@ function M.open_prewrite(path, proposed)
 		vim.bo[scratch].filetype = ft
 	end
 
-	mount_diff(buf, scratch, is_new, true)
+	mount_diff(buf, scratch, is_new, true, abs)
 
 	s.current, s.scratch, s.orig_buf = abs, scratch, buf
 	s.kind = is_new and "new" or "edit"
@@ -834,12 +926,23 @@ function M.sweep_new()
 	if not claude.state.claude_active then
 		return
 	end
-	for abs in pairs(M.state.pending_new) do
+	for abs, watched_at in pairs(M.state.pending_new) do
 		if vim.fn.filereadable(abs) == 1 then
 			M.state.pending_new[abs] = nil
-			M.state.new_files[abs] = true
-			M.push(abs) -- dedups against current + queue
-			log("new-created:" .. abs)
+			-- A path can go from "doesn't exist" to "exists" without Claude having
+			-- created it — the user (or git, or a build step) can create a file at a
+			-- path Claude only proposed, and reject_all's new-file branch deletes
+			-- whatever gets promoted here on <leader>cx. Only promote a path whose
+			-- ctime is AT OR AFTER the watch() call that armed this entry; an older
+			-- ctime means the file predates the proposal and is not Claude's creation.
+			local stat = vim.loop.fs_stat(abs)
+			if stat and stat.ctime.sec >= watched_at then
+				M.state.new_files[abs] = true
+				M.push(abs) -- dedups against current + queue
+				log("new-created:" .. abs)
+			else
+				log("new-pending-stale-skip:" .. abs)
+			end
 		end
 	end
 end
@@ -854,21 +957,26 @@ end
 -- this one's silent-reload (the flag would otherwise dangle forever: no write landed,
 -- so no FileChangedShell ever fires to consume it).
 function M.resolve_prewrite_result(path, is_error)
-	-- Normalize: pending_emit is keyed by open_prewrite's fnamemodify(path, ":p")
+	-- Normalize: pending_emit/approved are keyed by open_prewrite's realpath(path)
 	-- (s.current), but the caller here hands the RAW tool_use input.file_path —
 	-- same source string, but un-normalized. A silent mismatch would mean the
 	-- hunk never renders even on success, which is worse than the original bug.
-	path = vim.fn.fnamemodify(path, ":p")
+	path = realpath(path)
 	local emit = M.state.pending_emit[path]
-	if not emit then
-		return
-	end
 	M.state.pending_emit[path] = nil
+	-- `approved[path]` must clear on a FAILED write regardless of whether `emit`
+	-- was ever armed (accept_all only arms pending_emit when blk_old/blk_new were
+	-- captured — see accept_all's prewrite branch — but sets `approved` for every
+	-- accept). Gating this clear on `emit` existing (the old early-return-on-nil
+	-- shape) left `approved[path]` dangling whenever emit wasn't armed, silently
+	-- auto-approving the NEXT unrelated write to that path.
 	if is_error then
 		M.state.approved[path] = nil
 		log("prewrite-write-FAILED:" .. tostring(path))
-	else
-		log("prewrite-write-confirmed:" .. tostring(path))
+		return
+	end
+	log("prewrite-write-confirmed:" .. tostring(path))
+	if emit then
 		emit()
 	end
 end
@@ -934,7 +1042,9 @@ local function ensure_autocmds()
 			-- Pre-write gate: this write was ALREADY reviewed and approved (the user
 			-- accepted the pre-write diff; the CLI just performed the write). Reload
 			-- silently instead of queueing a second review. Flag is one-shot per path.
-			local abs = vim.api.nvim_buf_get_name(ev.buf)
+			-- realpath, not the raw buffer name — must match the key open_prewrite/
+			-- accept_all set `approved` under (see realpath()'s doc comment).
+			local abs = realpath(vim.api.nvim_buf_get_name(ev.buf))
 			if M.state.approved[abs] then
 				M.state.approved[abs] = nil
 				-- Reload OURSELVES (scheduled — buffer ops are forbidden in this
@@ -1060,10 +1170,16 @@ function M.on_panel_close()
 		saved_autoread = nil
 	end
 	-- Pending/new-file tracking is session-scoped: a path Claude never created (or
-	-- one already resolved) must not leak into the next panel session.
+	-- one already resolved) must not leak into the next panel session. pending_emit
+	-- and anchors were missing here (a leftover pending_emit closure holds the
+	-- previous session's blk_old/blk_new + an anchor_row into a dead panel buffer —
+	-- a same-path write in the NEXT session would resolve it and render last
+	-- session's hunk into the new transcript).
 	M.state.pending_new = {}
 	M.state.new_files = {}
 	M.state.approved = {}
+	M.state.pending_emit = {}
+	M.state.anchors = {}
 	M.state.reveal_new = nil
 end
 

@@ -405,8 +405,11 @@ local absnew = vim.fn.fnamemodify(newf, ":p")
 vim.fn.delete(newf)
 local watch_ret_new = D2.watch(newf) -- file absent → pending, no buffer created (would W13 on create)
 H.check(
+	-- pending_new stores the watch()-time timestamp (not a bare `true`) so
+	-- sweep_new can refuse to promote a path whose ctime predates this watch()
+	-- call — see GOAL12-FINDINGS.md § Batch 6, the dangling-pending-new fix.
 	"T17 watch records pending-new, creates NO buffer",
-	D2.state.pending_new[absnew] == true and vim.fn.bufnr(newf) == -1,
+	type(D2.state.pending_new[absnew]) == "number" and vim.fn.bufnr(newf) == -1,
 	"pending=" .. tostring(D2.state.pending_new[absnew]) .. " bufnr=" .. vim.fn.bufnr(newf)
 )
 H.check(

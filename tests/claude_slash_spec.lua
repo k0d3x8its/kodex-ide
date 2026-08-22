@@ -96,6 +96,44 @@ local d = slash._resolve_desc("diagnose")
 H.check("S3 diagnose resolves a non-empty description", type(d) == "string" and #d > 0, tostring(d))
 H.check("S3 a bogus command resolves to nil", slash._resolve_desc("definitely-not-a-command-xyz") == nil)
 
+-- ── S3b: parse_frontmatter's block-scalar branch (`description: >` / `|` plus
+-- indented continuation lines) — batch-5 testing finding: every real skill file
+-- this spec reads (diagnose, above) happens to use a single-line description, so
+-- the folded-scalar path was never actually exercised. Write a throwaway fixture
+-- SKILL.md under /tmp/.claude/skills (the cwd this spec already `cd`s into, so
+-- PROJECT_PATTERNS' real glob picks it up) using a folded block scalar.
+vim.fn.mkdir("/tmp/.claude/skills/block-scalar-fixture", "p")
+vim.fn.writefile({
+	"---",
+	"name: block-scalar-fixture",
+	"description: >",
+	"  This description folds",
+	"  across several indented lines.",
+	"---",
+	"",
+	"# Block scalar fixture",
+}, "/tmp/.claude/skills/block-scalar-fixture/SKILL.md")
+slash._refresh_disk_names()
+H.check(
+	"S3b block-scalar fixture is discovered on disk",
+	(function()
+		for _, name in ipairs(slash._disk_command_names()) do
+			if name == "block-scalar-fixture" then
+				return true
+			end
+		end
+		return false
+	end)()
+)
+local block_scalar_desc = slash._resolve_desc("block-scalar-fixture")
+H.check(
+	"S3b folded lines join into a single-line description",
+	block_scalar_desc == "This description folds across several indented lines.",
+	tostring(block_scalar_desc)
+)
+os.remove("/tmp/.claude/skills/block-scalar-fixture/SKILL.md")
+vim.fn.delete("/tmp/.claude/skills/block-scalar-fixture", "d")
+
 -- ── S4: menu float lifecycle (open → move → select → close) ───────────────────
 -- Pin disk discovery to empty so the lifecycle assertions depend only on the known
 -- CLI+LOCAL set (real ~/.claude skills would otherwise reorder the sorted menu).
@@ -351,5 +389,91 @@ H.check("S8 an embedded newline is rejected", slash._is_valid_name("foo\nbar") =
 H.check("S8 an empty string is rejected", slash._is_valid_name("") == false)
 H.check("S8 a non-string is rejected", slash._is_valid_name(42) == false)
 H.check("S8 a name over the length cap is rejected", slash._is_valid_name(string.rep("a", 81)) == false)
+
+-- ── S9: Slash.save_cache (batch-5 testing finding — zero direct coverage on the
+-- shrink-refusal/symlink-refusal guards added to fix a live data-loss bug: a good
+-- ~202-name cache once got clobbered down to 3 names by a transient partial
+-- capture). All three cases write to the same KODEX_CLAUDE_SLASH_CACHE tempfile
+-- this spec already isolated at the top of the file (CACHE_PATH is read once at
+-- module load, so we can't redirect it mid-spec — only swap what's on disk there).
+local cache_path = vim.env.KODEX_CLAUDE_SLASH_CACHE
+
+-- Capture vim.notify calls without letting them print to the headless session.
+local notified = nil
+local real_notify = vim.notify
+local function with_notify_capture(fn)
+	notified = nil
+	vim.notify = function(msg, level)
+		notified = { msg = msg, level = level }
+	end
+	local ok, err = pcall(fn)
+	vim.notify = real_notify
+	if not ok then
+		error(err)
+	end
+end
+
+-- (a) Round trip: save six valid names (>= the 5 already on disk from S1's feed(),
+-- so the shrink guard doesn't interfere), then reload them via ensure_commands into
+-- a fresh (nil) session — the same path Slash.ensure_commands takes pre-first-message.
+local round_trip_names = { "alpha", "beta", "gamma", "delta", "epsilon", "zeta" }
+slash.save_cache(round_trip_names)
+local saved_raw = vim.fn.readfile(cache_path)
+H.check(
+	"S9 save_cache writes valid JSON with the given names",
+	saved_raw[1] and vim.json.decode(saved_raw[1]) and #vim.json.decode(saved_raw[1]) == #round_trip_names,
+	table.concat(saved_raw, "|")
+)
+claude.state.slash_commands = nil
+slash.ensure_commands()
+H.check(
+	"S9 the saved names round-trip through ensure_commands",
+	claude.state.slash_commands ~= nil and #claude.state.slash_commands == #round_trip_names,
+	vim.inspect(claude.state.slash_commands)
+)
+-- Restore the CLI-advertised list the rest of the file's later sections expect.
+claude.state.slash_commands = { "brainstorm", "diagnose", "review", "compact", "changelog" }
+
+-- (b) Shrink refusal: a save with FEWER valid names than what's already on disk (6,
+-- from (a)) must be refused — file stays unchanged, a WARN notify fires.
+with_notify_capture(function()
+	slash.save_cache({ "only-one" })
+end)
+H.check(
+	"S9 a shrinking save warns via vim.notify",
+	notified ~= nil and notified.level == vim.log.levels.WARN,
+	vim.inspect(notified)
+)
+local after_shrink_attempt = vim.fn.readfile(cache_path)
+H.check(
+	"S9 a shrinking save does not touch the on-disk cache",
+	after_shrink_attempt[1] == saved_raw[1],
+	table.concat(after_shrink_attempt, "|")
+)
+
+-- (c) Symlink refusal: CACHE_PATH pointing at a symlink (rather than a regular
+-- file) must be refused outright — never written through, whatever it points at.
+local symlink_target = vim.fn.tempname() .. "_symlink_target.json"
+vim.fn.writefile({ vim.json.encode({ "untouched" }) }, symlink_target)
+os.remove(cache_path)
+vim.fn.system({ "ln", "-s", symlink_target, cache_path })
+H.check("S9 setup: CACHE_PATH is now a symlink", vim.fn.getftype(cache_path) == "link")
+with_notify_capture(function()
+	slash.save_cache({ "should-not-land" })
+end)
+H.check(
+	"S9 a save through a symlinked CACHE_PATH warns via vim.notify",
+	notified ~= nil and notified.level == vim.log.levels.WARN,
+	vim.inspect(notified)
+)
+H.check(
+	"S9 the symlink target is untouched by the refused save",
+	vim.fn.readfile(symlink_target)[1] == vim.json.encode({ "untouched" }),
+	table.concat(vim.fn.readfile(symlink_target), "|")
+)
+-- Clean up: restore a plain file at CACHE_PATH so later runs of this spec (a fresh
+-- tempname each run, but tidy regardless) don't leave a dangling symlink behind.
+os.remove(cache_path)
+os.remove(symlink_target)
 
 H.summary("claude_slash")

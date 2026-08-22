@@ -101,4 +101,130 @@ H.check(
 	advisor.current_label() == "No advisor" or type(advisor.current_label()) == "string"
 )
 
+-- ── A4: move() — Up/Down/j/k selection change + clamp at both ends (batch-5
+-- testing finding: A1/A2 only ever drive the picker via <CR>, never feed a
+-- movement key, so move()'s own logic had no direct coverage). No public getter
+-- for modal.sel exists, so drive selection via the real keymaps and observe which
+-- id lands via the on_confirm callback — the same public surface a real user
+-- interaction goes through.
+local function feed_key(lhs)
+	vim.api.nvim_win_call(advisor.win(), function()
+		vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(lhs, true, false, true), "x", false)
+	end)
+end
+
+-- Pin the starting selection explicitly rather than relying on core.lua's default
+-- (advisor_model = "opus", OPTIONS[1]) — active_index() seeds modal.sel from this,
+-- so an implicit default would make these assertions silently depend on ambient
+-- state the spec never states.
+claude.state.advisor_model = "opus"
+
+local confirmed_id
+advisor.open(function(id)
+	confirmed_id = id
+end)
+feed_key("<CR>") -- no movement: proves the starting selection is really OPTIONS[1]
+H.check(
+	"A4 the picker opens preselecting state.advisor_model's option (opus)",
+	confirmed_id == "opus",
+	tostring(confirmed_id)
+)
+
+claude.state.advisor_model = "opus"
+advisor.open(function(id)
+	confirmed_id = id
+end)
+feed_key("<Down>")
+feed_key("<Down>") -- opus -> sonnet -> fable
+feed_key("<CR>")
+H.check(
+	"A4 <Down><Down> then confirm lands on the third option (fable)",
+	confirmed_id == "fable",
+	tostring(confirmed_id)
+)
+
+claude.state.advisor_model = "opus"
+advisor.open(function(id)
+	confirmed_id = id
+end)
+feed_key("<Up>") -- already at row 1 (opus): must clamp, not wrap
+feed_key("<CR>")
+H.check("A4 <Up> from the top row clamps instead of wrapping", confirmed_id == "opus", tostring(confirmed_id))
+
+claude.state.advisor_model = "opus"
+advisor.open(function(id)
+	confirmed_id = id
+end)
+feed_key("j") -- j/k are the same move(±1) as Down/Up
+feed_key("<CR>")
+H.check("A4 'j' advances the selection like <Down>", confirmed_id == "sonnet", tostring(confirmed_id))
+
+claude.state.advisor_model = "opus"
+advisor.open(function(id)
+	confirmed_id = id
+end)
+feed_key("j")
+feed_key("k") -- back to the top
+feed_key("<CR>")
+H.check("A4 'k' reverses the selection like <Up>", confirmed_id == "opus", tostring(confirmed_id))
+
+-- ── A5: the WinClosed fallback teardown (mirrors effort.lua's fallback for a float
+-- closed by some path OTHER than Advisor.close(), e.g. `:q`) — batch-5 testing
+-- finding: no prior spec closed the picker window directly, so this autocmd path
+-- was unproven. Re-wire with a pet_attach_panel spy to prove Advisor.close()'s
+-- side effects still ran even though this call never went through Advisor.close().
+local panel_reattached = false
+advisor.wire({
+	panel_float_geom = function()
+		return 0, 40
+	end,
+	harden_float_scroll = function() end,
+	try_resume_decision_queues = function() end,
+	pet_attach_surface = function() end,
+	pet_attach_panel = function()
+		panel_reattached = true
+	end,
+})
+advisor.open(function() end)
+H.check("A5 picker opens", advisor.active() == true)
+local win_to_close = advisor.win()
+panel_reattached = false
+vim.api.nvim_win_close(win_to_close, true) -- bypass Advisor.close() entirely
+H.check("A5 modal state clears when the window closes via a non-Advisor.close path", advisor.active() == false)
+H.check("A5 the WinClosed fallback still ran Advisor.close()'s side effects", panel_reattached == true)
+
+-- ── A6: the pcall(try_resume_decision_queues) failure branches — batch-5 testing
+-- finding: neither spec ever made the injected hook throw, so the WARN-and-continue
+-- path (both in Advisor.close and confirm) was unproven. A throwing hook must not
+-- take the picker down with it — it should still close/confirm and just warn.
+local warned = nil
+local real_notify = vim.notify
+vim.notify = function(msg, level)
+	warned = { msg = msg, level = level }
+end
+advisor.wire({
+	panel_float_geom = function()
+		return 0, 40
+	end,
+	harden_float_scroll = function() end,
+	try_resume_decision_queues = function()
+		error("boom: queue hook exploded")
+	end,
+	pet_attach_surface = function() end,
+	pet_attach_panel = function() end,
+})
+local confirm_cb_ran = false
+advisor.open(function()
+	confirm_cb_ran = true
+end)
+feed_key("<CR>")
+vim.notify = real_notify
+H.check("A6 confirm() still completes when the resume hook throws", advisor.active() == false)
+H.check("A6 the on_confirm callback still fired despite the throwing hook", confirm_cb_ran == true)
+H.check(
+	"A6 the swallowed error is reported via vim.notify WARN, not silently dropped",
+	warned ~= nil and warned.level == vim.log.levels.WARN,
+	vim.inspect(warned)
+)
+
 H.summary("claude_advisor")

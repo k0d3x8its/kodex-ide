@@ -101,9 +101,9 @@ end
 -- Which OPTIONS index matches the currently-active advisor (state.advisor_model),
 -- so its row gets the ✔. Compared by id (nil == the "No advisor" row).
 local function active_index()
-	for i, o in ipairs(OPTIONS) do
-		if o.id == state.advisor_model then
-			return i
+	for idx, option in ipairs(OPTIONS) do
+		if option.id == state.advisor_model then
+			return idx
 		end
 	end
 	return nil
@@ -132,40 +132,38 @@ local function render()
 
 	add(" Advisor (experimental)", "ClaudeEffortTitle")
 	add("")
-	for _, l in ipairs(wrap(BLURB, textw)) do
-		add(" " .. l, "ClaudeSlashDesc")
+	for _, line in ipairs(wrap(BLURB, textw)) do
+		add(" " .. line, "ClaudeSlashDesc")
 	end
 	add("")
 
 	-- The option rows. "> " cursor on the highlighted row; " ✔" trailing the row
 	-- that is the currently-active advisor. Selected label bolded, others dim.
-	local opt_first = #lines -- 0-based line index of the first option row
-	for i, o in ipairs(OPTIONS) do
-		local cursor = (i == modal.sel) and "> " or "  "
-		local check = (i == activ) and "  ✔" or ""
-		local text = cursor .. i .. ". " .. o.label .. check
+	for idx, option in ipairs(OPTIONS) do
+		local cursor = (idx == modal.sel) and "> " or "  "
+		local check = (idx == activ) and "  ✔" or ""
+		local text = cursor .. idx .. ". " .. option.label .. check
 		lines[#lines + 1] = text
 		local ln = #lines - 1
 		-- Whole row dim by default; bold the selected row's label span.
-		hls[#hls + 1] = { ln, 0, -1, (i == modal.sel) and "ClaudeEffortSel" or "ClaudeEffortDim" }
+		hls[#hls + 1] = { ln, 0, -1, (idx == modal.sel) and "ClaudeEffortSel" or "ClaudeEffortDim" }
 		-- Green ✔ for the active advisor regardless of selection.
-		if i == activ then
+		if idx == activ then
 			hls[#hls + 1] = { ln, #text - #"✔", -1, "ClaudeTodoCheck" }
 		end
 	end
-	local _ = opt_first
 
 	add("")
-	for _, l in ipairs(wrap(RECO, textw)) do
-		add(" " .. l, "ClaudeSlashDesc")
+	for _, line in ipairs(wrap(RECO, textw)) do
+		add(" " .. line, "ClaudeSlashDesc")
 	end
 	add("")
 	-- Wrapped like BLURB/RECO above (not a single raw add()) — at panel widths under
 	-- ~125 columns this line doesn't fit unwrapped, and with `wrap` now false on the
 	-- window (see open()) an unwrapped overlong line would just be clipped instead
 	-- of soft-wrapping, hiding half the keybind hint.
-	for _, l in ipairs(wrap(" ↑/↓ to move · Enter to confirm · Esc to cancel", textw)) do
-		add(l, "ClaudeEffortHint")
+	for _, line in ipairs(wrap(" ↑/↓ to move · Enter to confirm · Esc to cancel", textw)) do
+		add(line, "ClaudeEffortHint")
 	end
 
 	vim.bo[modal.buf].modifiable = true
@@ -174,19 +172,32 @@ local function render()
 
 	local ns = modal.ns
 	vim.api.nvim_buf_clear_namespace(modal.buf, ns, 0, -1)
-	for _, h in ipairs(hls) do
-		-- h[3] == -1 means "highlight to end of line": omit end_col entirely and set
-		-- hl_eol (matching effort.lua). Do NOT write `end_col = cond and nil or h[3]`
+	for _, hl in ipairs(hls) do
+		-- hl[3] == -1 means "highlight to end of line": omit end_col entirely and set
+		-- hl_eol (matching effort.lua). Do NOT write `end_col = cond and nil or hl[3]`
 		-- — Lua's `x and nil or y` always yields y, so that leaks -1 into end_col.
-		local opts = { end_row = h[1] + 1, hl_group = h[4] }
-		if h[3] == -1 then
+		local opts = { end_row = hl[1] + 1, hl_group = hl[4] }
+		if hl[3] == -1 then
 			opts.hl_eol = true
 		else
-			opts.end_col = h[3]
+			opts.end_col = hl[3]
 		end
-		vim.api.nvim_buf_set_extmark(modal.buf, ns, h[1], h[2], opts)
+		vim.api.nvim_buf_set_extmark(modal.buf, ns, hl[1], hl[2], opts)
 	end
 	return #lines
+end
+
+-- Resume any queued question/permission card (see the wire-time doc above),
+-- pcall-guarded so a hook error can't take the picker's own close/confirm path
+-- down with it — just warn and move on. Shared by Advisor.close and confirm.
+local function resume_queue_safely()
+	if not try_resume_decision_queues then
+		return
+	end
+	local ok, err = pcall(try_resume_decision_queues)
+	if not ok then
+		vim.notify("advisor: failed to resume queued card: " .. tostring(err), vim.log.levels.WARN)
+	end
 end
 
 --- Close the picker without applying. Refocuses the panel window.
@@ -211,13 +222,8 @@ function Advisor.close(defer_resume)
 	if was_open and pet_attach_panel then
 		pet_attach_panel()
 	end
-	-- A question/permission card may be queued behind this picker (see the wire-time
-	-- doc above) — only worth trying if the picker was actually open.
-	if was_open and not defer_resume and try_resume_decision_queues then
-		local ok, err = pcall(try_resume_decision_queues)
-		if not ok then
-			vim.notify("advisor: failed to resume queued card: " .. tostring(err), vim.log.levels.WARN)
-		end
+	if was_open and not defer_resume then
+		resume_queue_safely()
 	end
 end
 
@@ -244,11 +250,8 @@ local function confirm()
 	if cb then
 		cb(id)
 	end
-	if was_open and try_resume_decision_queues then
-		local ok, err = pcall(try_resume_decision_queues)
-		if not ok then
-			vim.notify("advisor: failed to resume queued card: " .. tostring(err), vim.log.levels.WARN)
-		end
+	if was_open then
+		resume_queue_safely()
 	end
 end
 
@@ -318,28 +321,28 @@ function Advisor.open(on_confirm)
 		end,
 	})
 
-	local function map(lhs, fn)
-		vim.keymap.set("n", lhs, fn, { buffer = modal.buf, nowait = true, silent = true })
+	local function map(lhs, fn, desc)
+		vim.keymap.set("n", lhs, fn, { buffer = modal.buf, nowait = true, silent = true, desc = desc })
 	end
 	map("<Up>", function()
 		move(-1)
-	end)
+	end, "advisor: select previous")
 	map("<Down>", function()
 		move(1)
-	end)
+	end, "advisor: select next")
 	map("k", function()
 		move(-1)
-	end)
+	end, "advisor: select previous")
 	map("j", function()
 		move(1)
-	end)
-	map("<CR>", confirm)
-	map("<Esc>", Advisor.close)
-	map("q", Advisor.close)
+	end, "advisor: select next")
+	map("<CR>", confirm, "advisor: confirm selection")
+	map("<Esc>", Advisor.close, "advisor: cancel")
+	map("q", Advisor.close, "advisor: cancel")
 	-- No close-on-focus-loss: init's WinEnter focus-trap keeps the panel from
 	-- stealing focus (a click on the panel bounces back here); <Esc>/q dismiss.
 
-	local n = render()
+	local line_count = render()
 	if modal.win and vim.api.nvim_win_is_valid(modal.win) then
 		vim.api.nvim_win_set_config(modal.win, {
 			relative = "editor",
@@ -347,7 +350,7 @@ function Advisor.open(on_confirm)
 			row = widgets.float_bottom_row(),
 			col = col,
 			width = width,
-			height = math.max(n, 1), -- nvim rejects height = 0
+			height = math.max(line_count, 1), -- nvim rejects height = 0
 		})
 	end
 end
@@ -358,8 +361,8 @@ end
 --- matches a known id, or the literal "off" only for the unusual case where it
 --- holds a value absent from OPTIONS entirely (e.g. a future/unrecognized alias).
 function Advisor.current_label()
-	local i = active_index()
-	return i and OPTIONS[i].label or "off"
+	local idx = active_index()
+	return idx and OPTIONS[idx].label or "off"
 end
 
 return Advisor

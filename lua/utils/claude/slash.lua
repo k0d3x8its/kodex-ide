@@ -189,14 +189,14 @@ local disk_names_key = nil
 -- Trim a raw description to a single leading sentence. Not length-capped — the
 -- menu word-wraps it across indented rows (see render_menu), so the whole sentence
 -- stays readable rather than being cut with an ellipsis.
-local function first_sentence(d)
-	if not d or d == "" then
+local function first_sentence(desc)
+	if not desc or desc == "" then
 		return nil
 	end
-	d = vim.trim(d)
+	desc = vim.trim(desc)
 	-- First sentence = up to the first ./!/? followed by space or end.
-	local s = d:match("^(.-[%.%!%?])%s") or d:match("^(.-[%.%!%?])$") or d
-	return vim.trim(s)
+	local sentence = desc:match("^(.-[%.%!%?])%s") or desc:match("^(.-[%.%!%?])$") or desc
+	return vim.trim(sentence)
 end
 
 -- Parse a SKILL.md / command .md YAML frontmatter for its `name:` and
@@ -209,41 +209,47 @@ local function parse_frontmatter(path)
 		return nil, nil
 	end
 	local name, desc
-	local i = 2
-	while i <= #lines do
-		local ln = lines[i]
+	local idx = 2
+	while idx <= #lines do
+		local ln = lines[idx]
 		if ln == "---" then
 			break
 		end
-		local nm = ln:match("^name:%s*(.+)$")
-		if nm then
-			name = vim.trim(nm):gsub("^[\"']", ""):gsub("[\"']$", "")
+		local name_match = ln:match("^name:%s*(.+)$")
+		if name_match then
+			name = vim.trim(name_match):gsub("^[\"']", ""):gsub("[\"']$", "")
 		end
-		local dv = ln:match("^description:%s*(.*)$")
-		if dv then
-			dv = vim.trim(dv)
-			if dv == ">" or dv == "|" or dv == ">-" or dv == "|-" or dv == "" then
+		local desc_value = ln:match("^description:%s*(.*)$")
+		if desc_value then
+			desc_value = vim.trim(desc_value)
+			if
+				desc_value == ">"
+				or desc_value == "|"
+				or desc_value == ">-"
+				or desc_value == "|-"
+				or desc_value == ""
+			then
 				-- Block scalar: collect following indented (or blank) lines.
 				local body = {}
-				local j = i + 1
-				while j <= #lines do
-					local bl = lines[j]
-					if bl:match("^%s") or bl == "" then
-						local t = vim.trim(bl)
-						if t ~= "" then
-							body[#body + 1] = t
+				local body_idx = idx + 1
+				while body_idx <= #lines do
+					local body_line = lines[body_idx]
+					if body_line:match("^%s") or body_line == "" then
+						local trimmed = vim.trim(body_line)
+						if trimmed ~= "" then
+							body[#body + 1] = trimmed
 						end
-						j = j + 1
+						body_idx = body_idx + 1
 					else
 						break
 					end
 				end
-				dv = table.concat(body, " ")
-				i = j - 1
+				desc_value = table.concat(body, " ")
+				idx = body_idx - 1
 			end
-			desc = vim.trim(dv):gsub("^[\"']", ""):gsub("[\"']$", "")
+			desc = vim.trim(desc_value):gsub("^[\"']", ""):gsub("[\"']$", "")
 		end
-		i = i + 1
+		idx = idx + 1
 	end
 	return name, desc
 end
@@ -284,15 +290,15 @@ local MAX_SCAN_FILES = 500
 -- network-mounted tree and is worth bounding.
 local function glob_list(pats, skip_symlinks)
 	local out = {}
-	for _, p in ipairs(pats) do
-		for _, f in ipairs(vim.fn.glob(p, false, true)) do
+	for _, pattern in ipairs(pats) do
+		for _, file in ipairs(vim.fn.glob(pattern, false, true)) do
 			local keep = true
 			if skip_symlinks then
-				local dir = vim.fn.fnamemodify(f, ":h")
+				local dir = vim.fn.fnamemodify(file, ":h")
 				keep = vim.fn.getftype(dir) ~= "link"
 			end
 			if keep then
-				out[#out + 1] = f
+				out[#out + 1] = file
 				if #out >= MAX_SCAN_FILES then
 					return out
 				end
@@ -317,6 +323,19 @@ local function invalidate_scan()
 	scanned_home, scanned_project = nil, nil
 end
 
+-- The slash NAME a frontmatter file is invoked as: its own `.md` file stem, or
+-- (for a `SKILL.md`) its parent directory name instead. Shared by build_index()
+-- and disk_command_names() so a name always derives from a file path the exact
+-- same way in both places — the invariant disk_command_names' own comment
+-- depends on ("names and descriptions always come from the same files").
+local function command_name_from_path(path)
+	local base = vim.fn.fnamemodify(path, ":t:r")
+	if base == "SKILL" then
+		base = vim.fn.fnamemodify(path, ":h:t")
+	end
+	return base
+end
+
 -- Build the name→description index once. Indexes each file under BOTH its
 -- frontmatter `name:` and its directory/file basename, so a namespaced slash
 -- command ("plugin:skill") can resolve via the "skill" suffix (see resolve()).
@@ -333,30 +352,22 @@ local function build_index()
 	end
 	local home_files, project_files = scan_files()
 	for _, path in ipairs(home_files) do
-		local nm, desc = parse_frontmatter(path)
+		local name_match, desc = parse_frontmatter(path)
 		if desc then
-			local base = vim.fn.fnamemodify(path, ":t:r")
-			if base == "SKILL" then
-				base = vim.fn.fnamemodify(path, ":h:t")
-			end
-			add(nm, desc)
-			add(base, desc)
+			add(name_match, desc)
+			add(command_name_from_path(path), desc)
 		end
 	end
-	for k, v in pairs(BUILTIN_DESC) do
-		if not index[k] then
-			index[k] = v
+	for key, value in pairs(BUILTIN_DESC) do
+		if not index[key] then
+			index[key] = value
 		end
 	end
 	for _, path in ipairs(project_files) do
-		local nm, desc = parse_frontmatter(path)
+		local name_match, desc = parse_frontmatter(path)
 		if desc then
-			local base = vim.fn.fnamemodify(path, ":t:r")
-			if base == "SKILL" then
-				base = vim.fn.fnamemodify(path, ":h:t")
-			end
-			add(nm, desc)
-			add(base, desc)
+			add(name_match, desc)
+			add(command_name_from_path(path), desc)
 		end
 	end
 	return index
@@ -368,9 +379,9 @@ local function resolve(name)
 	if not desc_cache then
 		return nil
 	end
-	local d = desc_cache[name]
-	if d then
-		return d
+	local desc = desc_cache[name]
+	if desc then
+		return desc
 	end
 	local suffix = name:match(":(.+)$")
 	if suffix then
@@ -409,10 +420,7 @@ local function disk_command_names()
 	local names, seen, project_set = {}, {}, {}
 	local home_files, project_files = scan_files()
 	for _, path in ipairs(home_files) do
-		local base = vim.fn.fnamemodify(path, ":t:r") -- file stem
-		if base == "SKILL" then
-			base = vim.fn.fnamemodify(path, ":h:t")
-		end -- dir name
+		local base = command_name_from_path(path)
 		-- A directory/file basename is untrusted input (any byte but "/" and NUL on
 		-- Linux) — reject anything that isn't a well-formed command name rather than
 		-- letting a hostile basename (e.g. one containing a newline) reach the menu
@@ -423,10 +431,7 @@ local function disk_command_names()
 		end
 	end
 	for _, path in ipairs(project_files) do
-		local base = vim.fn.fnamemodify(path, ":t:r")
-		if base == "SKILL" then
-			base = vim.fn.fnamemodify(path, ":h:t")
-		end
+		local base = command_name_from_path(path)
 		if is_valid_name(base) and not seen[base] then
 			seen[base] = true
 			names[#names + 1] = base
@@ -487,28 +492,28 @@ end
 -- can't spill past the (nowrap) float's right edge. Shrinks by CHARACTER count but
 -- checks DISPLAY width each step — a char-count cut alone can leave double-width
 -- characters (CJK, emoji) still wider than `width` after "fitting".
-local function fit_width(s, width)
+local function fit_width(text, width)
 	if width < 2 then
 		return ""
 	end
-	if vim.fn.strdisplaywidth(s) <= width then
-		return s
+	if vim.fn.strdisplaywidth(text) <= width then
+		return text
 	end
-	local n = vim.fn.strchars(s)
-	while n > 0 and vim.fn.strdisplaywidth(vim.fn.strcharpart(s, 0, n)) > width - 1 do
-		n = n - 1
+	local char_count = vim.fn.strchars(text)
+	while char_count > 0 and vim.fn.strdisplaywidth(vim.fn.strcharpart(text, 0, char_count)) > width - 1 do
+		char_count = char_count - 1
 	end
-	return vim.fn.strcharpart(s, 0, n) .. "…"
+	return vim.fn.strcharpart(text, 0, char_count) .. "…"
 end
 
--- Greedy word-wrap `s` into a list of lines each <= `width` display cells. We wrap
+-- Greedy word-wrap `text` into a list of lines each <= `width` display cells. We wrap
 -- in Lua (rather than letting the window soft-wrap) so the float's height can stay
 -- equal to its buffer line count — the invariant the nowrap arrow fix depends on.
 -- A single word longer than `width` is clamped with an ellipsis (rare in a
 -- first-sentence description).
-local function wrap_text(s, width)
+local function wrap_text(text, width)
 	local out, cur = {}, ""
-	for word in s:gmatch("%S+") do
+	for word in text:gmatch("%S+") do
 		local cand = cur == "" and word or (cur .. " " .. word)
 		if vim.fn.strdisplaywidth(cand) <= width then
 			cur = cand
@@ -522,8 +527,8 @@ local function wrap_text(s, width)
 	if cur ~= "" then
 		out[#out + 1] = cur
 	end
-	for i, l in ipairs(out) do
-		out[i] = fit_width(l, width)
+	for idx, line in ipairs(out) do
+		out[idx] = fit_width(line, width)
 	end
 	return out
 end
@@ -619,8 +624,8 @@ Slash._all_commands = all_commands -- test hook (dedup / merge assertions)
 local function display_counts()
 	local counts = {}
 	for _, name in ipairs(all_commands()) do
-		local d = display_name(name)
-		counts[d] = (counts[d] or 0) + 1
+		local label = display_name(name)
+		counts[label] = (counts[label] or 0) + 1
 	end
 	return counts
 end
@@ -633,15 +638,19 @@ end
 -- exact text the menu just showed you ("/ce-code-review") still filters to it
 -- even though that text is a suffix, not a prefix, of the advertised name.
 local function filter_commands(query)
-	local q = (query or ""):lower()
+	local query_lower = (query or ""):lower()
 	local out = {}
 	for _, name in ipairs(all_commands()) do
-		if q == "" or name:lower():sub(1, #q) == q or display_name(name):lower():sub(1, #q) == q then
+		if
+			query_lower == ""
+			or name:lower():sub(1, #query_lower) == query_lower
+			or display_name(name):lower():sub(1, #query_lower) == query_lower
+		then
 			out[#out + 1] = name
 		end
 	end
-	table.sort(out, function(a, b)
-		return display_name(a):lower() < display_name(b):lower()
+	table.sort(out, function(name_a, name_b)
+		return display_name(name_a):lower() < display_name(name_b):lower()
 	end)
 	return out
 end
@@ -661,7 +670,7 @@ end
 --- entry named `name` exists — e.g. two different namespaced names both suffixing
 --- to "foo" with no bare "foo" anywhere. That's by design, not a gap: when a bare
 --- entry DOES exist (a real disk/local/advertised command literally named `name`),
---- matching it via `n == name` is always correct regardless of what any unrelated
+--- matching it via `entry == name` is always correct regardless of what any unrelated
 --- namespaced entry's suffix happens to collide with — the bare command is real
 --- either way. See S6c in claude_slash_spec.lua for the reachable ambiguous case.
 function Slash.is_command(name)
@@ -674,12 +683,12 @@ function Slash.is_command(name)
 	-- mid-line highlight scan).
 	local names = all_commands()
 	local counts = {}
-	for _, n in ipairs(names) do
-		local d = display_name(n)
-		counts[d] = (counts[d] or 0) + 1
+	for _, entry in ipairs(names) do
+		local label = display_name(entry)
+		counts[label] = (counts[label] or 0) + 1
 	end
-	for _, n in ipairs(names) do
-		if n == name or (n:match("([^:]+)$") == name and counts[name] == 1) then
+	for _, entry in ipairs(names) do
+		if entry == name or (entry:match("([^:]+)$") == name and counts[name] == 1) then
 			return true
 		end
 	end
@@ -695,9 +704,12 @@ function Slash.has_prefix(query)
 	if not query or query == "" then
 		return true
 	end
-	local q = query:lower()
+	local query_lower = query:lower()
 	for _, name in ipairs(all_commands()) do
-		if name:lower():sub(1, #q) == q or display_name(name):lower():sub(1, #q) == q then
+		if
+			name:lower():sub(1, #query_lower) == query_lower
+			or display_name(name):lower():sub(1, #query_lower) == query_lower
+		then
 			return true
 		end
 	end
@@ -717,7 +729,7 @@ local function render_menu()
 	if not (menu.buf and vim.api.nvim_buf_is_valid(menu.buf)) then
 		return
 	end
-	local n = #menu.items
+	local item_count = #menu.items
 
 	local width = 40
 	if menu.win and vim.api.nvim_win_is_valid(menu.win) then
@@ -732,16 +744,16 @@ local function render_menu()
 	-- means the query genuinely matched nothing — there is no longer a distinct
 	-- "commands not loaded yet" state to diagnose (the pre-first-message case that
 	-- text used to describe no longer produces an empty menu).
-	if n == 0 then
+	if item_count == 0 then
 		local msg = " no matching commands"
 		vim.bo[menu.buf].modifiable = true
 		vim.api.nvim_buf_set_lines(menu.buf, 0, -1, false, { msg })
 		vim.bo[menu.buf].modifiable = false
 		if menu.win and vim.api.nvim_win_is_valid(menu.win) then
-			local c = vim.api.nvim_win_get_config(menu.win)
-			if c.height ~= 1 then
-				c.height = 1
-				vim.api.nvim_win_set_config(menu.win, c)
+			local win_config = vim.api.nvim_win_get_config(menu.win)
+			if win_config.height ~= 1 then
+				win_config.height = 1
+				vim.api.nvim_win_set_config(menu.win, win_config)
 			end
 		end
 		vim.api.nvim_buf_clear_namespace(menu.buf, menu.ns, 0, -1)
@@ -762,8 +774,8 @@ local function render_menu()
 	--    `.claude/` (not home/plugin dirs) gets a "(project)" tag — nothing else
 	--    in the row distinguishes "a skill you installed" from "a skill this
 	--    cloned repo shipped", and the two should not look identical.
-	local function build(i)
-		local name = menu.items[i]
+	local function build(idx)
+		local name = menu.items[idx]
 		local shown = display_name(name)
 		if label_counts[shown] and label_counts[shown] > 1 then
 			shown = name -- ambiguous short label: fall back to the full name
@@ -773,12 +785,12 @@ local function render_menu()
 			label = label .. " (project)"
 		end
 		local desc = resolve(name) or ""
-		local blk = { name_line = " " .. label, name_end = 1 + #label, desc_lines = {} }
-		for _, l in ipairs(desc ~= "" and wrap_text(desc, dwidth) or {}) do
-			blk.desc_lines[#blk.desc_lines + 1] = indent .. l
+		local block = { name_line = " " .. label, name_end = 1 + #label, desc_lines = {} }
+		for _, desc_line in ipairs(desc ~= "" and wrap_text(desc, dwidth) or {}) do
+			block.desc_lines[#block.desc_lines + 1] = indent .. desc_line
 		end
-		blk.height = 1 + #blk.desc_lines
-		return blk
+		block.height = 1 + #block.desc_lines
+		return block
 	end
 
 	-- Row-budget viewport: accumulate item heights from menu.top (a blank separator
@@ -792,16 +804,16 @@ local function render_menu()
 		menu.top = 1
 	end
 	local function window()
-		local blks, last, used = {}, menu.top - 1, 0
-		for i = menu.top, n do
-			local b = build(i)
-			local h = b.height + (i > menu.top and 1 or 0) -- +1 for the separator line
-			if used + h > MAX_ROWS and i > menu.top then
+		local blocks_by_idx, last, used = {}, menu.top - 1, 0
+		for idx = menu.top, item_count do
+			local block = build(idx)
+			local height = block.height + (idx > menu.top and 1 or 0) -- +1 for the separator line
+			if used + height > MAX_ROWS and idx > menu.top then
 				break
 			end
-			used, last, blks[i] = used + h, i, b
+			used, last, blocks_by_idx[idx] = used + height, idx, block
 		end
-		return blks, last
+		return blocks_by_idx, last
 	end
 	local blocks, last = window()
 	while menu.sel > last do
@@ -812,23 +824,23 @@ local function render_menu()
 	-- Flatten the visible blocks into buffer lines, recording each item's absolute
 	-- line span for the highlight pass.
 	local lines, rows = {}, {}
-	for i = menu.top, last do
-		local b = blocks[i]
-		if i > menu.top then
+	for idx = menu.top, last do
+		local block = blocks[idx]
+		if idx > menu.top then
 			lines[#lines + 1] = ""
 		end -- blank separator between items
 		local name_lnum = #lines
-		lines[#lines + 1] = b.name_line
+		lines[#lines + 1] = block.name_line
 		local desc_lnums = {}
-		for _, dl in ipairs(b.desc_lines) do
+		for _, desc_line in ipairs(block.desc_lines) do
 			desc_lnums[#desc_lnums + 1] = #lines
-			lines[#lines + 1] = dl
+			lines[#lines + 1] = desc_line
 		end
 		rows[#rows + 1] = {
 			name_lnum = name_lnum,
-			name_end = b.name_end,
+			name_end = block.name_end,
 			desc_lnums = desc_lnums,
-			sel = (i == menu.sel),
+			sel = (idx == menu.sel),
 		}
 	end
 
@@ -839,19 +851,19 @@ local function render_menu()
 	-- Resize the float to the line count. Nowrap ⇒ line count == screen rows, so
 	-- every visible item stays on-screen and the highlight can't scroll off.
 	if menu.win and vim.api.nvim_win_is_valid(menu.win) then
-		local c = vim.api.nvim_win_get_config(menu.win)
-		if c.height ~= #lines then
-			c.height = math.max(#lines, 1)
-			vim.api.nvim_win_set_config(menu.win, c)
+		local win_config = vim.api.nvim_win_get_config(menu.win)
+		if win_config.height ~= #lines then
+			win_config.height = math.max(#lines, 1)
+			vim.api.nvim_win_set_config(menu.win, win_config)
 		end
 	end
 
 	-- Highlights: the selected item bands its name + every desc row; unselected
 	-- items colour the name span and dim their desc rows.
 	vim.api.nvim_buf_clear_namespace(menu.buf, menu.ns, 0, -1)
-	local function band(lnum)
-		vim.api.nvim_buf_set_extmark(menu.buf, menu.ns, lnum, 0, {
-			end_row = lnum + 1,
+	local function band(row)
+		vim.api.nvim_buf_set_extmark(menu.buf, menu.ns, row, 0, {
+			end_row = row + 1,
 			hl_group = "ClaudeSlashSel",
 			hl_eol = true,
 		})
@@ -861,8 +873,8 @@ local function render_menu()
 			-- Selected: a full-width band with dark text. Don't layer name/desc fg
 			-- colours on top — they'd render clay-on-clay (invisible).
 			band(meta.name_lnum)
-			for _, dl in ipairs(meta.desc_lnums) do
-				band(dl)
+			for _, desc_lnum in ipairs(meta.desc_lnums) do
+				band(desc_lnum)
 			end
 		else
 			-- Command name (cols 1..name_end, after the 1-space left gutter).
@@ -870,9 +882,9 @@ local function render_menu()
 				end_col = meta.name_end,
 				hl_group = "ClaudeSlashName",
 			})
-			for _, dl in ipairs(meta.desc_lnums) do
-				vim.api.nvim_buf_set_extmark(menu.buf, menu.ns, dl, 0, {
-					end_row = dl + 1,
+			for _, desc_lnum in ipairs(meta.desc_lnums) do
+				vim.api.nvim_buf_set_extmark(menu.buf, menu.ns, desc_lnum, 0, {
+					end_row = desc_lnum + 1,
 					hl_group = "ClaudeSlashDesc",
 				})
 			end
@@ -1021,7 +1033,12 @@ function Slash.open(ibuf, query, bar_rows, on_accept)
 		-- The menu owns <CR> on the chat buffer only while open: pick the highlighted
 		-- command instead of submitting. Removed in Slash.close() so the prompt
 		-- buffer's normal submit returns.
-		vim.keymap.set("i", "<CR>", accept_selected, { buffer = ibuf, nowait = true, silent = true })
+		vim.keymap.set(
+			"i",
+			"<CR>",
+			accept_selected,
+			{ buffer = ibuf, nowait = true, silent = true, desc = "slash: accept highlighted command" }
+		)
 	else
 		-- Already open: re-place (bar height may have changed). Also re-target ibuf/
 		-- on_accept and, if the prompt buffer itself changed (chat bar rebuilt while
@@ -1033,14 +1050,19 @@ function Slash.open(ibuf, query, bar_rows, on_accept)
 				pcall(vim.keymap.del, "i", "<CR>", { buffer = menu.ibuf })
 			end
 			if ibuf and vim.api.nvim_buf_is_valid(ibuf) then
-				vim.keymap.set("i", "<CR>", accept_selected, { buffer = ibuf, nowait = true, silent = true })
+				vim.keymap.set(
+					"i",
+					"<CR>",
+					accept_selected,
+					{ buffer = ibuf, nowait = true, silent = true, desc = "slash: accept highlighted command" }
+				)
 			end
 			menu.ibuf = ibuf
 		end
 		menu.on_accept = on_accept
-		local c = vim.api.nvim_win_get_config(menu.win)
-		c.row, c.col, c.width = row, col, width
-		vim.api.nvim_win_set_config(menu.win, c)
+		local win_config = vim.api.nvim_win_get_config(menu.win)
+		win_config.row, win_config.col, win_config.width = row, col, width
+		vim.api.nvim_win_set_config(menu.win, win_config)
 	end
 	render_menu()
 end

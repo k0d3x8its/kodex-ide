@@ -1206,4 +1206,69 @@ H.check("T30 logged the stale-skip", has_log("^new%-pending%-stale%-skip:"))
 
 claude.state.panel_buf = nil
 
+-- ─── T31: reveal_created's :edit throw must not stall the diff-processing queue
+--
+-- Batch 6 wave 2 (code-crit, reliability persona) High finding: reveal_created()
+-- cleared state.reveal_new BEFORE an unguarded vim.cmd("edit ...") — a throw
+-- (swapfile prompt, permission error) propagated out of poll(), so the trailing
+-- vim.schedule(M.process_next) never ran and the queue silently stalled until an
+-- unrelated tool_result happened to call poll() again. Fixed by pcall'ing the
+-- :edit and logging/notifying on failure instead of letting it escape. This
+-- drives the REAL poll() (not reveal_created() in isolation) to prove the
+-- decoupling: a queued SECOND diff must still open even though reveal_created's
+-- own :edit call throws.
+local t31_reveal = ws .. "/t31-reveal-throws.txt"
+vim.fn.writefile({ "reveal content" }, t31_reveal)
+local t31_queued = ws .. "/t31-queued-next.txt"
+vim.fn.writefile({ "queued content" }, t31_queued)
+vim.fn.bufload(vim.fn.bufadd(t31_queued)) -- open_diff requires an already-loaded buffer
+
+D2.state.current = nil
+D2.state.reveal_new = t31_reveal
+claude.state.diff_queue = {}
+D2.push(t31_queued)
+
+local t31_notified = nil
+local orig_notify = vim.notify
+vim.notify = function(msg, level)
+	t31_notified = { msg = msg, level = level }
+end
+local orig_cmd = vim.cmd
+vim.cmd = function(command)
+	if
+		type(command) == "string"
+		and command:match("^edit ")
+		and command:find(vim.fn.fnameescape(t31_reveal), 1, true)
+	then
+		error("T31 simulated :edit failure (E325-style)")
+	end
+	return orig_cmd(command)
+end
+
+D2.poll()
+vim.wait(300, function()
+	return D2.state.current ~= nil
+end)
+
+vim.cmd = orig_cmd
+vim.notify = orig_notify
+
+H.check("T31 reveal_new cleared despite the throw", D2.state.reveal_new == nil)
+H.check("T31 logged reveal-new-FAILED", has_log("^reveal%-new%-FAILED:" .. vim.pesc(t31_reveal)))
+H.check(
+	"T31 user notified of the failed reveal",
+	t31_notified ~= nil
+		and t31_notified.level == vim.log.levels.ERROR
+		and t31_notified.msg:find(t31_reveal, 1, true) ~= nil,
+	vim.inspect(t31_notified)
+)
+H.check(
+	"T31 queue NOT stalled — process_next still opened the next diff",
+	D2.state.current == t31_queued,
+	"current=" .. tostring(D2.state.current)
+)
+
+D2.reject_all()
+claude.state.panel_buf = nil
+
 H.summary("claude_diff")

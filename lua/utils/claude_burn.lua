@@ -93,11 +93,11 @@ end
 --- covers lualine's built-in components) — an unescaped `%{...}` here would be
 --- interpreted as statusline syntax on every redraw.
 function M.model()
-	local d = read_state()
-	if type(d) ~= "table" or type(d.model) ~= "table" or type(d.model.display_name) ~= "string" then
+	local decoded = read_state()
+	if type(decoded) ~= "table" or type(decoded.model) ~= "table" or type(decoded.model.display_name) ~= "string" then
 		return ""
 	end
-	return (d.model.display_name:gsub("%%", "%%%%"))
+	return (decoded.model.display_name:gsub("%%", "%%%%"))
 end
 
 -- Number of block segments in a meter bar.
@@ -134,16 +134,16 @@ local function countdown(resets_at)
 	if secs <= 0 then
 		return "now"
 	end
-	local d = math.floor(secs / 86400)
-	local h = math.floor((secs % 86400) / 3600)
-	local m = math.floor((secs % 3600) / 60)
-	if d > 0 then
-		return string.format("%dd%dh", d, h)
+	local days = math.floor(secs / 86400)
+	local hours = math.floor((secs % 86400) / 3600)
+	local mins = math.floor((secs % 3600) / 60)
+	if days > 0 then
+		return string.format("%dd%dh", days, hours)
 	end
-	if h > 0 then
-		return string.format("%dh%dm", h, m)
+	if hours > 0 then
+		return string.format("%dh%dm", hours, mins)
 	end
-	return string.format("%dm", m)
+	return string.format("%dm", mins)
 end
 
 -- Severity highlight suffix by fill: green under 60%, amber 60–85, red above.
@@ -231,7 +231,7 @@ local function add_meter(out, glyph, label, pct, resets_at, show_bar, stale, liv
 end
 
 -- Build the three meters at a given detail level (bars? countdowns?).
-local function build(rl, cw, show_bar, show_reset)
+local function build(rate_limits, context_window, show_bar, show_reset)
 	local out = {}
 	local function gap()
 		if #out > 0 then
@@ -240,51 +240,51 @@ local function build(rl, cw, show_bar, show_reset)
 	end
 	-- Use type()==table, not truthiness: a JSON null sub-object decodes to vim.NIL
 	-- (userdata, truthy) and indexing it (.used_percentage) would raise.
-	if type(rl.five_hour) == "table" then
+	if type(rate_limits.five_hour) == "table" then
 		add_meter(
 			out,
 			GLYPH.five,
 			"5h",
-			rl.five_hour.used_percentage,
-			show_reset and rl.five_hour.resets_at or nil,
+			rate_limits.five_hour.used_percentage,
+			show_reset and rate_limits.five_hour.resets_at or nil,
 			show_bar,
-			is_stale(rl.five_hour.resets_at),
+			is_stale(rate_limits.five_hour.resets_at),
 			live.five_hour,
 			show_reset
 		)
 	end
 	-- Also gate on used_percentage being a real number here, not just
-	-- rl.seven_day being a table — otherwise gap() fires and add_meter()
+	-- rate_limits.seven_day being a table — otherwise gap() fires and add_meter()
 	-- immediately no-ops on its own pct guard, leaving an orphan separator
 	-- that inflates chunks_width with no visible content behind it.
-	if type(rl.seven_day) == "table" and type(rl.seven_day.used_percentage) == "number" then
+	if type(rate_limits.seven_day) == "table" and type(rate_limits.seven_day.used_percentage) == "number" then
 		gap()
 		add_meter(
 			out,
 			GLYPH.seven,
 			"7d",
-			rl.seven_day.used_percentage,
-			show_reset and rl.seven_day.resets_at or nil,
+			rate_limits.seven_day.used_percentage,
+			show_reset and rate_limits.seven_day.resets_at or nil,
 			show_bar,
-			is_stale(rl.seven_day.resets_at),
+			is_stale(rate_limits.seven_day.resets_at),
 			live.seven_day,
 			show_reset
 		)
 	end
 	-- Context is always %-only (a hint, least critical) so it survives truncation.
-	if type(cw.used_percentage) == "number" then
+	if type(context_window.used_percentage) == "number" then
 		gap()
-		add_meter(out, GLYPH.ctx, "ctx", cw.used_percentage, nil, false)
+		add_meter(out, GLYPH.ctx, "ctx", context_window.used_percentage, nil, false)
 	end
 	return out
 end
 
 local function chunks_width(chunks)
-	local w = 0
-	for _, t in ipairs(chunks) do
-		w = w + vim.fn.strdisplaywidth(t[1])
+	local width = 0
+	for _, chunk in ipairs(chunks) do
+		width = width + vim.fn.strdisplaywidth(chunk[1])
 	end
-	return w
+	return width
 end
 
 --- Footer chunks for the chat bar, fitted to `maxwidth` (the float's inner width).
@@ -294,19 +294,19 @@ end
 --- Note: the context % comes from whichever interactive CC session last wrote the
 --- state file, not the panel's own subprocess — see the header.
 function M.chunks(maxwidth)
-	local d = read_state()
-	if not d then
+	local decoded = read_state()
+	if not decoded then
 		return nil
 	end
 	-- Same vim.NIL trap as the per-field checks below: a JSON null decodes to
 	-- truthy userdata, so `or {}` alone wouldn't fire.
-	local rl = (type(d.rate_limits) == "table") and d.rate_limits or {}
-	local cw = (type(d.context_window) == "table") and d.context_window or {}
+	local rate_limits = (type(decoded.rate_limits) == "table") and decoded.rate_limits or {}
+	local context_window = (type(decoded.context_window) == "table") and decoded.context_window or {}
 	maxwidth = maxwidth or 999
 
 	-- richest → leanest
 	for _, lvl in ipairs({ { true, true }, { true, false }, { false, false } }) do
-		local out = build(rl, cw, lvl[1], lvl[2])
+		local out = build(rate_limits, context_window, lvl[1], lvl[2])
 		if #out == 0 then
 			return nil
 		end
@@ -315,7 +315,7 @@ function M.chunks(maxwidth)
 		end
 	end
 	-- Even the leanest overflows a tiny panel; return it (footer truncates ctx last).
-	local out = build(rl, cw, false, false)
+	local out = build(rate_limits, context_window, false, false)
 	return (#out > 0) and out or nil
 end
 

@@ -73,7 +73,7 @@ return {
 		-- no-ops via implicit search) — pass the path explicitly instead of
 		-- relying on their config discovery. Project-local configs should be
 		-- passed the same way if a project needs to override these.
-		vim.g.ale_solidity_solhint_options = "--config " .. vim.fn.expand("~/.solhint.json")
-		vim.g.ale_html_htmllint_options = "--rc " .. vim.fn.expand("~/.htmllintrc")
+		vim.g.ale_solidity_solhint_options = "--config " .. vim.fn.shellescape(vim.fn.expand("~/.solhint.json"))
+		vim.g.ale_html_htmllint_options = "--rc " .. vim.fn.shellescape(vim.fn.expand("~/.htmllintrc"))
 	end,
 }

@@ -19,12 +19,14 @@ local M = {}
 --- @param gap        integer    minimum blank cells kept between a label and its shortcut
 --- @return integer
 function M.button_width(labels, shortcut_w, gap)
-  local max_label = 0
-  for _, l in ipairs(labels) do
-    local w = vim.fn.strdisplaywidth(l)
-    if w > max_label then max_label = w end
-  end
-  return max_label + gap + shortcut_w
+	local max_label = 0
+	for _, l in ipairs(labels) do
+		local w = vim.fn.strdisplaywidth(l)
+		if w > max_label then
+			max_label = w
+		end
+	end
+	return max_label + gap + shortcut_w
 end
 
 --- Left-truncate `s` to at most `max` display cells, prepending an ellipsis when
@@ -35,19 +37,25 @@ end
 --- @param max integer  display-cell budget
 --- @return string
 function M.truncate_left(s, max)
-  if max <= 0 then return "" end
-  if vim.fn.strdisplaywidth(s) <= max then return s end
-  local ell = "…" -- 1 display cell
-  local budget = max - 1 -- reserve the ellipsis cell
-  local chars = vim.fn.split(s, "\\zs") -- per-character, multibyte-safe
-  local tail, w = {}, 0
-  for i = #chars, 1, -1 do
-    local cw = vim.fn.strdisplaywidth(chars[i])
-    if w + cw > budget then break end
-    table.insert(tail, 1, chars[i])
-    w = w + cw
-  end
-  return ell .. table.concat(tail)
+	if max <= 0 then
+		return ""
+	end
+	if vim.fn.strdisplaywidth(s) <= max then
+		return s
+	end
+	local ell = "…" -- 1 display cell
+	local budget = max - 1 -- reserve the ellipsis cell
+	local chars = vim.fn.split(s, "\\zs") -- per-character, multibyte-safe
+	local tail, w = {}, 0
+	for i = #chars, 1, -1 do
+		local cw = vim.fn.strdisplaywidth(chars[i])
+		if w + cw > budget then
+			break
+		end
+		table.insert(tail, 1, chars[i])
+		w = w + cw
+	end
+	return ell .. table.concat(tail)
 end
 
 return M

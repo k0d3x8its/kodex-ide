@@ -14,23 +14,23 @@
 -- opts/config, so we only add init here to avoid overriding its setup.
 
 return {
-  "nvim-tree/nvim-tree.lua",
+	"nvim-tree/nvim-tree.lua",
 
-  init = function()
-    -- ONE VimEnter, once=true — fires for KODEX_IDE (OpenCode dock) or
-    -- KODEX_CLAUDE (Claude dock). The project picker handles which panel to open
-    -- based on the env var (branched in project_picker.lua open_workspace).
-    -- 100 ms defer: lets alpha + auto-session finish rendering before the picker
-    -- overlay appears (matches the original defer in opencode.lua).
-    vim.api.nvim_create_autocmd("VimEnter", {
-      once     = true,
-      callback = function()
-        if vim.env.KODEX_IDE == "1" or vim.env.KODEX_CLAUDE == "1" then
-          vim.defer_fn(function()
-            require("utils.project_picker").pick()
-          end, 100)
-        end
-      end,
-    })
-  end,
+	init = function()
+		-- ONE VimEnter, once=true — fires for KODEX_IDE (OpenCode dock) or
+		-- KODEX_CLAUDE (Claude dock). The project picker handles which panel to open
+		-- based on the env var (branched in project_picker.lua open_workspace).
+		-- 100 ms defer: lets alpha + auto-session finish rendering before the picker
+		-- overlay appears (matches the original defer in opencode.lua).
+		vim.api.nvim_create_autocmd("VimEnter", {
+			once = true,
+			callback = function()
+				if vim.env.KODEX_IDE == "1" or vim.env.KODEX_CLAUDE == "1" then
+					vim.defer_fn(function()
+						require("utils.project_picker").pick()
+					end, 100)
+				end
+			end,
+		})
+	end,
 }

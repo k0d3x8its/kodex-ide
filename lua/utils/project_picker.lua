@@ -37,6 +37,14 @@ end
 -- KODEX_CLAUDE launch-env branch (Goal 11 redesign 2026-06-28).
 local chosen_panel = "opencode"
 
+-- Resolves the vim.ui.select panel-choice callback's `selection` arg into a
+-- chosen_panel value. Dismiss (Esc) passes nil here, same as any selection
+-- other than "Claude Code" — both fall through to "opencode", the historical
+-- dock default (least surprising for anyone who just hits Enter/Esc).
+local function resolve_chosen_panel(selection)
+	return (selection == "Claude Code") and "claude" or "opencode"
+end
+
 -- Open the AI panel the user chose, seeded with the project root.
 -- Single routing point for both open_workspace sites (resumed + fresh-file).
 local function open_panel(proj)
@@ -117,6 +125,22 @@ local function open_workspace(proj)
 	tree_api.tree.change_root(proj)
 end
 
+-- Ask which AI panel to open — AFTER the repo + session decisions, BEFORE the
+-- panel launches. The choice is stored in chosen_panel, read at both
+-- open_workspace sites. Then defer 200 ms so any restore_session() source()
+-- call finishes opening buffers before open_workspace inspects the window
+-- layout.
+local function finish(proj)
+	vim.ui.select({ "OpenCode", "Claude Code" }, {
+		prompt = "Open which AI panel?",
+	}, function(panel)
+		chosen_panel = resolve_chosen_panel(panel)
+		vim.defer_fn(function()
+			open_workspace(proj)
+		end, 200)
+	end)
+end
+
 function mod.pick()
 	-- auto-session public API: restore_session(name) and get_root_dir()
 	local AutoSession = require("auto-session")
@@ -151,24 +175,6 @@ function mod.pick()
 		-- nil means the user dismissed the picker — do nothing.
 		if not choice then
 			return
-		end
-
-		-- Shared tail. Ask which AI panel to open — AFTER the repo + session
-		-- decisions, BEFORE the panel launches (Goal 11 redesign 2026-06-28). The
-		-- choice is stored in chosen_panel, read at both open_workspace sites.
-		-- Then defer 200 ms so any restore_session() source() call finishes opening
-		-- buffers before open_workspace inspects the window layout.
-		local function finish(proj)
-			vim.ui.select({ "OpenCode", "Claude Code" }, {
-				prompt = "Open which AI panel?",
-			}, function(panel)
-				-- Dismiss (Esc) defaults to OpenCode — the historical dock default,
-				-- least surprising for anyone who just hits Enter/Esc through the flow.
-				chosen_panel = (panel == "Claude Code") and "claude" or "opencode"
-				vim.defer_fn(function()
-					open_workspace(proj)
-				end, 200)
-			end)
 		end
 
 		if choice == RESUME then
@@ -220,6 +226,17 @@ function mod.pick()
 			finish(choice)
 		end)
 	end)
+end
+
+-- Test-only hooks: the panel-choice routing (chosen_panel, open_panel,
+-- finish) is the core branch point this module adds, but all three were
+-- module-local with no seam to drive from a spec. Exposed narrowly rather
+-- than restructuring pick() itself.
+mod._open_panel = open_panel
+mod._resolve_chosen_panel = resolve_chosen_panel
+mod._finish = finish
+mod._set_chosen_panel = function(value)
+	chosen_panel = value
 end
 
 return mod

@@ -14,7 +14,18 @@ return {
 					-- get_config's return is deep-merged into the `select` config
 					-- table (see dressing/config.lua), so the telescope theme must
 					-- nest under `telescope`, not be returned at the top level.
-					return { telescope = themes.get_dropdown({ width = 0.4, height = 0.35 }) }
+					-- Within that theme table, width/height must ALSO nest under
+					-- layout_config -- get_dropdown() itself deep-merges its opts
+					-- arg at the TOP level (siblings of layout_config), and the
+					-- "center" layout strategy only ever reads layout_config.width/
+					-- layout_config.height. A top-level width/height is accepted
+					-- but silently ignored -- the dropdown stays at get_dropdown's
+					-- own default size (min(max_columns,80) / min(max_lines,15)).
+					return {
+						telescope = themes.get_dropdown({
+							layout_config = { width = 0.4, height = 0.35 },
+						}),
+					}
 				end
 			end,
 		},

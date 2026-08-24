@@ -35,6 +35,12 @@ return {
 			swift = true,
 		}
 
+		-- Created once, outside on_attach — on_attach fires per buffer, and
+		-- clear=true inside it would wipe every earlier buffer's format-on-save
+		-- autocmd each time a new buffer attaches, leaving only the
+		-- last-attached buffer formatting on save.
+		local format_augroup = vim.api.nvim_create_augroup("LspFormatting", { clear = true })
+
 		-- on_attach function for keymaps and formatting
 		local on_attach = function(client, bufnr)
 			local nmap = function(keys, fn, desc)
@@ -57,7 +63,7 @@ return {
 				and client.server_capabilities.documentFormattingProvider
 			then
 				vim.api.nvim_create_autocmd("BufWritePre", {
-					group = vim.api.nvim_create_augroup("LspFormatting", { clear = true }),
+					group = format_augroup,
 					buffer = bufnr,
 					callback = function()
 						vim.lsp.buf.format({ bufnr = bufnr })
@@ -97,7 +103,6 @@ return {
 			"arduino_language_server",
 			"bashls",
 			"jsonls",
-			"sourcekit_lsp",
 		}
 
 		for _, server in ipairs(servers) do
@@ -161,23 +166,39 @@ return {
 		vim.lsp.enable("yamlls")
 
 		-- HTML language server, extended with htmx's hx-* attributes via
-		-- customData — no dedicated htmx LSP exists; this is the standard
-		-- approach (same mechanism the official vscode-htmx extension uses).
+		-- custom data. vscode-html-language-server reads custom data paths
+		-- from `initializationOptions.dataPaths`, not `settings.html.customData`
+		-- (that settings key only exists client-side, in VS Code's own
+		-- extension, which translates it into initializationOptions before
+		-- ever talking to the server) — sending it as `settings` is a silent
+		-- no-op over LSP.
 		vim.lsp.config("html", {
 			capabilities = capabilities,
 			on_attach = on_attach,
-			settings = {
-				html = {
-					customData = {
-						vim.fs.joinpath(vim.fn.stdpath("config"), "lua/data/htmx-custom-data.json"),
-					},
+			init_options = {
+				dataPaths = {
+					vim.fs.joinpath(vim.fn.stdpath("config"), "lua/data/htmx-custom-data.json"),
 				},
 			},
 		})
 		vim.lsp.enable("html")
 
-		-- sourcekit_lsp ships bundled with the Swift toolchain, not via Mason —
+		-- sourcekit-lsp ships bundled with the Swift toolchain, not via Mason —
 		-- installing the toolchain (swift.org or Xcode) is a host-level
 		-- prerequisite, not something this config can provision.
+		--
+		-- Scoped to `swift` only: the bundled config (nvim-lspconfig's
+		-- lsp/sourcekit.lua) defaults filetypes to
+		-- { swift, objc, objcpp, c, cpp } — same C/C++/objc filetypes clangd
+		-- above already owns. Left at the default, both servers would attach
+		-- to every C/C++ buffer, double-registering `on_attach`'s
+		-- BufWritePre formatter (double-format on save, since neither `c`
+		-- nor `cpp` is in lsp_format_blocklist).
+		vim.lsp.config("sourcekit", {
+			capabilities = capabilities,
+			on_attach = on_attach,
+			filetypes = { "swift" },
+		})
+		vim.lsp.enable("sourcekit")
 	end,
 }

@@ -1,5 +1,6 @@
 -- lua/plugins/dock.lua
--- Single VimEnter hook for all dock-launch flows (FINDINGS.md § A2).
+-- Single VimEnter hook for all dock-launch flows
+-- (.work/archive/legacy-findings.md § A2).
 --
 -- Why a dedicated file?
 --   Both opencode.lua and claude.lua plugin specs needed VimEnter to trigger the

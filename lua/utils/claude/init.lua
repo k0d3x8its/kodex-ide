@@ -3085,6 +3085,28 @@ local function open_panel_window(buf)
 	return win
 end
 
+--- Close the panel window and wipe its scratch buffer atomically, without
+-- touching any other session state. Used by auto-session's pre_save_cmds
+-- (VimLeavePre, quitting) so the panel's window-local options never reach
+-- the written session file. Returns true/false so a caller can surface
+-- failure instead of it disappearing into a swallowed pcall.
+function mod.close_panel()
+	local ok, err = pcall(function()
+		if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
+			vim.api.nvim_win_close(state.panel_win, true)
+		end
+		if state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf) then
+			vim.api.nvim_buf_delete(state.panel_buf, { force = true })
+		end
+		state.panel_win = nil
+		state.panel_buf = nil
+	end)
+	if not ok then
+		vim.notify("claude panel close failed: " .. tostring(err), vim.log.levels.WARN)
+	end
+	return ok
+end
+
 -- ─── Toggle / open / reset (Goals 6.8, 6.6) ──────────────────────────────────
 
 --- Toggle the panel open or closed (`<leader>cc`).

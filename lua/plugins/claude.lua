@@ -3,16 +3,16 @@
 --
 -- Anchor: stevearc/dressing.nvim (claude panel uses vim.ui.input, which
 -- dressing.nvim styles — a genuine dependency). lazy.nvim merges specs for
--- the same plugin; dressing.lua uses `opts = {}` (auto-generated config), so
--- we MUST NOT add a `config` key here — it would shadow dressing's setup().
--- All initialisation goes in `init` instead.
+-- the same plugin; dressing.lua uses `opts` (auto-generated config, no
+-- `config` key), so we MUST NOT add a `config` key here either — it would
+-- shadow dressing's setup(). All initialisation goes in `init` instead.
 --
 -- No VimEnter hook here — dock.lua owns the single VimEnter for both launchers
--- (FINDINGS.md § A2). Adding a second VimEnter on the same plugin would fire
--- the project picker twice.
+-- (.work/archive/legacy-findings.md § A2). Adding a second VimEnter on the
+-- same plugin would fire the project picker twice.
 --
 -- No toggleterm dependency — the Claude panel is a jobstart scratch buffer,
--- not a TUI in toggleterm (FINDINGS.md § D1 / neo-claude.md §6).
+-- not a TUI in toggleterm (.work/archive/legacy-findings.md § "Input Bar").
 
 return {
 	"stevearc/dressing.nvim",
@@ -27,7 +27,7 @@ return {
 		-- plugin spec that owns the UX — and not in the engine module that is
 		-- reusable across projects.
 		--
-		-- Palette source: kos-capture/screens/ingest.py + neo-claude.md §6 D7.
+		-- Palette source: kos-capture/screens/ingest.py.
 		-- Over Dracula base; groups must survive colorscheme reloads (see autocmd).
 
 		local function define_highlights()
@@ -301,10 +301,13 @@ return {
 		vim.api.nvim_create_autocmd("ColorScheme", {
 			group = vim.api.nvim_create_augroup("ClaudeHighlights", { clear = true }),
 			callback = function()
-				define_highlights()
-				pcall(function()
+				local ok, err = pcall(function()
+					define_highlights()
 					require("utils.claude.render").reset_hunk_fg_cache()
 				end)
+				if not ok then
+					vim.notify("claude highlight reapply on ColorScheme failed: " .. tostring(err), vim.log.levels.WARN)
+				end
 			end,
 		})
 

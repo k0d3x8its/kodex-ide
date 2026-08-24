@@ -22,9 +22,9 @@ local mod = {}
 -- buftype=="" alone missed the dashboard and fell back to a full-width strip
 -- under OpenCode.
 local EXCLUDE_FT = {
-  toggleterm = true,
-  NvimTree = true,
-  ["neo-tree"] = true,
+	toggleterm = true,
+	NvimTree = true,
+	["neo-tree"] = true,
 }
 
 --- The main content window to anchor the bottom strip under: the first window
@@ -33,23 +33,23 @@ local EXCLUDE_FT = {
 ---@param exclude integer
 ---@return integer?
 local function editor_window(exclude)
-  for _, w in ipairs(vim.api.nvim_list_wins()) do
-    if w ~= exclude then
-      local b = vim.api.nvim_win_get_buf(w)
-      local ft = vim.api.nvim_get_option_value("filetype", { buf = b })
-      if not EXCLUDE_FT[ft] then
-        return w
-      end
-    end
-  end
-  return nil
+	for _, w in ipairs(vim.api.nvim_list_wins()) do
+		if w ~= exclude then
+			local b = vim.api.nvim_win_get_buf(w)
+			local ft = vim.api.nvim_get_option_value("filetype", { buf = b })
+			if not EXCLUDE_FT[ft] then
+				return w
+			end
+		end
+	end
+	return nil
 end
 
 --- Pin the just-opened terminal window to the far-right, full-height column.
 --- Call from a vertical terminal's on_open. `width` is columns.
 function mod.place_vertical(width)
-  vim.cmd("wincmd L")
-  vim.cmd("vertical resize " .. width)
+	vim.cmd("wincmd L")
+	vim.cmd("vertical resize " .. width)
 end
 
 --- Pin the just-opened terminal window to a bottom strip under the EDITOR.
@@ -63,18 +63,18 @@ end
 --- win_splitmove relocates ONLY our window, so OpenCode is never touched.
 --- Falls back to `wincmd J` when no editor window is visible.
 function mod.place_horizontal(height)
-  local strip = vim.api.nvim_get_current_win()
-  local editor = editor_window(strip)
-  if editor then
-    pcall(vim.fn.win_splitmove, strip, editor, { vertical = false, rightbelow = true })
-    -- win_splitmove can shift the current window; reselect the strip to resize it
-    if vim.api.nvim_win_is_valid(strip) then
-      vim.api.nvim_set_current_win(strip)
-    end
-  else
-    vim.cmd("wincmd J")
-  end
-  vim.cmd("resize " .. height)
+	local strip = vim.api.nvim_get_current_win()
+	local editor = editor_window(strip)
+	if editor then
+		pcall(vim.fn.win_splitmove, strip, editor, { vertical = false, rightbelow = true })
+		-- win_splitmove can shift the current window; reselect the strip to resize it
+		if vim.api.nvim_win_is_valid(strip) then
+			vim.api.nvim_set_current_win(strip)
+		end
+	else
+		vim.cmd("wincmd J")
+	end
+	vim.cmd("resize " .. height)
 end
 
 return mod

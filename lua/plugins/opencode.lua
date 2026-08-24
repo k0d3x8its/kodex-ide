@@ -8,7 +8,8 @@ return {
     -- cheap at startup: utils/opencode requires toggleterm only on first toggle
     require("utils.opencode").setup({ width_pct = 0.40 })
     -- VimEnter dock-launch hook removed — dock.lua owns the single VimEnter
-    -- for both KODEX_IDE and KODEX_CLAUDE launchers (FINDINGS.md § A2).
+    -- for both KODEX_IDE and KODEX_CLAUDE launchers
+    -- (.work/archive/legacy-findings.md § A2).
   end,
 
   keys = {

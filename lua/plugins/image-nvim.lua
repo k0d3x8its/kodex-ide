@@ -6,6 +6,6 @@
 -- assets or a kitty-graphics terminal never pays for loading it. pet_render.setup
 -- triggers the load on first render via require("lazy").load.
 return {
-  "3rd/image.nvim",
-  lazy = true,
+	"3rd/image.nvim",
+	lazy = true,
 }

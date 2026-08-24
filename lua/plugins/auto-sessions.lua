@@ -30,7 +30,7 @@ return {
         -- editor loses its line numbers. Closing the panel window + wiping its
         -- scratch buffer here means only real editor windows (which keep the
         -- global number=true) reach mksession, so nothing turns numbers off.
-        "lua pcall(function() local c=require('utils.claude'); if c.state.panel_win and vim.api.nvim_win_is_valid(c.state.panel_win) then vim.api.nvim_win_close(c.state.panel_win,true) end; if c.state.panel_buf and vim.api.nvim_buf_is_valid(c.state.panel_buf) then vim.api.nvim_buf_delete(c.state.panel_buf,{force=true}) end end)",
+        "lua require('utils.claude').close_panel()",
       },
     })
 

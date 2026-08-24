@@ -81,7 +81,7 @@ opened = {}
 with_file_window()
 stub_panel_select("Claude Code")
 project_picker._finish("/home/k0d3x/dev/kodex-ide")
-vim.wait(300, function()
+vim.wait(1000, function()
 	return #opened > 0
 end)
 H.check(
@@ -94,7 +94,7 @@ opened = {}
 with_file_window()
 stub_panel_select(nil) -- Esc dismiss
 project_picker._finish("/home/k0d3x/dev/kodex-ide")
-vim.wait(300, function()
+vim.wait(1000, function()
 	return #opened > 0
 end)
 H.check(

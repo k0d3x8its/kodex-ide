@@ -9,29 +9,26 @@ mod.OPENCODE_BIN = vim.fn.expand("~/.opencode/bin/opencode")
 --- Guard used before any panel toggle (findings Q8)
 ---@return boolean
 function mod.is_available()
-  return vim.fn.executable(mod.OPENCODE_BIN) == 1
+	return vim.fn.executable(mod.OPENCODE_BIN) == 1
 end
 
 -- Shared entry-point guard: notify once + return false when the binary is
 -- missing. Both toggle() and ask_selection() gate on this.
 local function ensure_available()
-  if mod.is_available() then
-    return true
-  end
-  vim.notify(
-    "opencode not found at ~/.opencode/bin/opencode — install from opencode.ai",
-    vim.log.levels.ERROR
-  )
-  return false
+	if mod.is_available() then
+		return true
+	end
+	vim.notify("opencode not found at ~/.opencode/bin/opencode — install from opencode.ai", vim.log.levels.ERROR)
+	return false
 end
 
 -- Panel state (findings Q5, Q11). Exposed so the diff workflow (Goal 3)
 -- can gate on opencode_active and share diff_queue.
 mod.state = {
-  opencode_active = false, -- true while panel open; gates FileChangedShell handling
-  stored_root = nil,       -- project root at terminal creation, compared on each open
-  diff_queue = {},         -- pending file paths for queued vimdiff
-  term = nil,              -- single persistent toggleterm Terminal
+	opencode_active = false, -- true while panel open; gates FileChangedShell handling
+	stored_root = nil, -- project root at terminal creation, compared on each open
+	diff_queue = {}, -- pending file paths for queued vimdiff
+	term = nil, -- single persistent toggleterm Terminal
 }
 local state = mod.state
 
@@ -39,97 +36,94 @@ local opts = { width_pct = 0.40 }
 
 --- Merge lazy plugin opts (findings Q9). Idempotent — safe to call repeatedly.
 function mod.setup(user_opts)
-  opts = vim.tbl_deep_extend("force", opts, user_opts or {})
+	opts = vim.tbl_deep_extend("force", opts, user_opts or {})
 end
 
 -- toggleterm vertical "size" is columns; computed per-toggle so the panel
 -- tracks terminal resizes instead of freezing at creation-time width
 local function panel_width()
-  return math.floor(vim.o.columns * opts.width_pct)
+	return math.floor(vim.o.columns * opts.width_pct)
 end
 
 -- Seed first message with current file as context (findings Q4).
 -- TUI --prompt flag — `opencode run` is one-shot and never starts the TUI.
 local function build_cmd(root)
-  local file = vim.api.nvim_buf_get_name(0)
-  if file == "" then
-    return mod.OPENCODE_BIN -- dashboard/terminal buffer: nothing to seed
-  end
-  local rel = vim.fs.relpath(root, file) or file
-  return mod.OPENCODE_BIN .. " --prompt " .. vim.fn.shellescape("currently in " .. rel)
+	local file = vim.api.nvim_buf_get_name(0)
+	if file == "" then
+		return mod.OPENCODE_BIN -- dashboard/terminal buffer: nothing to seed
+	end
+	local rel = vim.fs.relpath(root, file) or file
+	return mod.OPENCODE_BIN .. " --prompt " .. vim.fn.shellescape("currently in " .. rel)
 end
 
 local function create_term(root)
-  local Terminal = require("toggleterm.terminal").Terminal
-  return Terminal:new {
-    cmd             = build_cmd(root),
-    dir             = root,
-    direction       = "vertical",
-    start_in_insert = true,
-    close_on_exit   = false,
-    hidden          = true,
-    -- flag flips via callbacks, not in toggle(): catches every close path
-    -- (keymap, :q on the window, etc.). Diff hooks manage 'autoread' +
-    -- interceptor autocmds (findings Q6 prototype correction #1).
-    on_open         = function(term)
-      state.opencode_active = true
-      -- Force the far-right column on every open. Without this, opening the
-      -- panel while the dev terminal is up anchors the split to the terminal's
-      -- window and OpenCode lands as a horizontal strip UNDER it instead of a
-      -- vertical panel on the right. See utils.term_layout for the toggleterm
-      -- grouping behaviour this works around.
-      require("utils.term_layout").place_vertical(panel_width())
-      require("utils.opencode_diff").on_panel_open()
-      -- Pass <Esc> through to the TUI (e.g. dismiss ctrl+p palette).
-      -- Use <C-\><C-n> to exit terminal mode instead.
-      vim.keymap.set("t", "<Esc>", "<Esc>", { buffer = term.bufnr, noremap = true })
-      -- Rename the buffer so bufferline (tab) and lualine (statusline) show
-      -- "opencode" instead of toggleterm's raw "term://…;#toggleterm#1" URI.
-      -- toggleterm tracks this terminal via its Terminal object, not the buffer
-      -- name, so the rename is safe. Guard against re-running on every toggle:
-      -- after the rename the name resolves to "<cwd>/opencode", so skip if it
-      -- already ends in /opencode. pcall guards the rare E95 name-collision.
-      local bufname = vim.api.nvim_buf_get_name(term.bufnr)
-      if not bufname:match("/opencode$") then
-        pcall(vim.api.nvim_buf_set_name, term.bufnr, "opencode")
-      end
-    end,
-    on_close        = function()
-      state.opencode_active = false
-      require("utils.opencode_diff").on_panel_close()
-    end,
-  }
+	local Terminal = require("toggleterm.terminal").Terminal
+	return Terminal:new({
+		cmd = build_cmd(root),
+		dir = root,
+		direction = "vertical",
+		start_in_insert = true,
+		close_on_exit = false,
+		hidden = true,
+		-- flag flips via callbacks, not in toggle(): catches every close path
+		-- (keymap, :q on the window, etc.). Diff hooks manage 'autoread' +
+		-- interceptor autocmds (findings Q6 prototype correction #1).
+		on_open = function(term)
+			state.opencode_active = true
+			-- Force the far-right column on every open. Without this, opening the
+			-- panel while the dev terminal is up anchors the split to the terminal's
+			-- window and OpenCode lands as a horizontal strip UNDER it instead of a
+			-- vertical panel on the right. See utils.term_layout for the toggleterm
+			-- grouping behaviour this works around.
+			require("utils.term_layout").place_vertical(panel_width())
+			require("utils.opencode_diff").on_panel_open()
+			-- Pass <Esc> through to the TUI (e.g. dismiss ctrl+p palette).
+			-- Use <C-\><C-n> to exit terminal mode instead.
+			vim.keymap.set("t", "<Esc>", "<Esc>", { buffer = term.bufnr, noremap = true })
+			-- Rename the buffer so bufferline (tab) and lualine (statusline) show
+			-- "opencode" instead of toggleterm's raw "term://…;#toggleterm#1" URI.
+			-- toggleterm tracks this terminal via its Terminal object, not the buffer
+			-- name, so the rename is safe. Guard against re-running on every toggle:
+			-- after the rename the name resolves to "<cwd>/opencode", so skip if it
+			-- already ends in /opencode. pcall guards the rare E95 name-collision.
+			local bufname = vim.api.nvim_buf_get_name(term.bufnr)
+			if not bufname:match("/opencode$") then
+				pcall(vim.api.nvim_buf_set_name, term.bufnr, "opencode")
+			end
+		end,
+		on_close = function()
+			state.opencode_active = false
+			require("utils.opencode_diff").on_panel_close()
+		end,
+	})
 end
 
 --- Toggle panel open/close (`<leader>oc`)
 function mod.toggle()
-  if not ensure_available() then
-    return
-  end
+	if not ensure_available() then
+		return
+	end
 
-  -- Mutex: close the Claude panel if it is open before opening OpenCode.
-  -- Both panels use term_layout.place_vertical (wincmd L); running both
-  -- simultaneously strands one on a stale alternate screen (FINDINGS.md § A5).
-  local ok, claude = pcall(require, "utils.claude")
-  if ok and claude.state and claude.state.claude_active then
-    claude.toggle()
-    vim.notify(
-      "OpenCode panel open — Claude closed (<leader>cc to switch)",
-      vim.log.levels.INFO
-    )
-  end
+	-- Mutex: close the Claude panel if it is open before opening OpenCode.
+	-- Both panels use term_layout.place_vertical (wincmd L); running both
+	-- simultaneously strands one on a stale alternate screen (FINDINGS.md § A5).
+	local ok, claude = pcall(require, "utils.claude")
+	if ok and claude.state and claude.state.claude_active then
+		claude.toggle()
+		vim.notify("OpenCode panel open — Claude closed (<leader>cc to switch)", vim.log.levels.INFO)
+	end
 
-  local root = require("utils.project_root").detect()
+	local root = require("utils.project_root").detect()
 
-  if state.term == nil then
-    state.stored_root = root
-    state.term = create_term(root)
-  elseif not state.term:is_open() and root ~= state.stored_root then
-    -- re-opening into a different project: warn, don't auto-restart (findings Q11)
-    vim.notify("Project root changed → <leader>or to restart opencode", vim.log.levels.WARN)
-  end
+	if state.term == nil then
+		state.stored_root = root
+		state.term = create_term(root)
+	elseif not state.term:is_open() and root ~= state.stored_root then
+		-- re-opening into a different project: warn, don't auto-restart (findings Q11)
+		vim.notify("Project root changed → <leader>or to restart opencode", vim.log.levels.WARN)
+	end
 
-  state.term:toggle(panel_width())
+	state.term:toggle(panel_width())
 end
 
 --- Return text from last visual selection.
@@ -139,23 +133,25 @@ end
 -- selection (empty on first use → false "no text selected").
 -- getpos returns {bufnr, line, col, off} — col is 1-based byte offset.
 local function get_visual_selection()
-  local s = vim.fn.getpos("'<")
-  local e = vim.fn.getpos("'>")
-  -- nvim_buf_get_lines is 0-indexed, end-exclusive
-  local lines = vim.api.nvim_buf_get_lines(0, s[2] - 1, e[2], false)
-  if #lines == 0 then return "" end
-  -- '> col is inclusive under the default selection=inclusive; with
-  -- selection=exclusive it points one past the last char, so drop one.
-  local end_col = e[3]
-  if vim.o.selection == "exclusive" then
-    end_col = end_col - 1
-  end
-  -- trim the last line to the end-column first (before trimming the first
-  -- line shifts index [1] when the selection is a single line)
-  lines[#lines] = lines[#lines]:sub(1, end_col)
-  -- trim the first line to start at the selection's start-column
-  lines[1] = lines[1]:sub(s[3])
-  return table.concat(lines, "\n")
+	local s = vim.fn.getpos("'<")
+	local e = vim.fn.getpos("'>")
+	-- nvim_buf_get_lines is 0-indexed, end-exclusive
+	local lines = vim.api.nvim_buf_get_lines(0, s[2] - 1, e[2], false)
+	if #lines == 0 then
+		return ""
+	end
+	-- '> col is inclusive under the default selection=inclusive; with
+	-- selection=exclusive it points one past the last char, so drop one.
+	local end_col = e[3]
+	if vim.o.selection == "exclusive" then
+		end_col = end_col - 1
+	end
+	-- trim the last line to the end-column first (before trimming the first
+	-- line shifts index [1] when the selection is a single line)
+	lines[#lines] = lines[#lines]:sub(1, end_col)
+	-- trim the first line to start at the selection's start-column
+	lines[1] = lines[1]:sub(s[3])
+	return table.concat(lines, "\n")
 end
 
 --- Ask OpenCode about visually selected text (<leader>oq).
@@ -164,69 +160,71 @@ end
 -- vim.ui.input is used so dressing.nvim / noice.nvim can style the float
 -- (matches the "Ask opencode  @selection:" UI shown in the design reference).
 function mod.ask_selection()
-  if not ensure_available() then
-    return
-  end
+	if not ensure_available() then
+		return
+	end
 
-  -- This is a mode="v" keymap, so it fires while STILL in visual mode — at
-  -- which point '< and '> hold the PREVIOUS selection (empty on first use).
-  -- Leave visual mode to flush the marks to the CURRENT selection before
-  -- reading it. \27 == <Esc>; the \22 branch covers blockwise (<C-v>).
-  if vim.fn.mode():match("[vV\22]") then
-    vim.cmd("normal! \27")
-  end
+	-- This is a mode="v" keymap, so it fires while STILL in visual mode — at
+	-- which point '< and '> hold the PREVIOUS selection (empty on first use).
+	-- Leave visual mode to flush the marks to the CURRENT selection before
+	-- reading it. \27 == <Esc>; the \22 branch covers blockwise (<C-v>).
+	if vim.fn.mode():match("[vV\22]") then
+		vim.cmd("normal! \27")
+	end
 
-  local selection = get_visual_selection()
-  if selection == "" then
-    vim.notify("OpenCode: no text selected", vim.log.levels.WARN)
-    return
-  end
+	local selection = get_visual_selection()
+	if selection == "" then
+		vim.notify("OpenCode: no text selected", vim.log.levels.WARN)
+		return
+	end
 
-  -- prompt string intentionally mirrors the "Ask opencode  @selection:" label
-  -- from the design reference so the UX is recognisable without extra UI work
-  vim.ui.input({ prompt = "Ask opencode  @selection: " }, function(question)
-    if not question or question == "" then return end
+	-- prompt string intentionally mirrors the "Ask opencode  @selection:" label
+	-- from the design reference so the UX is recognisable without extra UI work
+	vim.ui.input({ prompt = "Ask opencode  @selection: " }, function(question)
+		if not question or question == "" then
+			return
+		end
 
-    -- snapshot BEFORE mod.open() so we know whether the TUI job already exists.
-    -- close_on_exit=false keeps the job alive across toggles, so a term that
-    -- exists at all (even toggled closed) is already at its input loop — only a
-    -- never-created term is a true cold boot.
-    local warm = state.term ~= nil
-    mod.open()
+		-- snapshot BEFORE mod.open() so we know whether the TUI job already exists.
+		-- close_on_exit=false keeps the job alive across toggles, so a term that
+		-- exists at all (even toggled closed) is already at its input loop — only a
+		-- never-created term is a true cold boot.
+		local warm = state.term ~= nil
+		mod.open()
 
-    -- cold-boot needs ~500 ms for opencode's TUI to reach its input loop;
-    -- a warm job just needs a tick for focus/redraw to settle
-    local delay = warm and 50 or 500
-    vim.defer_fn(function()
-      -- fenced code block so opencode renders the selection as code, not prose
-      local msg = question .. "\n\n```\n" .. selection .. "\n```"
-      -- term:send(text, true) writes to the terminal channel then appends \n,
-      -- which submits the message exactly as if the user pressed <CR>
-      state.term:send(msg, true)
-    end, delay)
-  end)
+		-- cold-boot needs ~500 ms for opencode's TUI to reach its input loop;
+		-- a warm job just needs a tick for focus/redraw to settle
+		local delay = warm and 50 or 500
+		vim.defer_fn(function()
+			-- fenced code block so opencode renders the selection as code, not prose
+			local msg = question .. "\n\n```\n" .. selection .. "\n```"
+			-- term:send(text, true) writes to the terminal channel then appends \n,
+			-- which submits the message exactly as if the user pressed <CR>
+			state.term:send(msg, true)
+		end, delay)
+	end)
 end
 
 --- Open without toggling — dock-launch flow calls this (findings Q14)
 function mod.open()
-  if state.term and state.term:is_open() then
-    return
-  end
-  mod.toggle()
+	if state.term and state.term:is_open() then
+		return
+	end
+	mod.toggle()
 end
 
 --- Kill instance + fresh session (`<leader>or`, findings Q5b)
 function mod.reset()
-  if state.term then
-    state.term:shutdown() -- kills the job and closes the window
-  end
-  state.term = nil
-  state.stored_root = nil
-  state.diff_queue = {}
-  state.opencode_active = false
-  -- shutdown() may not fire on_close; restore autoread explicitly
-  require("utils.opencode_diff").on_panel_close()
-  mod.toggle()
+	if state.term then
+		state.term:shutdown() -- kills the job and closes the window
+	end
+	state.term = nil
+	state.stored_root = nil
+	state.diff_queue = {}
+	state.opencode_active = false
+	-- shutdown() may not fire on_close; restore autoread explicitly
+	require("utils.opencode_diff").on_panel_close()
+	mod.toggle()
 end
 
 return mod
